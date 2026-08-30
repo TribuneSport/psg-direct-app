@@ -1,54 +1,85 @@
-# API score PSG — déploiement indépendant
+# Backoffice PSG Direct — Installation complète
 
-Ce dossier est un projet **complètement séparé** de tribune-sport. Il ne
-contient qu'une seule route (`/api/live-score`) et sera hébergé à sa propre
-adresse. **Aucun risque pour ton site actuel** : ils n'ont rien en commun,
-pas même le même hébergement.
+Ce projet ajoute au dépôt `psg-direct-app` existant : le backoffice
+(brouillons, validation, actions en masse), l'API des articles publiés, et
+reprend le score en direct déjà en place. Tout reste dans le même projet
+Vercel qu'on a déjà déployé — pas de nouveau site à créer.
 
-## Déploiement (10 minutes, gratuit, sans carte bancaire)
+## Étape 1 — Créer la base de données (gratuite, 2 clics)
 
-1. Va sur https://vercel.com et crée un compte gratuit (tu peux t'inscrire
-   directement avec Google ou GitHub, pas besoin de carte).
-2. Une fois connecté, installe l'outil Vercel en ligne de commande. Dans un
-   terminal, tape :
-   ```
-   npm install -g vercel
-   ```
-3. Place-toi dans ce dossier (`psg-live-score-api`) avec `cd`, puis tape :
-   ```
-   vercel
-   ```
-   Ça va te poser quelques questions (répondre par défaut à tout, appuyer
-   sur Entrée à chaque fois convient très bien pour un premier essai).
-4. Une fois le déploiement terminé, Vercel t'affiche une adresse du type
-   `https://psg-live-score-api-xxxx.vercel.app`. **Note cette adresse.**
-5. Ajoute ta clé API Football-Data.org en tant que variable d'environnement
-   *sur Vercel* (pas dans un fichier local cette fois) :
-   ```
-   vercel env add FOOTBALL_DATA_API_KEY
-   ```
-   Colle ta clé quand demandé, choisis "Production" quand on te demande
-   l'environnement.
-6. Redéploie une dernière fois pour que la variable soit prise en compte :
-   ```
-   vercel --prod
-   ```
+1. Va sur ton tableau de bord Vercel, ouvre le projet **psg-direct-app**.
+2. Dans le menu, clique sur **Storage**, puis **Create Database**.
+3. Choisis **Neon** (Postgres), plan **Free**. Suis les quelques écrans,
+   accepte les valeurs par défaut.
+4. Une fois créée, Vercel ajoute automatiquement deux variables
+   d'environnement à ton projet : `DATABASE_URL` et `DIRECT_URL`. Tu n'as
+   rien à copier-coller, c'est fait tout seul.
 
-## Tester que ça marche
+## Étape 2 — Envoyer tous ces fichiers sur GitHub
 
-Ouvre dans ton navigateur :
-```
-https://TON-ADRESSE.vercel.app/api/live-score
-```
-Tu dois voir un résultat JSON (`liveScore: null` si pas de match aujourd'hui,
-ou les infos du match si le PSG joue).
+1. Va sur `github.com/TribuneSport/psg-direct-app`.
+2. Clique sur **Add file** → **Upload files**.
+3. Glisse **tous** les fichiers et dossiers de cette archive (respecte bien
+   la structure de dossiers : `app/`, `prisma/`, `lib/`, et les fichiers à
+   la racine comme `package.json`, `tsconfig.json`).
+   ⚠️ Sur GitHub, glisser un dossier entier fonctionne directement (pas
+   besoin de le faire fichier par fichier) — glisse le dossier `app` en
+   entier, puis `prisma`, puis `lib`, puis les fichiers seuls.
+4. En bas de page, clique sur **Commit changes**.
 
-## Côté app (psg-direct-app)
+## Étape 3 — Ajouter ta clé API Football-Data.org (si pas déjà fait)
 
-Dans `config.ts`, remplace la valeur par l'adresse Vercel obtenue à
-l'étape 4 :
-```ts
-export const API_BASE_URL = "https://TON-ADRESSE.vercel.app";
-```
+Si tu l'avais déjà ajoutée lors de l'étape du score en direct, tu peux
+sauter cette étape. Sinon : Vercel → projet → **Settings** →
+**Environment Variables** → ajoute `FOOTBALL_DATA_API_KEY` avec ta clé.
 
-C'est tout — tribune-sport n'a été ni touché, ni redéployé, ni redémarré.
+## Étape 4 — Redéployer
+
+1. Retourne sur Vercel, onglet **Deployments**.
+2. Le dépôt GitHub étant modifié, un nouveau déploiement démarre
+   normalement tout seul après quelques secondes. Sinon, clique sur les
+   trois points "..." du dernier déploiement → **Redeploy**.
+3. Attends que le statut passe à **Ready** (peut prendre 1 à 3 minutes,
+   plus long que la dernière fois car il y a plus de code à construire).
+
+## Étape 5 — Créer les tables dans la base de données
+
+C'est la seule étape qui demande le terminal (une fois, pas plus) :
+
+1. Sur ton PC, ouvre PowerShell dans un dossier **vide** temporaire.
+2. Tape :
+   ```
+   npx prisma --version
+   ```
+   (accepte l'installation si demandé)
+3. Va sur Vercel → projet → **Settings** → **Environment Variables**,
+   clique sur l'icône "œil" à côté de `DATABASE_URL` pour voir sa valeur
+   complète, et copie-la.
+4. Dans PowerShell, tape (Windows) :
+   ```
+   $env:DATABASE_URL="colle_la_valeur_copiee_ici"
+   ```
+5. Toujours dans ce même dossier vide, récupère juste le fichier
+   `prisma/schema.prisma` de cette archive (télécharge-le, place-le dans un
+   sous-dossier `prisma` de ton dossier temporaire), puis tape :
+   ```
+   npx prisma migrate deploy
+   ```
+   Ça crée la table `Article` dans ta nouvelle base de données.
+
+Si cette étape 5 te semble trop technique, dis-le moi — je peux te donner
+une méthode alternative en cliquant uniquement, directement dans
+l'interface Neon.
+
+## Étape 6 — Tester
+
+Ouvre `https://psg-direct-app-1ktj.vercel.app/admin/articles` — tu dois
+voir le backoffice, vide pour l'instant (aucun article créé). Clique sur
+**+ Nouvel article** pour en créer un premier test.
+
+## ⚠️ Sécurité — à ne pas oublier avant de partager l'app
+
+Cette page `/admin/articles` n'a **aucune protection par mot de passe**.
+N'importe qui connaissant l'adresse peut y accéder et publier/supprimer des
+articles. Avant de rendre l'app publique, dis-le moi et on ajoutera un mot
+de passe simple.
