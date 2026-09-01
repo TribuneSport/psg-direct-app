@@ -1,0 +1,51 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DATABASE_URL_UNPOOLED")
+}
+
+enum ArticleStatus {
+  DRAFT
+  PUBLISHED
+  UNPUBLISHED
+}
+
+model Article {
+  id            String        @id @default(cuid())
+  title         String
+  slug          String        @unique
+  content       String
+  excerpt       String?
+  club          String
+  status        ArticleStatus @default(DRAFT)
+  isAiGenerated Boolean       @default(false)
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  publishedAt DateTime?
+
+  @@index([status])
+  @@index([club])
+  @@index([publishedAt])
+}
+
+// Un jeton par téléphone ayant activé les notifications.
+model DeviceToken {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  createdAt DateTime @default(now())
+}
+
+// Une seule ligne, qui garde en mémoire le dernier score connu, pour
+// détecter un but en comparant avec le score actuel à chaque vérification.
+model MatchState {
+  id         String   @id @default("current")
+  homeScore  Int      @default(0)
+  awayScore  Int      @default(0)
+  status     String   @default("")
+  updatedAt  DateTime @updatedAt
+}
