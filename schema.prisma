@@ -23,6 +23,7 @@ model Article {
   club          String
   status        ArticleStatus @default(DRAFT)
   isAiGenerated Boolean       @default(false)
+  sourceUrl     String?       @unique // évite de recréer deux fois le même article
 
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
