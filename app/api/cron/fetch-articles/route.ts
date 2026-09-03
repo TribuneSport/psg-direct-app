@@ -90,22 +90,42 @@ export async function GET(req: NextRequest) {
 
     try {
       /*
-       * On récupère maintenant le contenu de la page source.
+       * Récupération du véritable contenu de la page source.
        *
-       * Le RSS de Google News contient souvent un titre et une
-       * description trop courte. La page source peut contenir
-       * les informations précises : heure, chaîne, joueurs,
-       * absences, lieu, montant, etc.
+       * IMPORTANT :
+       * Si nous ne récupérons pas suffisamment de contenu,
+       * nous refusons de générer l'article.
+       *
+       * Cela évite que Gemini remplisse les trous avec
+       * des phrases génériques ou des informations inventées.
        */
+
       const sourceContent = await fetchSourceArticle(
         selectedItem.link
       );
+
+      if (sourceContent.length < 500) {
+        throw new Error(
+          `Contenu source insuffisant (${sourceContent.length} caractères). Article non créé pour éviter une génération imprécise.`
+        );
+      }
 
       const rewritten = await rewriteWithGemini(
         selectedItem.title,
         selectedItem.description,
         sourceContent
       );
+
+      /*
+       * Vérification supplémentaire :
+       * on refuse un article trop court.
+       */
+
+      if (rewritten.content.length < 300) {
+        throw new Error(
+          "Article Gemini trop court. Article non créé."
+        );
+      }
 
       const slug = slugify(rewritten.title);
 
@@ -129,7 +149,8 @@ export async function GET(req: NextRequest) {
         skipped: items.length - 1,
         failed: 0,
         errors: [],
-        sourceContentRetrieved: sourceContent.length > 0,
+        sourceContentRetrieved: true,
+        sourceContentLength: sourceContent.length,
         article: {
           id: article.id,
           title: article.title,
@@ -215,10 +236,16 @@ async function fetchRssItems(): Promise<RssItem[]> {
 }
 
 /**
- * Récupère le contenu texte de la page source.
+ * Récupère le véritable contenu éditorial de la page source.
  *
- * On essaie de rester léger pour ne pas dépasser la limite
- * de temps du cron.
+ * Ordre de priorité :
+ *
+ * 1. JSON-LD avec articleBody
+ * 2. balise <article>
+ * 3. balise <main>
+ * 4. fallback sur le HTML visible
+ *
+ * On limite le résultat à 12000 caractères.
  */
 async function fetchSourceArticle(url: string): Promise<string> {
   try {
@@ -235,7 +262,8 @@ async function fetchSourceArticle(url: string): Promise<string> {
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
         Accept:
           "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+        "Accept-Language":
+          "fr-FR,fr;q=0.9,en;q=0.8",
       },
       cache: "no-store",
       redirect: "follow",
@@ -258,17 +286,83 @@ async function fetchSourceArticle(url: string): Promise<string> {
       return "";
     }
 
-    const content = extractMainText(html);
+    /*
+     * Première méthode :
+     * chercher articleBody dans les données JSON-LD.
+     *
+     * C'est souvent la méthode la plus propre car les sites
+     * de presse placent directement le contenu de l'article
+     * dans leur structured data.
+     */
+    const jsonLdContent = extractArticleBodyFromJsonLd(html);
+
+    if (jsonLdContent.length >= 500) {
+      console.log(
+        `Source récupérée via JSON-LD : ${jsonLdContent.length} caractères`
+      );
+
+      return jsonLdContent.substring(0, 12000);
+    }
 
     /*
-     * Limite volontaire pour éviter d'envoyer des milliers
-     * de caractères inutiles à Gemini.
+     * Deuxième méthode :
+     * chercher le contenu dans <article>.
      */
-    return content.substring(0, 12000);
+    const articleContent = extractElementText(
+      html,
+      "article"
+    );
+
+    if (articleContent.length >= 500) {
+      console.log(
+        `Source récupérée via <article> : ${articleContent.length} caractères`
+      );
+
+      return articleContent.substring(0, 12000);
+    }
+
+    /*
+     * Troisième méthode :
+     * chercher le contenu dans <main>.
+     */
+    const mainContent = extractElementText(
+      html,
+      "main"
+    );
+
+    if (mainContent.length >= 500) {
+      console.log(
+        `Source récupérée via <main> : ${mainContent.length} caractères`
+      );
+
+      return mainContent.substring(0, 12000);
+    }
+
+    /*
+     * Dernière tentative :
+     * récupération du texte visible général.
+     */
+    const fallbackContent = extractMainText(html);
+
+    if (fallbackContent.length >= 500) {
+      console.log(
+        `Source récupérée via fallback HTML : ${fallbackContent.length} caractères`
+      );
+
+      return fallbackContent.substring(0, 12000);
+    }
+
+    console.warn(
+      `Contenu source insuffisant après extraction : ${fallbackContent.length} caractères`
+    );
+
+    return "";
   } catch (error) {
     console.warn(
       "Impossible de récupérer la page source :",
-      error instanceof Error ? error.message : String(error)
+      error instanceof Error
+        ? error.message
+        : String(error)
     );
 
     return "";
@@ -276,18 +370,179 @@ async function fetchSourceArticle(url: string): Promise<string> {
 }
 
 /**
- * Transforme une page HTML en texte exploitable.
+ * Cherche articleBody dans les blocs JSON-LD.
  *
- * On supprime :
- * - scripts
- * - styles
- * - SVG
- * - éléments de navigation
- * - commentaires HTML
+ * Exemple recherché :
  *
- * Puis on récupère le texte visible.
+ * {
+ *   "@type": "NewsArticle",
+ *   "articleBody": "..."
+ * }
  */
-function extractMainText(html: string): string {
+function extractArticleBodyFromJsonLd(
+  html: string
+): string {
+  const matches = html.match(
+    /<script\b[^>]*type=["']application\/ld\+json["'][^>]*>[\s\S]*?<\/script>/gi
+  );
+
+  if (!matches) {
+    return "";
+  }
+
+  for (const block of matches) {
+    const jsonText = block
+      .replace(
+        /<script\b[^>]*>/i,
+        ""
+      )
+      .replace(
+        /<\/script>\s*$/i,
+        ""
+      )
+      .trim();
+
+    try {
+      const data = JSON.parse(
+        decodeHtmlEntities(jsonText)
+      );
+
+      const articleBody = findArticleBody(data);
+
+      if (articleBody.length >= 500) {
+        return cleanExtractedText(articleBody);
+      }
+    } catch {
+      /*
+       * Certains sites ont un JSON-LD légèrement invalide.
+       * On continue avec les autres méthodes.
+       */
+    }
+  }
+
+  return "";
+}
+
+/**
+ * Cherche récursivement articleBody dans :
+ *
+ * - un objet ;
+ * - @graph ;
+ * - un tableau d'objets.
+ */
+function findArticleBody(
+  data: unknown
+): string {
+  if (!data) {
+    return "";
+  }
+
+  if (Array.isArray(data)) {
+    for (const item of data) {
+      const result = findArticleBody(item);
+
+      if (result.length >= 500) {
+        return result;
+      }
+    }
+
+    return "";
+  }
+
+  if (
+    typeof data !== "object" ||
+    data === null
+  ) {
+    return "";
+  }
+
+  const obj = data as Record<string, unknown>;
+
+  if (
+    typeof obj.articleBody === "string" &&
+    obj.articleBody.trim().length >= 500
+  ) {
+    return obj.articleBody;
+  }
+
+  if (obj["@graph"]) {
+    const graphResult = findArticleBody(
+      obj["@graph"]
+    );
+
+    if (graphResult.length >= 500) {
+      return graphResult;
+    }
+  }
+
+  for (const value of Object.values(obj)) {
+    if (
+      typeof value === "object" &&
+      value !== null
+    ) {
+      const result = findArticleBody(value);
+
+      if (result.length >= 500) {
+        return result;
+      }
+    }
+  }
+
+  return "";
+}
+
+/**
+ * Extrait le texte d'une balise HTML donnée.
+ */
+function extractElementText(
+  html: string,
+  tagName: string
+): string {
+  const regex = new RegExp(
+    `<${tagName}\\b[^>]*>([\\s\\S]*?)<\\/${tagName}>`,
+    "i"
+  );
+
+  const match = html.match(regex);
+
+  if (!match) {
+    return "";
+  }
+
+  return cleanExtractedText(
+    removeUnwantedHtml(match[1])
+  );
+}
+
+/**
+ * Nettoyage du contenu extrait d'un article.
+ */
+function cleanExtractedText(
+  text: string
+): string {
+  let cleaned = text;
+
+  cleaned = cleaned
+    .replace(/\r/g, " ")
+    .replace(/\n+/g, " ")
+    .replace(/\t+/g, " ");
+
+  cleaned = cleaned.replace(
+    /\s+/g,
+    " "
+  );
+
+  cleaned = cleaned.trim();
+
+  return cleaned;
+}
+
+/**
+ * Supprime les éléments HTML inutiles.
+ */
+function removeUnwantedHtml(
+  html: string
+): string {
   let text = html;
 
   text = text.replace(
@@ -320,47 +575,117 @@ function extractMainText(html: string): string {
     " "
   );
 
-  text = text.replace(/<[^>]+>/g, " ");
+  text = text.replace(
+    /<[^>]+>/g,
+    " "
+  );
 
   text = decodeHtmlEntities(text);
-
-  text = text.replace(/\s+/g, " ").trim();
 
   return text;
 }
 
-function decodeHtmlEntities(text: string): string {
-  return text
-    .replace(/&nbsp;/gi, " ")
-    .replace(/&amp;/gi, "&")
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;/gi, "'")
-    .replace(/&apos;/gi, "'")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">")
-    .replace(/&#x27;/gi, "'")
-    .replace(/&#x2F;/gi, "/")
-    .replace(/&#(\d+);/g, (_, code) => {
-      return String.fromCharCode(Number(code));
-    })
-    .replace(/&#x([0-9a-f]+);/gi, (_, code) => {
-      return String.fromCharCode(parseInt(code, 16));
-    });
+/**
+ * Fallback : transforme la page HTML complète
+ * en texte visible.
+ */
+function extractMainText(
+  html: string
+): string {
+  return cleanExtractedText(
+    removeUnwantedHtml(html)
+  );
 }
 
-function extractTag(xml: string, tag: string): string {
+function decodeHtmlEntities(
+  text: string
+): string {
+  return text
+    .replace(
+      /&nbsp;/gi,
+      " "
+    )
+    .replace(
+      /&amp;/gi,
+      "&"
+    )
+    .replace(
+      /&quot;/gi,
+      '"'
+    )
+    .replace(
+      /&#39;/gi,
+      "'"
+    )
+    .replace(
+      /&apos;/gi,
+      "'"
+    )
+    .replace(
+      /&lt;/gi,
+      "<"
+    )
+    .replace(
+      /&gt;/gi,
+      ">"
+    )
+    .replace(
+      /&#x27;/gi,
+      "'"
+    )
+    .replace(
+      /&#x2F;/gi,
+      "/"
+    )
+    .replace(
+      /&#(\d+);/g,
+      (_, code) => {
+        return String.fromCharCode(
+          Number(code)
+        );
+      }
+    )
+    .replace(
+      /&#x([0-9a-f]+);/gi,
+      (_, code) => {
+        return String.fromCharCode(
+          parseInt(code, 16)
+        );
+      }
+    );
+}
+
+function extractTag(
+  xml: string,
+  tag: string
+): string {
   const match = xml.match(
-    new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`)
+    new RegExp(
+      `<${tag}>([\\s\\S]*?)<\\/${tag}>`
+    )
   );
 
-  return match ? match[1] : "";
+  return match
+    ? match[1]
+    : "";
 }
 
-function cleanText(text: string): string {
+function cleanText(
+  text: string
+): string {
   return text
-    .replace("<![CDATA[", "")
-    .replace("]]>", "")
-    .replace(/<[^>]+>/g, "")
+    .replace(
+      "<![CDATA[",
+      ""
+    )
+    .replace(
+      "]]>",
+      ""
+    )
+    .replace(
+      /<[^>]+>/g,
+      ""
+    )
     .trim();
 }
 
@@ -375,267 +700,246 @@ async function rewriteWithGemini(
 }> {
   const prompt = `Tu es un journaliste sportif professionnel spécialisé dans le Paris Saint-Germain.
 
-Ta mission est de transformer les informations fournies ci-dessous en un véritable article de presse sportive ORIGINAL, précis, factuel et naturel en français.
+Tu dois rédiger un véritable article journalistique français à partir d'une source fournie.
 
-Tu disposes de trois niveaux d'information :
+IMPORTANT :
 
-1. TITRE RSS
-2. DESCRIPTION RSS
-3. CONTENU DE LA PAGE SOURCE
+Le CONTENU DE LA PAGE SOURCE est la source principale.
 
-Le contenu de la page source est prioritaire lorsqu'il apporte davantage de détails factuels.
+Le TITRE RSS et la DESCRIPTION RSS servent uniquement à compléter ou identifier le sujet.
 
-================ TITRE RSS ================
+Tu dois d'abord identifier mentalement les faits présents dans la source, puis rédiger l'article.
+
+========================================================
+TITRE RSS
+========================================================
 
 ${originalTitle}
 
-================ DESCRIPTION RSS ================
+========================================================
+DESCRIPTION RSS
+========================================================
 
 ${originalDescription}
 
-================ CONTENU DE LA PAGE SOURCE ================
-
-${sourceContent || "Aucun contenu source supplémentaire disponible."}
-
+========================================================
+CONTENU DE LA PAGE SOURCE
 ========================================================
 
-
-RÈGLE ABSOLUE : CONSERVE LES FAITS
-
-Tu dois identifier les informations factuelles réellement présentes dans les données fournies avant de rédiger.
-
-Conserve, lorsqu'elles sont présentes :
-
-- les noms des équipes ;
-- les noms des joueurs ;
-- les noms des entraîneurs ;
-- les noms des dirigeants ;
-- la compétition ;
-- la date ;
-- l'heure exacte ;
-- la chaîne TV ;
-- la plateforme de diffusion ;
-- le diffuseur ;
-- le stade ;
-- le lieu ;
-- le score ;
-- les absences ;
-- les blessures ;
-- les suspensions ;
-- les informations de mercato ;
-- les montants ;
-- les durées de contrat ;
-- les dates ;
-- les statistiques ;
-- les déclarations réellement présentes ;
-- toutes les données chiffrées importantes.
-
+${sourceContent}
 
 ========================================================
-RÈGLE TRÈS IMPORTANTE : PRIORITÉ AUX INFORMATIONS
+RÈGLE ABSOLUE : NE JAMAIS INVENTER
 ========================================================
 
-Si le titre RSS ou la description RSS est vague mais que le contenu de la page source contient une information précise, utilise cette information précise.
-
-Exemple :
-
-Si le RSS indique :
-
-« PSG - Monaco : les détails pour suivre le match »
-
-mais que la page source indique :
-
-« La rencontre aura lieu vendredi 4 septembre à 21h05 et sera diffusée sur Ligue 1+. »
-
-alors l'article final DOIT mentionner :
-
-- vendredi 4 septembre ;
-- 21h05 ;
-- PSG ;
-- Monaco ;
-- Ligue 1 ;
-- Ligue 1+.
-
-Ne transforme jamais ces informations en phrase vague.
-
-
-========================================================
-ARTICLES MATCH / TV / DIFFUSION
-========================================================
-
-Si le sujet concerne un match, une diffusion ou un horaire, cherche en priorité dans toutes les informations disponibles :
-
-1. date ;
-2. heure ;
-3. chaîne ;
-4. plateforme ;
-5. diffuseur ;
-6. équipes ;
-7. compétition ;
-8. stade ;
-9. lieu.
-
-Lorsqu'une de ces informations est présente dans la source, elle doit être explicitement conservée dans l'article.
-
-
-========================================================
-INTERDICTION DES FORMULATIONS VAGUES
-========================================================
-
-INTERDIT :
-
-« Les supporters pourront connaître les détails de la diffusion. »
-
-INTERDIT :
-
-« Les précisions concernant la rencontre sont désormais disponibles. »
-
-INTERDIT :
-
-« Les fans pourront suivre cette rencontre dans les meilleures conditions. »
-
-INTERDIT :
-
-« Les informations concernant la programmation seront à retrouver prochainement. »
-
-Si une information précise est disponible, donne-la directement.
-
-Exemple :
-
-« Le PSG recevra Monaco vendredi 4 septembre à 21h05 au Parc des Princes. La rencontre sera diffusée sur Ligue 1+. »
-
-
-========================================================
-NE JAMAIS INVENTER
-========================================================
-
-N'invente absolument aucune information.
+Tu ne dois utiliser que les informations réellement présentes dans les données fournies.
 
 Tu ne dois jamais inventer :
 
+- un joueur ;
+- un entraîneur ;
+- une déclaration ;
+- une date ;
 - une heure ;
+- un score ;
+- une compétition ;
 - une chaîne ;
 - une plateforme ;
-- un score ;
-- un joueur ;
+- un stade ;
 - une blessure ;
 - une suspension ;
 - un transfert ;
 - un montant ;
-- une date ;
-- un stade ;
-- une déclaration ;
-- une statistique.
+- une statistique ;
+- une information de mercato.
 
-Si une information n'est pas présente dans les données fournies, ne l'invente pas.
-
-Si une information est absente, omets-la simplement.
-
+Si une information n'est pas présente dans la source, ne l'ajoute pas.
 
 ========================================================
-QUALITÉ JOURNALISTIQUE
+EXTRACTION DES FAITS
 ========================================================
 
-Le texte doit ressembler à un véritable article publié sur un média sportif.
+Avant de rédiger, identifie les faits réellement présents concernant :
 
-- Reformule entièrement les informations.
-- Ne copie pas les phrases de la source.
-- Ne fais pas une paraphrase mécanique.
-- Commence directement par l'information principale.
-- Évite les introductions génériques.
-- Évite les répétitions.
-- Évite les phrases qui ne donnent aucune information.
-- Ne remplis jamais artificiellement le texte.
-- Ne parle jamais de « la source ».
-- Ne parle jamais de « l'article source ».
-- Ne parle jamais de ton travail.
-- Ne dis jamais « selon les informations fournies ».
-- Ne dis jamais « les détails sont désormais accessibles » sans donner les détails.
-- Le premier paragraphe doit contenir le fait principal.
-- Le deuxième paragraphe doit apporter les informations complémentaires.
-- Un troisième paragraphe est autorisé uniquement s'il apporte une information réellement utile.
+- le PSG ;
+- les adversaires ;
+- les joueurs ;
+- les entraîneurs ;
+- les dirigeants ;
+- les matchs ;
+- les compétitions ;
+- les résultats ;
+- les performances ;
+- les blessures ;
+- les absences ;
+- les suspensions ;
+- le mercato ;
+- les transferts ;
+- les déclarations ;
+- les prochaines échéances ;
+- les dates ;
+- les horaires ;
+- les chaînes ;
+- les plateformes ;
+- les statistiques ;
+- les montants ;
+- les contrats.
 
+Tu dois privilégier les informations concrètes plutôt que les généralités.
+
+========================================================
+INTERDICTION DES ARTICLES GÉNÉRIQUES
+========================================================
+
+Ne rédige jamais un article rempli de phrases comme :
+
+« Le PSG aborde ses prochaines échéances avec ambition. »
+
+« Le club de la capitale veut retrouver une dynamique positive. »
+
+« Les Parisiens devront afficher leurs qualités. »
+
+« Cette rencontre suscite beaucoup d'attentes. »
+
+« Les supporters attendent avec impatience cette rencontre. »
+
+Ces phrases ne doivent être utilisées que si elles sont directement justifiées par un fait précis présent dans la source.
+
+Chaque paragraphe doit apporter une information concrète provenant de la source.
+
+========================================================
+MÉTHODE DE RÉDACTION
+========================================================
+
+Le premier paragraphe doit répondre immédiatement à :
+
+QUOI ?
+
+Le deuxième paragraphe doit apporter les informations importantes permettant de comprendre :
+
+QUI ?
+QUAND ?
+OÙ ?
+COMMENT ?
+POURQUOI ?
+
+selon les informations réellement disponibles.
+
+Un troisième paragraphe peut être utilisé uniquement s'il apporte un fait supplémentaire important.
+
+========================================================
+INFORMATIONS CHIFFRÉES
+========================================================
+
+Toutes les informations chiffrées importantes présentes dans la source doivent être conservées.
+
+Par exemple :
+
+- date ;
+- heure ;
+- score ;
+- nombre de buts ;
+- nombre de matchs ;
+- montant ;
+- durée ;
+- classement ;
+- statistiques.
+
+Ne remplace jamais une donnée précise par une formulation vague.
+
+========================================================
+DÉCLARATIONS
+========================================================
+
+Si la source contient une déclaration précise d'un joueur, entraîneur ou dirigeant, conserve son sens exact en la reformulant.
+
+N'invente aucune citation.
+
+Ne présente jamais une opinion de Gemini comme une déclaration réelle.
+
+========================================================
+ARTICLE ORIGINAL
+========================================================
+
+Reformule les informations avec un style journalistique naturel.
+
+Ne copie pas les phrases de la source.
+
+Ne mentionne jamais :
+
+- « la source » ;
+- « l'article source » ;
+- « les informations fournies » ;
+- « selon les données » ;
+- « d'après le texte fourni ».
+
+Le lecteur doit avoir l'impression de lire un article sportif normalement rédigé.
 
 ========================================================
 TITRE
 ========================================================
 
-Crée un titre clair, naturel et informatif.
+Crée un titre informatif basé sur le fait principal.
 
-Le titre doit refléter le fait principal.
+Le titre doit éviter les formulations artificiellement sensationnalistes.
 
-Pour un article concernant un match ou une diffusion, le titre peut intégrer :
-
-- la date ;
-- l'heure ;
-- la chaîne ;
-
-uniquement lorsque ces informations sont réellement présentes dans les données.
-
+Il doit permettre au lecteur de comprendre immédiatement le sujet.
 
 ========================================================
 RÉSUMÉ
 ========================================================
 
-Crée un résumé d'une seule phrase.
+Une seule phrase.
 
-Il doit présenter immédiatement le fait principal.
-
-Lorsque la date, l'heure ou le diffuseur sont des informations centrales, conserve-les dans le résumé.
-
+Elle doit présenter le fait principal avec les informations les plus importantes.
 
 ========================================================
 CONTENU
 ========================================================
 
-Crée un article de 2 à 3 paragraphes maximum.
+2 à 3 paragraphes maximum.
 
-Le premier paragraphe doit donner immédiatement l'information principale.
+Chaque paragraphe doit apporter des informations concrètes.
 
-Le deuxième paragraphe doit apporter les détails importants.
+Ne remplis jamais artificiellement l'article.
 
-Le troisième paragraphe ne doit être utilisé que s'il existe une information supplémentaire réellement utile.
-
-Pour un article de match ou de diffusion, ne laisse jamais le lecteur chercher inutilement l'heure ou la chaîne lorsqu'elles sont présentes dans les données.
-
+Si la source contient beaucoup d'informations, sélectionne les plus importantes.
 
 ========================================================
-OBJECTIF
+CONTRÔLE FINAL
 ========================================================
 
-L'article doit être :
+Avant de répondre, vérifie mentalement :
 
-- précis ;
-- informatif ;
-- naturel ;
-- original ;
-- lisible ;
-- journalistique ;
-- factuel.
+1. Est-ce que chaque information importante vient réellement de la source ?
+2. Ai-je inventé une information ?
+3. Ai-je utilisé des phrases génériques sans valeur ?
+4. Ai-je conservé les noms propres ?
+5. Ai-je conservé les chiffres ?
+6. Ai-je conservé les dates et horaires lorsqu'ils existent ?
+7. Ai-je conservé les informations de diffusion lorsqu'elles existent ?
+8. Est-ce que le premier paragraphe donne immédiatement le fait principal ?
 
-La priorité absolue est :
+Si la réponse à une question est non, corrige l'article avant de répondre.
 
-1. exactitude ;
-2. conservation des faits ;
-3. clarté ;
-4. qualité journalistique ;
-5. reformulation originale.
-
+========================================================
+FORMAT DE RÉPONSE
+========================================================
 
 Réponds STRICTEMENT avec un objet JSON valide.
 
-Ne mets PAS de markdown.
+Aucun markdown.
 
-Ne mets PAS de texte avant le JSON.
+Aucun texte avant le JSON.
 
-Ne mets PAS de texte après le JSON.
+Aucun texte après le JSON.
 
-Format attendu :
+Format :
 
 {
-  "title": "Titre de l'article",
+  "title": "Titre informatif",
   "excerpt": "Résumé factuel en une phrase",
-  "content": "Premier paragraphe.\\n\\nDeuxième paragraphe.\\n\\nTroisième paragraphe si nécessaire."
+  "content": "Premier paragraphe factuel.\\n\\nDeuxième paragraphe factuel.\\n\\nTroisième paragraphe uniquement si nécessaire."
 }`;
 
   const res = await fetch(
@@ -656,7 +960,7 @@ Format attendu :
           },
         ],
         generationConfig: {
-          temperature: 0.4,
+          temperature: 0.2,
           responseMimeType: "application/json",
         },
       }),
@@ -668,7 +972,10 @@ Format attendu :
   if (!res.ok) {
     console.error(
       `Gemini HTTP ${res.status}:`,
-      responseText.substring(0, 2000)
+      responseText.substring(
+        0,
+        2000
+      )
     );
 
     throw new Error(
@@ -681,7 +988,9 @@ Format attendu :
   let data: any;
 
   try {
-    data = JSON.parse(responseText);
+    data = JSON.parse(
+      responseText
+    );
   } catch {
     throw new Error(
       `Réponse Gemini impossible à analyser : ${responseText.substring(
@@ -692,11 +1001,13 @@ Format attendu :
   }
 
   const text =
-    data?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+    data?.candidates?.[0]?.content?.parts?.[0]?.text ??
+    "";
 
   if (!text) {
     const finishReason =
-      data?.candidates?.[0]?.finishReason ?? "inconnu";
+      data?.candidates?.[0]?.finishReason ??
+      "inconnu";
 
     throw new Error(
       `Gemini n'a retourné aucun texte. finishReason=${finishReason}`
@@ -704,9 +1015,18 @@ Format attendu :
   }
 
   const cleaned = text
-    .replace(/^```json\s*/i, "")
-    .replace(/^```\s*/i, "")
-    .replace(/\s*```$/i, "")
+    .replace(
+      /^```json\s*/i,
+      ""
+    )
+    .replace(
+      /^```\s*/i,
+      ""
+    )
+    .replace(
+      /\s*```$/i,
+      ""
+    )
     .trim();
 
   let parsed: {
@@ -716,14 +1036,22 @@ Format attendu :
   };
 
   try {
-    parsed = JSON.parse(cleaned);
+    parsed = JSON.parse(
+      cleaned
+    );
   } catch {
     throw new Error(
-      `JSON Gemini invalide : ${cleaned.substring(0, 1500)}`
+      `JSON Gemini invalide : ${cleaned.substring(
+        0,
+        1500
+      )}`
     );
   }
 
-  if (!parsed.title || !parsed.content) {
+  if (
+    !parsed.title ||
+    !parsed.content
+  ) {
     throw new Error(
       `Réponse Gemini incomplète : ${JSON.stringify(
         parsed
@@ -732,34 +1060,61 @@ Format attendu :
   }
 
   return {
-    title: String(parsed.title).trim(),
-    excerpt: String(parsed.excerpt ?? "").trim(),
-    content: String(parsed.content).trim(),
+    title: String(
+      parsed.title
+    ).trim(),
+    excerpt: String(
+      parsed.excerpt ?? ""
+    ).trim(),
+    content: String(
+      parsed.content
+    ).trim(),
   };
 }
 
-function extractGeminiError(responseText: string): string {
+function extractGeminiError(
+  responseText: string
+): string {
   try {
-    const data = JSON.parse(responseText);
+    const data = JSON.parse(
+      responseText
+    );
 
     return (
       data?.error?.message ??
       data?.error?.status ??
-      responseText.substring(0, 1000)
+      responseText.substring(
+        0,
+        1000
+      )
     );
   } catch {
-    return responseText.substring(0, 1000);
+    return responseText.substring(
+      0,
+      1000
+    );
   }
 }
 
-function slugify(title: string): string {
+function slugify(
+  title: string
+): string {
   return (
     title
       .toLowerCase()
       .normalize("NFD")
-      .replace(/[\u0300-\u036f]/g, "")
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/(^-|-$)/g, "") +
+      .replace(
+        /[\u0300-\u036f]/g,
+        ""
+      )
+      .replace(
+        /[^a-z0-9]+/g,
+        "-"
+      )
+      .replace(
+        /(^-|-$)/g,
+        ""
+      ) +
     "-" +
     Date.now().toString(36)
   );
