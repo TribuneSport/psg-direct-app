@@ -33,3 +33,17 @@ model Article {
   @@index([club])
   @@index([publishedAt])
 }
+
+model DeviceToken {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  createdAt DateTime @default(now())
+}
+
+model MatchState {
+  id         String   @id @default("current")
+  homeScore  Int      @default(0)
+  awayScore  Int      @default(0)
+  status     String   @default("")
+  updatedAt DateTime @updatedAt
+}
