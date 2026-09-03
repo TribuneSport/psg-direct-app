@@ -52,11 +52,10 @@ export async function GET(req: NextRequest) {
     }
 
     /*
-     * On cherche le premier article RSS qui n'existe pas encore
-     * dans la base de données.
+     * Un seul article est traité par exécution.
      *
-     * Un seul article est traité par exécution afin de rester
-     * sous la limite de 30 secondes de cron-job.org.
+     * Cela permet de rester sous la limite de 30 secondes
+     * de cron-job.org.
      */
 
     let selectedItem: RssItem | null = null;
@@ -136,7 +135,10 @@ export async function GET(req: NextRequest) {
         skipped: 0,
         failed: 1,
         errors: [
-          `Article "${selectedItem.title.substring(0, 100)}" : ${message}`,
+          `Article "${selectedItem.title.substring(
+            0,
+            100
+          )}" : ${message}`,
         ],
       });
     }
@@ -222,9 +224,11 @@ async function rewriteWithGemini(
   excerpt: string;
   content: string;
 }> {
-  const prompt = `Tu es journaliste sportif spécialisé dans le Paris Saint-Germain.
+  const prompt = `Tu es un journaliste sportif professionnel spécialisé dans le Paris Saint-Germain.
 
-À partir de l'information brute ci-dessous, rédige un article sportif ORIGINAL en français.
+Ta mission est de transformer l'information source ci-dessous en un véritable article de presse sportive ORIGINAL, précis, factuel et naturel en français.
+
+================ INFORMATION SOURCE ================
 
 Titre source :
 ${originalTitle}
@@ -232,22 +236,241 @@ ${originalTitle}
 Description source :
 ${originalDescription}
 
-Consignes :
-- Reformule entièrement l'information.
-- Ne recopie pas les phrases de la source.
-- Ne crée aucune information qui n'est pas présente dans la source.
-- Crée un titre clair et accrocheur.
-- Crée un résumé d'une seule phrase.
-- Crée un contenu de 2 à 3 paragraphes.
-- Le contenu doit être naturel et journalistique.
+=====================================================
 
-Réponds STRICTEMENT avec un objet JSON valide, sans markdown et sans texte avant ou après.
+
+RÈGLE ABSOLUE : CONSERVE LES FAITS IMPORTANTS
+
+Tu dois d'abord identifier mentalement tous les faits présents dans le titre et la description source avant de rédiger.
+
+Tu dois conserver dans l'article, lorsqu'ils sont présents dans la source :
+
+- les noms des équipes ;
+- les noms des joueurs ;
+- les noms des entraîneurs ;
+- les noms des dirigeants ;
+- la compétition ;
+- la date ;
+- l'heure exacte du match ou de l'événement ;
+- la chaîne TV ;
+- la plateforme de diffusion ;
+- le diffuseur ;
+- le stade ou le lieu ;
+- le score ;
+- les absences ;
+- les blessures ;
+- les suspensions ;
+- les informations de mercato ;
+- les montants ;
+- les durées de contrat ;
+- les dates de contrat ;
+- toutes les autres données chiffrées importantes ;
+- toutes les informations concrètes permettant de comprendre l'actualité.
+
+
+=====================================================
+RÈGLE SPÉCIALE POUR LES ARTICLES MATCH / TV / DIFFUSION
+=====================================================
+
+Si le sujet concerne :
+
+- un match ;
+- un horaire ;
+- une chaîne TV ;
+- une diffusion ;
+- une retransmission ;
+- une plateforme ;
+- la question « sur quelle chaîne regarder » ;
+- la question « à quelle heure regarder » ;
+- ou une combinaison de ces éléments ;
+
+tu dois rechercher dans les informations fournies TOUS les éléments disponibles concernant :
+
+1. la date ;
+2. l'heure du coup d'envoi ;
+3. la chaîne de télévision ;
+4. la plateforme de diffusion ;
+5. le diffuseur ;
+6. les équipes ;
+7. la compétition ;
+8. le stade ou le lieu lorsqu'il est indiqué.
+
+SI L'HEURE EST PRÉSENTE DANS LA SOURCE :
+
+Elle DOIT apparaître explicitement dans le contenu final.
+
+Ne la remplace jamais par une formulation vague.
+
+SI LA CHAÎNE OU LA PLATEFORME EST PRÉSENTE DANS LA SOURCE :
+
+Elle DOIT apparaître explicitement dans le contenu final.
+
+Ne la remplace jamais par une formulation vague.
+
+SI LA DATE EST PRÉSENTE :
+
+Elle DOIT être conservée.
+
+SI LE STADE EST PRÉSENT :
+
+Il DOIT être conservé.
+
+
+=====================================================
+INTERDICTION DES FORMULATIONS VAGUES
+=====================================================
+
+Ne transforme jamais une information précise en phrase générique.
+
+INTERDIT :
+
+« Les supporters pourront connaître les détails de la diffusion. »
+
+INTERDIT :
+
+« Les précisions concernant la rencontre sont désormais disponibles. »
+
+INTERDIT :
+
+« Les fans pourront suivre cette rencontre dans les meilleures conditions. »
+
+INTERDIT :
+
+« Il faudra se renseigner pour connaître l'horaire exact. »
+
+Si l'information précise est disponible, donne directement l'information.
+
+Exemple :
+
+« Le coup d'envoi est prévu à 21h05 et la rencontre sera diffusée sur Ligue 1+. »
+
+Autre exemple :
+
+« PSG - Monaco débutera à 21h05 ce vendredi et sera diffusé en direct sur Ligue 1+. »
+
+Le lecteur doit pouvoir comprendre immédiatement QUAND et OÙ regarder le match lorsqu'une information de diffusion est présente dans la source.
+
+
+=====================================================
+NE JAMAIS INVENTER
+=====================================================
+
+N'invente aucune information.
+
+N'invente jamais :
+
+- une heure ;
+- une chaîne ;
+- une plateforme ;
+- un score ;
+- un joueur ;
+- une blessure ;
+- une suspension ;
+- un transfert ;
+- un montant ;
+- une date ;
+- un stade ;
+- un résultat ;
+- une déclaration ;
+- une statistique.
+
+Si une information n'est pas présente dans les informations source, tu ne dois pas la créer.
+
+Tu dois uniquement utiliser les informations fournies.
+
+
+=====================================================
+QUALITÉ JOURNALISTIQUE
+=====================================================
+
+Le résultat doit ressembler à un véritable article de presse sportive.
+
+- Reformule entièrement les phrases de la source.
+- Ne copie pas les phrases originales.
+- Ne fais pas une simple paraphrase mécanique.
+- Va directement à l'information importante.
+- Évite les phrases génériques.
+- Évite les répétitions.
+- Ne remplis jamais artificiellement l'article.
+- Ne parle jamais de « la source ».
+- Ne parle jamais de « l'article source ».
+- Ne parle jamais de ton travail de rédaction.
+- Ne dis jamais « selon les informations fournies ».
+- Ne dis jamais qu'une information est « désormais accessible » si tu ne donnes pas réellement cette information.
+- Le premier paragraphe doit présenter immédiatement le fait principal.
+- Le deuxième paragraphe doit apporter les informations importantes.
+- Un troisième paragraphe peut être utilisé uniquement s'il apporte une information supplémentaire.
+
+
+=====================================================
+TITRE
+=====================================================
+
+Crée un titre clair, naturel et informatif.
+
+Le titre doit refléter fidèlement le sujet.
+
+Pour un article concernant une diffusion TV ou un horaire, tu peux intégrer l'heure ou le diffuseur dans le titre UNIQUEMENT si ces informations sont présentes dans la source.
+
+
+=====================================================
+RÉSUMÉ
+=====================================================
+
+Crée un résumé d'une seule phrase.
+
+Le résumé doit contenir le fait principal.
+
+Lorsque la source contient une date, une heure ou un diffuseur important, le résumé doit conserver ces informations lorsque cela est pertinent.
+
+
+=====================================================
+CONTENU
+=====================================================
+
+Crée un article de 2 à 3 paragraphes maximum.
+
+Le contenu doit conserver les informations factuelles importantes présentes dans la source.
+
+Pour les articles de match, de diffusion ou d'horaire, les informations concernant :
+
+- la date ;
+- l'heure ;
+- la chaîne ;
+- la plateforme ;
+
+doivent être explicitement mentionnées lorsqu'elles sont présentes dans la source.
+
+
+=====================================================
+IMPORTANT
+=====================================================
+
+Ne cherche pas à rendre l'article plus spectaculaire en inventant des informations.
+
+La priorité absolue est :
+
+1. exactitude ;
+2. conservation des faits ;
+3. clarté ;
+4. qualité journalistique ;
+5. reformulation originale.
+
+
+Réponds STRICTEMENT avec un objet JSON valide.
+
+Ne mets PAS de markdown.
+
+Ne mets PAS de texte avant le JSON.
+
+Ne mets PAS de texte après le JSON.
 
 Format attendu :
+
 {
-  "title": "...",
-  "excerpt": "...",
-  "content": "..."
+  "title": "Titre de l'article",
+  "excerpt": "Résumé factuel en une phrase",
+  "content": "Premier paragraphe.\\n\\nDeuxième paragraphe.\\n\\nTroisième paragraphe si nécessaire."
 }`;
 
   const res = await fetch(
@@ -268,7 +491,7 @@ Format attendu :
           },
         ],
         generationConfig: {
-          temperature: 0.7,
+          temperature: 0.4,
           responseMimeType: "application/json",
         },
       }),
@@ -284,7 +507,9 @@ Format attendu :
     );
 
     throw new Error(
-      `Gemini HTTP ${res.status} : ${extractGeminiError(responseText)}`
+      `Gemini HTTP ${res.status} : ${extractGeminiError(
+        responseText
+      )}`
     );
   }
 
@@ -335,10 +560,9 @@ Format attendu :
 
   if (!parsed.title || !parsed.content) {
     throw new Error(
-      `Réponse Gemini incomplète : ${JSON.stringify(parsed).substring(
-        0,
-        1500
-      )}`
+      `Réponse Gemini incomplète : ${JSON.stringify(
+        parsed
+      ).substring(0, 1500)}`
     );
   }
 
