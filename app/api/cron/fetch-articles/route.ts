@@ -40,76 +40,106 @@ export async function GET(req: NextRequest) {
   try {
     const items = await fetchRssItems();
 
-    let created = 0;
-    let skipped = 0;
-    let failed = 0;
+    if (items.length === 0) {
+      return NextResponse.json({
+        checked: 0,
+        processed: 0,
+        created: 0,
+        skipped: 0,
+        failed: 0,
+        errors: [],
+      });
+    }
 
-    const errors: string[] = [];
+    /*
+     * On cherche le premier article RSS qui n'existe pas encore
+     * dans la base de données.
+     *
+     * Un seul article est traité par exécution afin de rester
+     * sous la limite de 30 secondes de cron-job.org.
+     */
 
-    for (const item of items.slice(0, 5)) {
-      try {
-        const existing = await prisma.article.findUnique({
-          where: {
-            sourceUrl: item.link,
-          },
-        });
+    let selectedItem: RssItem | null = null;
 
-        if (existing) {
-          skipped++;
-          continue;
-        }
+    for (const item of items) {
+      const existing = await prisma.article.findUnique({
+        where: {
+          sourceUrl: item.link,
+        },
+        select: {
+          id: true,
+        },
+      });
 
-        const rewritten = await rewriteWithGemini(
-          item.title,
-          item.description
-        );
-
-        if (!rewritten) {
-          failed++;
-          errors.push(
-            `Gemini n'a pas pu réécrire : ${item.title.substring(0, 100)}`
-          );
-          continue;
-        }
-
-        const slug = slugify(rewritten.title);
-
-        await prisma.article.create({
-          data: {
-            title: rewritten.title,
-            slug,
-            content: rewritten.content,
-            excerpt: rewritten.excerpt,
-            club: "PSG",
-            status: "DRAFT",
-            isAiGenerated: true,
-            sourceUrl: item.link,
-          },
-        });
-
-        created++;
-      } catch (error) {
-        failed++;
-
-        const message =
-          error instanceof Error ? error.message : String(error);
-
-        errors.push(
-          `Article "${item.title.substring(0, 80)}" : ${message}`
-        );
-
-        console.error("Erreur traitement article :", error);
+      if (!existing) {
+        selectedItem = item;
+        break;
       }
     }
 
-    return NextResponse.json({
-      checked: items.length,
-      processed: Math.min(items.length, 5),
-      created,
-      skipped,
-      failed,
-      errors,
-    });
+    if (!selectedItem) {
+      return NextResponse.json({
+        checked: items.length,
+        processed: 0,
+        created: 0,
+        skipped: items.length,
+        failed: 0,
+        errors: [],
+        message: "Tous les articles RSS disponibles existent déjà.",
+      });
+    }
+
+    try {
+      const rewritten = await rewriteWithGemini(
+        selectedItem.title,
+        selectedItem.description
+      );
+
+      const slug = slugify(rewritten.title);
+
+      const article = await prisma.article.create({
+        data: {
+          title: rewritten.title,
+          slug,
+          content: rewritten.content,
+          excerpt: rewritten.excerpt,
+          club: "PSG",
+          status: "DRAFT",
+          isAiGenerated: true,
+          sourceUrl: selectedItem.link,
+        },
+      });
+
+      return NextResponse.json({
+        checked: items.length,
+        processed: 1,
+        created: 1,
+        skipped: items.length - 1,
+        failed: 0,
+        errors: [],
+        article: {
+          id: article.id,
+          title: article.title,
+          status: article.status,
+        },
+      });
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : String(error);
+
+      console.error("Erreur traitement article :", error);
+
+      return NextResponse.json({
+        checked: items.length,
+        processed: 1,
+        created: 0,
+        skipped: 0,
+        failed: 1,
+        errors: [
+          `Article "${selectedItem.title.substring(0, 100)}" : ${message}`,
+        ],
+      });
+    }
   } catch (error) {
     const message =
       error instanceof Error ? error.message : String(error);
@@ -191,7 +221,7 @@ async function rewriteWithGemini(
   title: string;
   excerpt: string;
   content: string;
-} | null> {
+}> {
   const prompt = `Tu es journaliste sportif spécialisé dans le Paris Saint-Germain.
 
 À partir de l'information brute ci-dessous, rédige un article sportif ORIGINAL en français.
@@ -220,109 +250,103 @@ Format attendu :
   "content": "..."
 }`;
 
-  try {
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${GEMINI_API_KEY}`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          contents: [
-            {
-              parts: [
-                {
-                  text: prompt,
-                },
-              ],
-            },
-          ],
-          generationConfig: {
-            temperature: 0.7,
-            responseMimeType: "application/json",
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${GEMINI_API_KEY}`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        contents: [
+          {
+            parts: [
+              {
+                text: prompt,
+              },
+            ],
           },
-        }),
-      }
+        ],
+        generationConfig: {
+          temperature: 0.7,
+          responseMimeType: "application/json",
+        },
+      }),
+    }
+  );
+
+  const responseText = await res.text();
+
+  if (!res.ok) {
+    console.error(
+      `Gemini HTTP ${res.status}:`,
+      responseText.substring(0, 2000)
     );
 
-    const responseText = await res.text();
-
-    if (!res.ok) {
-      console.error(
-        `Gemini HTTP ${res.status}:`,
-        responseText.substring(0, 2000)
-      );
-
-      throw new Error(
-        `Gemini HTTP ${res.status} : ${extractGeminiError(responseText)}`
-      );
-    }
-
-    let data: any;
-
-    try {
-      data = JSON.parse(responseText);
-    } catch {
-      throw new Error(
-        `Réponse Gemini impossible à analyser : ${responseText.substring(
-          0,
-          1000
-        )}`
-      );
-    }
-
-    const text =
-      data?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
-
-    if (!text) {
-      const finishReason =
-        data?.candidates?.[0]?.finishReason ?? "inconnu";
-
-      throw new Error(
-        `Gemini n'a retourné aucun texte. finishReason=${finishReason}`
-      );
-    }
-
-    const cleaned = text
-      .replace(/^```json\s*/i, "")
-      .replace(/^```\s*/i, "")
-      .replace(/\s*```$/i, "")
-      .trim();
-
-    let parsed: {
-      title?: string;
-      excerpt?: string;
-      content?: string;
-    };
-
-    try {
-      parsed = JSON.parse(cleaned);
-    } catch {
-      throw new Error(
-        `JSON Gemini invalide : ${cleaned.substring(0, 1500)}`
-      );
-    }
-
-    if (!parsed.title || !parsed.content) {
-      throw new Error(
-        `Réponse Gemini incomplète : ${JSON.stringify(parsed).substring(
-          0,
-          1500
-        )}`
-      );
-    }
-
-    return {
-      title: String(parsed.title).trim(),
-      excerpt: String(parsed.excerpt ?? "").trim(),
-      content: String(parsed.content).trim(),
-    };
-  } catch (error) {
-    console.error("Erreur Gemini :", error);
-
-    throw error;
+    throw new Error(
+      `Gemini HTTP ${res.status} : ${extractGeminiError(responseText)}`
+    );
   }
+
+  let data: any;
+
+  try {
+    data = JSON.parse(responseText);
+  } catch {
+    throw new Error(
+      `Réponse Gemini impossible à analyser : ${responseText.substring(
+        0,
+        1000
+      )}`
+    );
+  }
+
+  const text =
+    data?.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+
+  if (!text) {
+    const finishReason =
+      data?.candidates?.[0]?.finishReason ?? "inconnu";
+
+    throw new Error(
+      `Gemini n'a retourné aucun texte. finishReason=${finishReason}`
+    );
+  }
+
+  const cleaned = text
+    .replace(/^```json\s*/i, "")
+    .replace(/^```\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+
+  let parsed: {
+    title?: string;
+    excerpt?: string;
+    content?: string;
+  };
+
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch {
+    throw new Error(
+      `JSON Gemini invalide : ${cleaned.substring(0, 1500)}`
+    );
+  }
+
+  if (!parsed.title || !parsed.content) {
+    throw new Error(
+      `Réponse Gemini incomplète : ${JSON.stringify(parsed).substring(
+        0,
+        1500
+      )}`
+    );
+  }
+
+  return {
+    title: String(parsed.title).trim(),
+    excerpt: String(parsed.excerpt ?? "").trim(),
+    content: String(parsed.content).trim(),
+  };
 }
 
 function extractGeminiError(responseText: string): string {
