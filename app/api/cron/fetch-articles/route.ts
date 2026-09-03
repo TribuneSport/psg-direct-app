@@ -89,9 +89,22 @@ export async function GET(req: NextRequest) {
     }
 
     try {
+      /*
+       * On récupère maintenant le contenu de la page source.
+       *
+       * Le RSS de Google News contient souvent un titre et une
+       * description trop courte. La page source peut contenir
+       * les informations précises : heure, chaîne, joueurs,
+       * absences, lieu, montant, etc.
+       */
+      const sourceContent = await fetchSourceArticle(
+        selectedItem.link
+      );
+
       const rewritten = await rewriteWithGemini(
         selectedItem.title,
-        selectedItem.description
+        selectedItem.description,
+        sourceContent
       );
 
       const slug = slugify(rewritten.title);
@@ -116,6 +129,7 @@ export async function GET(req: NextRequest) {
         skipped: items.length - 1,
         failed: 0,
         errors: [],
+        sourceContentRetrieved: sourceContent.length > 0,
         article: {
           id: article.id,
           title: article.title,
@@ -200,6 +214,140 @@ async function fetchRssItems(): Promise<RssItem[]> {
   return items;
 }
 
+/**
+ * Récupère le contenu texte de la page source.
+ *
+ * On essaie de rester léger pour ne pas dépasser la limite
+ * de temps du cron.
+ */
+async function fetchSourceArticle(url: string): Promise<string> {
+  try {
+    const controller = new AbortController();
+
+    const timeout = setTimeout(() => {
+      controller.abort();
+    }, 7000);
+
+    const res = await fetch(url, {
+      method: "GET",
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
+        Accept:
+          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+      },
+      cache: "no-store",
+      redirect: "follow",
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeout);
+
+    if (!res.ok) {
+      console.warn(
+        `Page source inaccessible HTTP ${res.status} : ${url}`
+      );
+
+      return "";
+    }
+
+    const html = await res.text();
+
+    if (!html) {
+      return "";
+    }
+
+    const content = extractMainText(html);
+
+    /*
+     * Limite volontaire pour éviter d'envoyer des milliers
+     * de caractères inutiles à Gemini.
+     */
+    return content.substring(0, 12000);
+  } catch (error) {
+    console.warn(
+      "Impossible de récupérer la page source :",
+      error instanceof Error ? error.message : String(error)
+    );
+
+    return "";
+  }
+}
+
+/**
+ * Transforme une page HTML en texte exploitable.
+ *
+ * On supprime :
+ * - scripts
+ * - styles
+ * - SVG
+ * - éléments de navigation
+ * - commentaires HTML
+ *
+ * Puis on récupère le texte visible.
+ */
+function extractMainText(html: string): string {
+  let text = html;
+
+  text = text.replace(
+    /<script\b[^>]*>[\s\S]*?<\/script>/gi,
+    " "
+  );
+
+  text = text.replace(
+    /<style\b[^>]*>[\s\S]*?<\/style>/gi,
+    " "
+  );
+
+  text = text.replace(
+    /<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi,
+    " "
+  );
+
+  text = text.replace(
+    /<svg\b[^>]*>[\s\S]*?<\/svg>/gi,
+    " "
+  );
+
+  text = text.replace(
+    /<!--[\s\S]*?-->/g,
+    " "
+  );
+
+  text = text.replace(
+    /<(nav|header|footer|aside|form|button)\b[^>]*>[\s\S]*?<\/\1>/gi,
+    " "
+  );
+
+  text = text.replace(/<[^>]+>/g, " ");
+
+  text = decodeHtmlEntities(text);
+
+  text = text.replace(/\s+/g, " ").trim();
+
+  return text;
+}
+
+function decodeHtmlEntities(text: string): string {
+  return text
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&apos;/gi, "'")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&#x27;/gi, "'")
+    .replace(/&#x2F;/gi, "/")
+    .replace(/&#(\d+);/g, (_, code) => {
+      return String.fromCharCode(Number(code));
+    })
+    .replace(/&#x([0-9a-f]+);/gi, (_, code) => {
+      return String.fromCharCode(parseInt(code, 16));
+    });
+}
+
 function extractTag(xml: string, tag: string): string {
   const match = xml.match(
     new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`)
@@ -218,7 +366,8 @@ function cleanText(text: string): string {
 
 async function rewriteWithGemini(
   originalTitle: string,
-  originalDescription: string
+  originalDescription: string,
+  sourceContent: string
 ): Promise<{
   title: string;
   excerpt: string;
@@ -226,24 +375,36 @@ async function rewriteWithGemini(
 }> {
   const prompt = `Tu es un journaliste sportif professionnel spécialisé dans le Paris Saint-Germain.
 
-Ta mission est de transformer l'information source ci-dessous en un véritable article de presse sportive ORIGINAL, précis, factuel et naturel en français.
+Ta mission est de transformer les informations fournies ci-dessous en un véritable article de presse sportive ORIGINAL, précis, factuel et naturel en français.
 
-================ INFORMATION SOURCE ================
+Tu disposes de trois niveaux d'information :
 
-Titre source :
+1. TITRE RSS
+2. DESCRIPTION RSS
+3. CONTENU DE LA PAGE SOURCE
+
+Le contenu de la page source est prioritaire lorsqu'il apporte davantage de détails factuels.
+
+================ TITRE RSS ================
+
 ${originalTitle}
 
-Description source :
+================ DESCRIPTION RSS ================
+
 ${originalDescription}
 
-=====================================================
+================ CONTENU DE LA PAGE SOURCE ================
+
+${sourceContent || "Aucun contenu source supplémentaire disponible."}
+
+========================================================
 
 
-RÈGLE ABSOLUE : CONSERVE LES FAITS IMPORTANTS
+RÈGLE ABSOLUE : CONSERVE LES FAITS
 
-Tu dois d'abord identifier mentalement tous les faits présents dans le titre et la description source avant de rédiger.
+Tu dois identifier les informations factuelles réellement présentes dans les données fournies avant de rédiger.
 
-Tu dois conserver dans l'article, lorsqu'ils sont présents dans la source :
+Conserve, lorsqu'elles sont présentes :
 
 - les noms des équipes ;
 - les noms des joueurs ;
@@ -251,11 +412,12 @@ Tu dois conserver dans l'article, lorsqu'ils sont présents dans la source :
 - les noms des dirigeants ;
 - la compétition ;
 - la date ;
-- l'heure exacte du match ou de l'événement ;
+- l'heure exacte ;
 - la chaîne TV ;
 - la plateforme de diffusion ;
 - le diffuseur ;
-- le stade ou le lieu ;
+- le stade ;
+- le lieu ;
 - le score ;
 - les absences ;
 - les blessures ;
@@ -263,64 +425,62 @@ Tu dois conserver dans l'article, lorsqu'ils sont présents dans la source :
 - les informations de mercato ;
 - les montants ;
 - les durées de contrat ;
-- les dates de contrat ;
-- toutes les autres données chiffrées importantes ;
-- toutes les informations concrètes permettant de comprendre l'actualité.
+- les dates ;
+- les statistiques ;
+- les déclarations réellement présentes ;
+- toutes les données chiffrées importantes.
 
 
-=====================================================
-RÈGLE SPÉCIALE POUR LES ARTICLES MATCH / TV / DIFFUSION
-=====================================================
+========================================================
+RÈGLE TRÈS IMPORTANTE : PRIORITÉ AUX INFORMATIONS
+========================================================
 
-Si le sujet concerne :
+Si le titre RSS ou la description RSS est vague mais que le contenu de la page source contient une information précise, utilise cette information précise.
 
-- un match ;
-- un horaire ;
-- une chaîne TV ;
-- une diffusion ;
-- une retransmission ;
-- une plateforme ;
-- la question « sur quelle chaîne regarder » ;
-- la question « à quelle heure regarder » ;
-- ou une combinaison de ces éléments ;
+Exemple :
 
-tu dois rechercher dans les informations fournies TOUS les éléments disponibles concernant :
+Si le RSS indique :
 
-1. la date ;
-2. l'heure du coup d'envoi ;
-3. la chaîne de télévision ;
-4. la plateforme de diffusion ;
-5. le diffuseur ;
-6. les équipes ;
-7. la compétition ;
-8. le stade ou le lieu lorsqu'il est indiqué.
+« PSG - Monaco : les détails pour suivre le match »
 
-SI L'HEURE EST PRÉSENTE DANS LA SOURCE :
+mais que la page source indique :
 
-Elle DOIT apparaître explicitement dans le contenu final.
+« La rencontre aura lieu vendredi 4 septembre à 21h05 et sera diffusée sur Ligue 1+. »
 
-Ne la remplace jamais par une formulation vague.
+alors l'article final DOIT mentionner :
 
-SI LA CHAÎNE OU LA PLATEFORME EST PRÉSENTE DANS LA SOURCE :
+- vendredi 4 septembre ;
+- 21h05 ;
+- PSG ;
+- Monaco ;
+- Ligue 1 ;
+- Ligue 1+.
 
-Elle DOIT apparaître explicitement dans le contenu final.
-
-Ne la remplace jamais par une formulation vague.
-
-SI LA DATE EST PRÉSENTE :
-
-Elle DOIT être conservée.
-
-SI LE STADE EST PRÉSENT :
-
-Il DOIT être conservé.
+Ne transforme jamais ces informations en phrase vague.
 
 
-=====================================================
+========================================================
+ARTICLES MATCH / TV / DIFFUSION
+========================================================
+
+Si le sujet concerne un match, une diffusion ou un horaire, cherche en priorité dans toutes les informations disponibles :
+
+1. date ;
+2. heure ;
+3. chaîne ;
+4. plateforme ;
+5. diffuseur ;
+6. équipes ;
+7. compétition ;
+8. stade ;
+9. lieu.
+
+Lorsqu'une de ces informations est présente dans la source, elle doit être explicitement conservée dans l'article.
+
+
+========================================================
 INTERDICTION DES FORMULATIONS VAGUES
-=====================================================
-
-Ne transforme jamais une information précise en phrase générique.
+========================================================
 
 INTERDIT :
 
@@ -336,28 +496,22 @@ INTERDIT :
 
 INTERDIT :
 
-« Il faudra se renseigner pour connaître l'horaire exact. »
+« Les informations concernant la programmation seront à retrouver prochainement. »
 
-Si l'information précise est disponible, donne directement l'information.
+Si une information précise est disponible, donne-la directement.
 
 Exemple :
 
-« Le coup d'envoi est prévu à 21h05 et la rencontre sera diffusée sur Ligue 1+. »
-
-Autre exemple :
-
-« PSG - Monaco débutera à 21h05 ce vendredi et sera diffusé en direct sur Ligue 1+. »
-
-Le lecteur doit pouvoir comprendre immédiatement QUAND et OÙ regarder le match lorsqu'une information de diffusion est présente dans la source.
+« Le PSG recevra Monaco vendredi 4 septembre à 21h05 au Parc des Princes. La rencontre sera diffusée sur Ligue 1+. »
 
 
-=====================================================
+========================================================
 NE JAMAIS INVENTER
-=====================================================
+========================================================
 
-N'invente aucune information.
+N'invente absolument aucune information.
 
-N'invente jamais :
+Tu ne dois jamais inventer :
 
 - une heure ;
 - une chaîne ;
@@ -370,83 +524,94 @@ N'invente jamais :
 - un montant ;
 - une date ;
 - un stade ;
-- un résultat ;
 - une déclaration ;
 - une statistique.
 
-Si une information n'est pas présente dans les informations source, tu ne dois pas la créer.
+Si une information n'est pas présente dans les données fournies, ne l'invente pas.
 
-Tu dois uniquement utiliser les informations fournies.
+Si une information est absente, omets-la simplement.
 
 
-=====================================================
+========================================================
 QUALITÉ JOURNALISTIQUE
-=====================================================
+========================================================
 
-Le résultat doit ressembler à un véritable article de presse sportive.
+Le texte doit ressembler à un véritable article publié sur un média sportif.
 
-- Reformule entièrement les phrases de la source.
-- Ne copie pas les phrases originales.
-- Ne fais pas une simple paraphrase mécanique.
-- Va directement à l'information importante.
-- Évite les phrases génériques.
+- Reformule entièrement les informations.
+- Ne copie pas les phrases de la source.
+- Ne fais pas une paraphrase mécanique.
+- Commence directement par l'information principale.
+- Évite les introductions génériques.
 - Évite les répétitions.
-- Ne remplis jamais artificiellement l'article.
+- Évite les phrases qui ne donnent aucune information.
+- Ne remplis jamais artificiellement le texte.
 - Ne parle jamais de « la source ».
 - Ne parle jamais de « l'article source ».
-- Ne parle jamais de ton travail de rédaction.
+- Ne parle jamais de ton travail.
 - Ne dis jamais « selon les informations fournies ».
-- Ne dis jamais qu'une information est « désormais accessible » si tu ne donnes pas réellement cette information.
-- Le premier paragraphe doit présenter immédiatement le fait principal.
-- Le deuxième paragraphe doit apporter les informations importantes.
-- Un troisième paragraphe peut être utilisé uniquement s'il apporte une information supplémentaire.
+- Ne dis jamais « les détails sont désormais accessibles » sans donner les détails.
+- Le premier paragraphe doit contenir le fait principal.
+- Le deuxième paragraphe doit apporter les informations complémentaires.
+- Un troisième paragraphe est autorisé uniquement s'il apporte une information réellement utile.
 
 
-=====================================================
+========================================================
 TITRE
-=====================================================
+========================================================
 
 Crée un titre clair, naturel et informatif.
 
-Le titre doit refléter fidèlement le sujet.
+Le titre doit refléter le fait principal.
 
-Pour un article concernant une diffusion TV ou un horaire, tu peux intégrer l'heure ou le diffuseur dans le titre UNIQUEMENT si ces informations sont présentes dans la source.
-
-
-=====================================================
-RÉSUMÉ
-=====================================================
-
-Crée un résumé d'une seule phrase.
-
-Le résumé doit contenir le fait principal.
-
-Lorsque la source contient une date, une heure ou un diffuseur important, le résumé doit conserver ces informations lorsque cela est pertinent.
-
-
-=====================================================
-CONTENU
-=====================================================
-
-Crée un article de 2 à 3 paragraphes maximum.
-
-Le contenu doit conserver les informations factuelles importantes présentes dans la source.
-
-Pour les articles de match, de diffusion ou d'horaire, les informations concernant :
+Pour un article concernant un match ou une diffusion, le titre peut intégrer :
 
 - la date ;
 - l'heure ;
 - la chaîne ;
-- la plateforme ;
 
-doivent être explicitement mentionnées lorsqu'elles sont présentes dans la source.
+uniquement lorsque ces informations sont réellement présentes dans les données.
 
 
-=====================================================
-IMPORTANT
-=====================================================
+========================================================
+RÉSUMÉ
+========================================================
 
-Ne cherche pas à rendre l'article plus spectaculaire en inventant des informations.
+Crée un résumé d'une seule phrase.
+
+Il doit présenter immédiatement le fait principal.
+
+Lorsque la date, l'heure ou le diffuseur sont des informations centrales, conserve-les dans le résumé.
+
+
+========================================================
+CONTENU
+========================================================
+
+Crée un article de 2 à 3 paragraphes maximum.
+
+Le premier paragraphe doit donner immédiatement l'information principale.
+
+Le deuxième paragraphe doit apporter les détails importants.
+
+Le troisième paragraphe ne doit être utilisé que s'il existe une information supplémentaire réellement utile.
+
+Pour un article de match ou de diffusion, ne laisse jamais le lecteur chercher inutilement l'heure ou la chaîne lorsqu'elles sont présentes dans les données.
+
+
+========================================================
+OBJECTIF
+========================================================
+
+L'article doit être :
+
+- précis ;
+- informatif ;
+- naturel ;
+- original ;
+- lisible ;
+- journalistique ;
+- factuel.
 
 La priorité absolue est :
 
