@@ -1,23 +1,18 @@
 {
-  "name": "psg-direct-backoffice",
-  "version": "1.0.0",
-  "private": true,
-  "scripts": {
-    "dev": "next dev",
-    "build": "prisma generate && next build",
-    "start": "next start",
-    "postinstall": "prisma generate"
-  },
-  "dependencies": {
-    "next": "14.2.5",
-    "react": "18.3.1",
-    "react-dom": "18.3.1",
-    "@prisma/client": "5.18.0"
-  },
-  "devDependencies": {
-    "prisma": "5.18.0",
-    "typescript": "5.5.4",
-    "@types/node": "20.14.15",
-    "@types/react": "18.3.3"
+  "expo": {
+    "name": "PSG Direct",
+    "slug": "psg-direct",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "android": {
+      "package": "com.psgdirect.app",
+      "adaptiveIcon": {
+        "backgroundColor": "#0A1B4D"
+      }
+    },
+    "ios": {
+      "bundleIdentifier": "com.psgdirect.app"
+    }
   }
 }
