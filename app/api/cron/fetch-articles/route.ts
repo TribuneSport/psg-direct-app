@@ -1,4 +1,3 @@
-````ts
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 
@@ -1096,4 +1095,3 @@ function slugify(
     `${base}-${Date.now().toString(36)}`
   );
 }
-````
