@@ -4,20 +4,25 @@ import { prisma } from "@/lib/prisma";
 const CRON_SECRET = process.env.CRON_SECRET!;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY!;
 
-// Flux Google News filtré sur le PSG
-const RSS_URL =
-  "https://news.google.com/rss/search?q=PSG+Paris+Saint-Germain+football&hl=fr&gl=FR&ceid=FR:fr";
+const RSS_FEEDS = [
+  {
+    name: "Google News",
+    url: "https://news.google.com/rss/search?q=PSG+Paris+Saint-Germain+football&hl=fr&gl=FR&ceid=FR:fr",
+  },
+  {
+    name: "RMC Sport",
+    url: "https://rmcsport.bfmtv.com/rss/football/",
+  },
+  {
+    name: "Foot Mercato",
+    url: "https://www.footmercato.net/rss",
+  },
+  {
+    name: "CulturePSG",
+    url: "https://www.culturepsg.com/news?rss",
+  },
+];
 
-// GET /api/cron/fetch-articles?secret=xxx
-//
-// Appelée périodiquement par cron-job.org.
-//
-// Pour chaque actualité PSG pas encore connue :
-// - récupère le titre et le résumé RSS
-// - réécrit le contenu avec Gemini
-// - crée un brouillon
-//
-// Ne publie JAMAIS automatiquement.
 export async function GET(req: NextRequest) {
   const secret = req.nextUrl.searchParams.get("secret");
 
@@ -28,13 +33,15 @@ export async function GET(req: NextRequest) {
     );
   }
 
-  const items = await fetchRssItems();
+  const { items, sourcesOk } = await fetchAllRssItems();
 
   let created = 0;
   let skipped = 0;
+  let duplicates = 0;
 
-  // Maximum 5 articles par passage
-  for (const item of items.slice(0, 5)) {
+  const selected: RssItem[] = [];
+
+  for (const item of items) {
     const existing = await prisma.article.findUnique({
       where: {
         sourceUrl: item.link,
@@ -46,6 +53,20 @@ export async function GET(req: NextRequest) {
       continue;
     }
 
+    if (
+      selected.some((other) =>
+        areSameSubject(other.title, item.title)
+      )
+    ) {
+      duplicates++;
+      continue;
+    }
+
+    selected.push(item);
+  }
+
+  // Maximum 5 nouveaux articles par passage.
+  for (const item of selected.slice(0, 5)) {
     const rewritten = await rewriteWithGemini(
       item.title,
       item.description
@@ -77,6 +98,9 @@ export async function GET(req: NextRequest) {
     checked: items.length,
     created,
     skipped,
+    duplicates,
+    sourcesOk,
+    sources: RSS_FEEDS.map((feed) => feed.name),
   });
 }
 
@@ -84,10 +108,48 @@ type RssItem = {
   title: string;
   description: string;
   link: string;
+  source: string;
 };
 
-async function fetchRssItems(): Promise<RssItem[]> {
-  const res = await fetch(RSS_URL);
+async function fetchAllRssItems(): Promise<{
+  items: RssItem[];
+  sourcesOk: string[];
+}> {
+  const allItems: RssItem[] = [];
+  const sourcesOk: string[] = [];
+
+  for (const feed of RSS_FEEDS) {
+    try {
+      const items = await fetchRssItems(
+        feed.url,
+        feed.name
+      );
+
+      if (items.length > 0) {
+        sourcesOk.push(feed.name);
+        allItems.push(...items);
+      }
+    } catch {
+      // Une source indisponible ne bloque pas les autres.
+    }
+  }
+
+  return {
+    items: allItems,
+    sourcesOk,
+  };
+}
+
+async function fetchRssItems(
+  url: string,
+  source: string
+): Promise<RssItem[]> {
+  const res = await fetch(url, {
+    headers: {
+      "User-Agent": "PSG-Direct/1.0 RSS reader",
+    },
+    cache: "no-store",
+  });
 
   if (!res.ok) {
     return [];
@@ -95,22 +157,26 @@ async function fetchRssItems(): Promise<RssItem[]> {
 
   const xml = await res.text();
 
-  // Extraction simple des balises <item>
-  // Aucun package supplémentaire nécessaire.
   const items: RssItem[] = [];
 
-  const itemBlocks = xml.split("<item>").slice(1);
+  const itemBlocks = xml
+    .split("<item>")
+    .slice(1);
 
   for (const block of itemBlocks) {
     const title = extractTag(block, "title");
     const link = extractTag(block, "link");
-    const description = extractTag(block, "description");
+    const description = extractTag(
+      block,
+      "description"
+    );
 
     if (title && link) {
       items.push({
         title: cleanText(title),
         link: cleanText(link),
         description: cleanText(description),
+        source,
       });
     }
   }
@@ -118,9 +184,14 @@ async function fetchRssItems(): Promise<RssItem[]> {
   return items;
 }
 
-function extractTag(xml: string, tag: string): string {
+function extractTag(
+  xml: string,
+  tag: string
+): string {
   const match = xml.match(
-    new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`)
+    new RegExp(
+      `<${tag}>([\\s\\S]*?)<\\/${tag}>`
+    )
   );
 
   return match ? match[1] : "";
@@ -131,7 +202,61 @@ function cleanText(text: string): string {
     .replace("<![CDATA[", "")
     .replace("]]>", "")
     .replace(/<[^>]+>/g, "")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
     .trim();
+}
+
+function normalizeTitle(title: string): string {
+  return title
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(
+      /\b(le|la|les|un|une|des|du|de|pour|avec|sur|dans|et|a|au|aux)\b/g,
+      " "
+    )
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function areSameSubject(
+  a: string,
+  b: string
+): boolean {
+  const wordsA = new Set(
+    normalizeTitle(a)
+      .split(" ")
+      .filter(Boolean)
+  );
+
+  const wordsB = new Set(
+    normalizeTitle(b)
+      .split(" ")
+      .filter(Boolean)
+  );
+
+  if (!wordsA.size || !wordsB.size) {
+    return false;
+  }
+
+  let common = 0;
+
+  for (const word of wordsA) {
+    if (wordsB.has(word)) {
+      common++;
+    }
+  }
+
+  const similarity =
+    common / Math.min(wordsA.size, wordsB.size);
+
+  return similarity >= 0.75;
 }
 
 async function rewriteWithGemini(
@@ -146,23 +271,33 @@ async function rewriteWithGemini(
 
 Voici une information brute provenant d'une source sportive.
 
-Titre :
+Source :
 ${originalTitle}
 
-Résumé :
+Résumé / informations disponibles :
 ${originalDescription}
 
-Rédige un article ORIGINAL en français à partir de cette information.
+Rédige un article ORIGINAL en français à partir des informations réellement fournies.
 
 Consignes :
 - Ne recopie jamais les phrases originales.
 - Reformule entièrement.
-- Ne crée aucune information qui n'est pas présente dans les données fournies.
-- Un titre accrocheur.
+- N'invente absolument aucune information.
+- Si une date est présente, conserve-la précisément.
+- Si une heure est présente, conserve-la précisément.
+- Si une chaîne de diffusion est présente, conserve-la précisément.
+- Si un stade est présent, conserve-le précisément.
+- Si un joueur est présent, conserve son nom précisément.
+- Si une compétition est présente, conserve-la précisément.
+- Si un résultat est présent, conserve-le précisément.
+- Si une information importante n'est pas présente, ne la devine pas.
+- Ne fabrique jamais une chaîne TV.
+- Ne fabrique jamais une date ou une heure.
+- N'écris pas qu'une information est disponible si elle ne l'est pas.
+- Un titre accrocheur mais factuel.
 - Un résumé court d'une phrase.
-- Un contenu de 2 à 3 paragraphes.
-- Reste factuel.
-- Si une date, une heure, un joueur, une compétition ou un résultat est présent dans les informations fournies, conserve précisément cette information.
+- Un contenu de 2 à 4 paragraphes.
+- Reste factuel et précis.
 
 Réponds STRICTEMENT au format JSON suivant, sans aucun texte autour :
 
@@ -201,7 +336,8 @@ Réponds STRICTEMENT au format JSON suivant, sans aucun texte autour :
     const data = await res.json();
 
     const text =
-      data.candidates?.[0]?.content?.parts?.[0]?.text ?? "";
+      data.candidates?.[0]?.content?.parts?.[0]
+        ?.text ?? "";
 
     const cleaned = text
       .replace(/```json/g, "")
@@ -219,7 +355,7 @@ Réponds STRICTEMENT au format JSON suivant, sans aucun texte autour :
       excerpt: parsed.excerpt || "",
       content: parsed.content,
     };
-  } catch (error) {
+  } catch {
     return null;
   }
 }
