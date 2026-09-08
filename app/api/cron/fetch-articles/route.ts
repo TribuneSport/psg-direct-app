@@ -948,10 +948,19 @@ function dedupeFeedItems(
 }
 
 /**
- * Regroupement strict.
+ * Regroupement strict des actualités.
  *
- * Le simple mot "PSG" ne permet plus
- * de regrouper deux articles.
+ * Deux articles concernant le PSG ne sont PAS
+ * automatiquement considérés comme la même actualité.
+ *
+ * L'adversaire est une information forte :
+ *
+ * PSG + Bratislava != PSG + Monaco
+ * PSG + Bratislava != PSG + Lille
+ *
+ * La comparaison avec un cluster est également stricte :
+ * un nouvel article doit rester compatible avec le sujet
+ * global du cluster et pas seulement avec un article isolé.
  */
 function buildClusters(
   items: FeedItem[]
@@ -1012,9 +1021,135 @@ function clusterSimilarity(
   item: FeedItem,
   cluster: FeedItem[]
 ): number {
+  if (
+    cluster.length ===
+    0
+  ) {
+    return 0;
+  }
+
+  const itemSignals =
+    extractStorySignals(
+      item.title
+    );
+
+  const clusterSignals =
+    cluster.map(
+      (other) =>
+        extractStorySignals(
+          other.title
+        )
+    );
+
+  const clusterOpponents = [
+    ...new Set(
+      clusterSignals.flatMap(
+        (signals) =>
+          signals.opponents
+      )
+    ),
+  ];
+
+  const clusterPeople = [
+    ...new Set(
+      clusterSignals.flatMap(
+        (signals) =>
+          signals.people
+      )
+    ),
+  ];
+
+  const clusterEventTypes = [
+    ...new Set(
+      clusterSignals
+        .map(
+          (signals) =>
+            signals.eventType
+        )
+        .filter(
+          (type) =>
+            type !==
+            "general"
+        )
+    ),
+  ];
+
+  /**
+   * Règle fondamentale :
+   * si l'article possède un adversaire précis
+   * et que le cluster possède déjà un adversaire précis,
+   * ils doivent être identiques.
+   */
+  if (
+    itemSignals.opponents.length >
+      0 &&
+    clusterOpponents.length >
+      0 &&
+    !hasOverlap(
+      itemSignals.opponents,
+      clusterOpponents
+    )
+  ) {
+    return 0;
+  }
+
+  /**
+   * Même règle pour les joueurs importants.
+   *
+   * On autorise toutefois les articles généraux
+   * qui ne citent aucun joueur.
+   */
+  if (
+    itemSignals.people.length >
+      0 &&
+    clusterPeople.length >
+      0 &&
+    !hasOverlap(
+      itemSignals.people,
+      clusterPeople
+    )
+  ) {
+    const hasStrongDifferentEvent =
+      clusterEventTypes.some(
+        (type) =>
+          itemSignals.eventType !==
+            "general" &&
+          type !==
+            itemSignals.eventType
+      );
+
+    if (
+      hasStrongDifferentEvent
+    ) {
+      return 0;
+    }
+  }
+
+  /**
+   * Si l'article et le cluster ont des types
+   * d'événements précis différents, on ne mélange pas.
+   */
+  if (
+    itemSignals.eventType !==
+      "general" &&
+    clusterEventTypes.length >
+      0 &&
+    !clusterEventTypes.includes(
+      itemSignals.eventType
+    )
+  ) {
+    return 0;
+  }
+
   let best =
     0;
 
+  /**
+   * On cherche le meilleur score parmi les
+   * articles compatibles du cluster.
+   *
+   * Les conflits ont déjà été bloqués au-dessus.
+   */
   for (
     const other of cluster
   ) {
@@ -1056,6 +1191,10 @@ function storyCompatibility(
       b.title
     );
 
+  /**
+   * Adversaire précis différent :
+   * sujets différents.
+   */
   if (
     signalsA.opponents.length >
       0 &&
@@ -1069,6 +1208,10 @@ function storyCompatibility(
     return 0;
   }
 
+  /**
+   * Joueurs différents sur deux sujets précis :
+   * on évite le mélange.
+   */
   if (
     signalsA.people.length >
       0 &&
@@ -1077,13 +1220,31 @@ function storyCompatibility(
     !hasOverlap(
       signalsA.people,
       signalsB.people
-    ) &&
-    titleScore <
-      0.84
+    )
   ) {
-    return 0;
+    if (
+      signalsA.eventType !==
+        "general" &&
+      signalsB.eventType !==
+        "general" &&
+      signalsA.eventType !==
+        signalsB.eventType
+    ) {
+      return 0;
+    }
+
+    if (
+      titleScore <
+      0.84
+    ) {
+      return 0;
+    }
   }
 
+  /**
+   * Types d'événements différents :
+   * composition, mercato, blessure, déclaration...
+   */
   if (
     signalsA.eventType !==
       "general" &&
@@ -1125,6 +1286,10 @@ function storyCompatibility(
     signalsA.eventType ===
     signalsB.eventType;
 
+  /**
+   * Même adversaire + même type :
+   * cas idéal pour deux articles sur le même match.
+   */
   if (
     opponentOverlap &&
     sameEventType &&
@@ -1139,6 +1304,10 @@ function storyCompatibility(
     );
   }
 
+  /**
+   * Même joueur + même type :
+   * cas idéal pour deux articles sur la même actualité.
+   */
   if (
     peopleOverlap &&
     sameEventType &&
@@ -1153,6 +1322,11 @@ function storyCompatibility(
     );
   }
 
+  /**
+   * Deux titres quasiment identiques :
+   * même sujet même si l'un des titres omet
+   * certaines entités.
+   */
   if (
     titleScore >=
     0.84
@@ -1192,6 +1366,10 @@ function storyCompatibility(
       0.16;
   }
 
+  /**
+   * Sans élément spécifique commun,
+   * deux sujets PSG généraux restent séparés.
+   */
   if (
     !opponentOverlap &&
     !peopleOverlap &&
@@ -2135,6 +2313,13 @@ function extractPageContent(
       )
       .trim();
 
+  if (
+    content.length <
+    200
+  ) {
+    return "";
+  }
+
   return content.slice(
     0,
     MAX_SOURCE_TEXT_LENGTH
@@ -2208,6 +2393,9 @@ REGLES ABSOLUES :
 8. L'article doit parler d'UN sujet précis.
 9. Les informations importantes doivent être concrètes.
 10. Évite les phrases génériques lorsqu'une information précise est disponible.
+11. Si plusieurs adversaires différents apparaissent dans les sources, considère-les comme des sujets différents et ne mélange pas leurs informations.
+12. Si plusieurs joueurs différents apparaissent, ne mélange pas leurs actualités sauf si les sources montrent clairement qu'ils font partie du même événement.
+13. Ne reprends jamais une information d'un autre événement simplement parce qu'elle concerne le PSG.
 
 STRUCTURE OBLIGATOIRE :
 
@@ -2284,6 +2472,16 @@ Réponds UNIQUEMENT avec un JSON valide :
     "error" in result
   ) {
     return result;
+  }
+
+  if (
+    !("text" in result)
+  ) {
+    return {
+      ok: false,
+      error:
+        "Réponse Gemini invalide.",
+    };
   }
 
   const parsed =
@@ -2364,6 +2562,16 @@ ${source.pageText}
         "\n"
       );
 
+  const clusterTitles =
+    cluster
+      .map(
+        (item) =>
+          `- ${item.source}: ${item.title}`
+      )
+      .join(
+        "\n"
+      );
+
   const prompt = `
 Tu es rédacteur pour PSG Direct.
 
@@ -2378,13 +2586,20 @@ ${article.excerpt}
 Contenu :
 ${article.content}
 
+SUJETS DU GROUPE :
+${clusterTitles}
+
 SOURCES :
 ${sourceFacts}
 
 Tu dois enrichir cet article SANS INVENTER DE FAITS.
 
-Conserve strictement le même sujet.
+Conserve strictement le même sujet que l'article existant.
+
 N'ajoute aucun autre événement.
+
+Si plusieurs adversaires ou plusieurs actualités apparaissent dans les sources, utilise uniquement les informations correspondant au sujet de l'article existant.
+
 Ajoute uniquement des informations réellement présentes dans les sources.
 
 Tu peux préciser, si les sources le permettent :
@@ -2435,6 +2650,16 @@ Réponds uniquement en JSON :
     "error" in result
   ) {
     return result;
+  }
+
+  if (
+    !("text" in result)
+  ) {
+    return {
+      ok: false,
+      error:
+        "Réponse Gemini invalide lors de l'expansion.",
+    };
   }
 
   const parsed =
@@ -2515,106 +2740,142 @@ async function callGemini(
   for (
     const config of models
   ) {
-    const controller =
-      new AbortController();
+    let attempt =
+      0;
 
-    const timeout =
-      setTimeout(
-        () => {
-          controller.abort();
-        },
-        config.timeout
-      );
+    while (
+      attempt <
+      2
+    ) {
+      attempt++;
 
-    try {
-      const response =
-        await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/${config.model}:generateContent?key=${GEMINI_API_KEY}`,
-          {
-            method:
-              "POST",
+      const controller =
+        new AbortController();
 
-            headers: {
-              "Content-Type":
-                "application/json",
-            },
-
-            body:
-              JSON.stringify({
-                contents: [
-                  {
-                    role:
-                      "user",
-
-                    parts: [
-                      {
-                        text:
-                          prompt,
-                      },
-                    ],
-                  },
-                ],
-
-                generationConfig:
-                  {
-                    temperature:
-                      0.35,
-
-                    maxOutputTokens:
-                      2200,
-
-                    responseMimeType:
-                      "application/json",
-                  },
-              }),
-
-            signal:
-              controller.signal,
-          }
+      const timeout =
+        setTimeout(
+          () => {
+            controller.abort();
+          },
+          config.timeout
         );
 
-      if (
-        !response.ok
-      ) {
+      try {
+        const response =
+          await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/${config.model}:generateContent?key=${GEMINI_API_KEY}`,
+            {
+              method:
+                "POST",
+
+              headers: {
+                "Content-Type":
+                  "application/json",
+              },
+
+              body:
+                JSON.stringify({
+                  contents: [
+                    {
+                      role:
+                        "user",
+
+                      parts: [
+                        {
+                          text:
+                            prompt,
+                        },
+                      ],
+                    },
+                  ],
+
+                  generationConfig:
+                    {
+                      temperature:
+                        0.35,
+
+                      maxOutputTokens:
+                        2200,
+
+                      responseMimeType:
+                        "application/json",
+                    },
+                }),
+
+              signal:
+                controller.signal,
+            }
+          );
+
+        if (
+          response.ok
+        ) {
+          const data =
+            await response.json();
+
+          const text =
+            data?.candidates?.[0]
+              ?.content?.parts?.[0]
+              ?.text;
+
+          if (
+            typeof text ===
+              "string" &&
+            text.trim()
+          ) {
+            return {
+              ok: true,
+              text:
+                text.trim(),
+            };
+          }
+
+          lastError =
+            `Gemini ${config.model}: réponse vide`;
+
+          break;
+        }
+
         lastError =
           `Gemini ${config.model}: HTTP ${response.status}`;
 
-        continue;
-      }
+        /**
+         * Retry uniquement sur 503.
+         *
+         * Une seule nouvelle tentative maximum
+         * afin de ne pas rallonger inutilement
+         * l'exécution du Cron Vercel.
+         */
+        if (
+          response.status ===
+            503 &&
+          attempt <
+            2
+        ) {
+          await sleep(
+            500
+          );
 
-      const data =
-        await response.json();
+          continue;
+        }
 
-      const text =
-        data?.candidates?.[0]
-          ?.content?.parts?.[0]
-          ?.text;
-
-      if (
-        typeof text !==
-          "string" ||
-        !text.trim()
-      ) {
+        break;
+      } catch (error) {
         lastError =
-          `Gemini ${config.model}: réponse vide`;
+          error instanceof Error
+            ? `Gemini ${config.model}: ${error.message}`
+            : `Gemini ${config.model}: ${String(error)}`;
 
-        continue;
+        /**
+         * En cas de timeout ou d'erreur réseau,
+         * on passe directement au modèle suivant.
+         */
+        break;
+      } finally {
+        clearTimeout(
+          timeout
+        );
       }
-
-      return {
-        ok: true,
-        text:
-          text.trim(),
-      };
-    } catch (error) {
-      lastError =
-        error instanceof Error
-          ? `Gemini ${config.model}: ${error.message}`
-          : `Gemini ${config.model}: ${String(error)}`;
-    } finally {
-      clearTimeout(
-        timeout
-      );
     }
   }
 
@@ -2623,6 +2884,18 @@ async function callGemini(
     error:
       lastError,
   };
+}
+
+function sleep(
+  milliseconds: number
+): Promise<void> {
+  return new Promise(
+    (resolve) =>
+      setTimeout(
+        resolve,
+        milliseconds
+      )
+  );
 }
 
 function parseGeminiJson(
