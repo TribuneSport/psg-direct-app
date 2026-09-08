@@ -32,7 +32,6 @@ const MAX_ITEMS_PER_SOURCE = 30;
 const MAX_CLUSTERS_TO_PROCESS = 1;
 
 const RSS_TIMEOUT_MS = 4000;
-const GEMINI_TIMEOUT_MS = 6000;
 
 type FeedItem = {
   source: string;
@@ -74,6 +73,11 @@ type GenerationFailure = {
 type GenerationResult =
   | GenerationSuccess
   | GenerationFailure;
+
+type GeminiModel = {
+  name: string;
+  timeout: number;
+};
 
 type Diagnostic = {
   cluster: number;
@@ -309,7 +313,6 @@ export async function GET(req: NextRequest) {
     let created = 0;
     let skipped = 0;
     let duplicates = 0;
-
     let deferred = 0;
 
     let geminiCalls = 0;
@@ -325,11 +328,6 @@ export async function GET(req: NextRequest) {
     const diagnostics: Diagnostic[] =
       [];
 
-    /*
-     * On élimine d'abord les sujets déjà connus.
-     * Cela permet au cron de passer au prochain
-     * véritable nouveau sujet.
-     */
     const candidateClusters =
       clusters
         .slice()
@@ -426,8 +424,7 @@ export async function GET(req: NextRequest) {
       const orderedCluster =
         [...cluster].sort(
           (a, b) =>
-            a.priority -
-            b.priority
+            a.priority - b.priority
         );
 
       const representative =
@@ -693,8 +690,7 @@ async function generateArticle(
   const orderedCluster =
     [...cluster].sort(
       (a, b) =>
-        a.priority -
-        b.priority
+        a.priority - b.priority
     );
 
   const evidence =
@@ -786,6 +782,10 @@ IMPORTANT :
 
 Le contenu doit contenir AU MINIMUM 400 MOTS.
 
+L'article doit comporter plusieurs paragraphes distincts.
+
+Chaque paragraphe doit apporter une information concrète, un élément de contexte ou une explication utile.
+
 Même lorsqu'une seule source est disponible, développe l'article à partir de tous les faits réellement présents dans cette source.
 
 Tu peux expliquer la chronologie des faits, le contexte de l'événement, les personnes concernées, la procédure engagée, les déclarations disponibles et les conséquences annoncées lorsqu'elles sont présentes dans les informations fournies.
@@ -805,15 +805,6 @@ Le titre doit être informatif et spécifique.
 L'extrait doit résumer les faits principaux.
 
 Le contenu doit développer les informations disponibles avec plusieurs paragraphes.
-
-Structure recommandée :
-
-1. introduction factuelle
-2. rappel du contexte
-3. faits précis
-4. personnes ou institutions concernées
-5. procédure ou conséquences
-6. suite attendue lorsqu'elle est connue
 
 Style :
 
@@ -842,9 +833,26 @@ SOURCES :
 ${evidence}
 `;
 
-  const models = [
-    "gemini-3.6-flash",
-    "gemini-3.5-flash-lite",
+  /*
+   * Gemini 3.5 Flash-Lite est utilisé en priorité :
+   * il est destiné aux tâches à faible latence et à fort volume.
+   *
+   * Le second modèle sert de fallback.
+   *
+   * Le timeout est volontairement réparti afin de rester
+   * compatible avec le temps d'exécution du cron.
+   */
+  const models: GeminiModel[] = [
+    {
+      name:
+        "gemini-3.5-flash-lite",
+      timeout: 4500,
+    },
+    {
+      name:
+        "gemini-3.6-flash",
+      timeout: 1500,
+    },
   ];
 
   let lastFailure:
@@ -857,7 +865,7 @@ ${evidence}
     models.length;
     modelIndex++
   ) {
-    const model =
+    const modelConfig =
       models[modelIndex];
 
     const controller =
@@ -868,13 +876,13 @@ ${evidence}
         () => {
           controller.abort();
         },
-        GEMINI_TIMEOUT_MS
+        modelConfig.timeout
       );
 
     try {
       const response =
         await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+          `https://generativelanguage.googleapis.com/v1beta/models/${modelConfig.name}:generateContent`,
           {
             method: "POST",
 
@@ -944,10 +952,10 @@ ${evidence}
           ok: false,
 
           outcome:
-            `gemini_${model}_http_${response.status}`,
+            `gemini_${modelConfig.name}_http_${response.status}`,
 
           error:
-            `Modèle ${model} — HTTP ${response.status}: ${raw.slice(
+            `Modèle ${modelConfig.name} — HTTP ${response.status}: ${raw.slice(
               0,
               500
             )}`,
@@ -956,14 +964,17 @@ ${evidence}
         lastFailure =
           failure;
 
-        const canFallback =
+        /*
+         * On passe systématiquement au modèle
+         * suivant en cas d'erreur HTTP.
+         *
+         * Cela permet de récupérer un article même
+         * lorsqu'un modèle est temporairement indisponible.
+         */
+        if (
           modelIndex <
-            models.length - 1 &&
-          [429, 500, 502, 503, 504].includes(
-            response.status
-          );
-
-        if (canFallback) {
+          models.length - 1
+        ) {
           continue;
         }
 
@@ -979,16 +990,31 @@ ${evidence}
             raw
           ) as GeminiResponse;
       } catch {
-        return {
+        const failure:
+          GenerationFailure = {
           ok: false,
+
           outcome:
-            "invalid_json",
+            `invalid_json_${modelConfig.name}`,
+
           error:
             `Réponse Gemini non JSON: ${raw.slice(
               0,
               500
             )}`,
         };
+
+        lastFailure =
+          failure;
+
+        if (
+          modelIndex <
+          models.length - 1
+        ) {
+          continue;
+        }
+
+        return failure;
       }
 
       const candidate =
@@ -1008,13 +1034,28 @@ ${evidence}
           .trim() || "";
 
       if (!text) {
-        return {
+        const failure:
+          GenerationFailure = {
           ok: false,
+
           outcome:
-            `gemini_empty_${finishReason}`,
+            `gemini_empty_${modelConfig.name}_${finishReason}`,
+
           error:
-            `Aucun texte Gemini. finishReason=${finishReason}`,
+            `Aucun texte Gemini. Modèle=${modelConfig.name}, finishReason=${finishReason}`,
         };
+
+        lastFailure =
+          failure;
+
+        if (
+          modelIndex <
+          models.length - 1
+        ) {
+          continue;
+        }
+
+        return failure;
       }
 
       const parsed =
@@ -1023,16 +1064,31 @@ ${evidence}
         );
 
       if (!parsed) {
-        return {
+        const failure:
+          GenerationFailure = {
           ok: false,
+
           outcome:
-            "invalid_json",
+            `invalid_json_${modelConfig.name}`,
+
           error:
-            `JSON article invalide: ${text.slice(
+            `JSON article invalide avec ${modelConfig.name}: ${text.slice(
               0,
               500
             )}`,
         };
+
+        lastFailure =
+          failure;
+
+        if (
+          modelIndex <
+          models.length - 1
+        ) {
+          continue;
+        }
+
+        return failure;
       }
 
       return {
@@ -1040,6 +1096,11 @@ ${evidence}
         article: parsed,
       };
     } catch (error) {
+      const isAbort =
+        error instanceof Error &&
+        error.name ===
+          "AbortError";
+
       const detail =
         error instanceof Error
           ? error.message
@@ -1050,14 +1111,12 @@ ${evidence}
         ok: false,
 
         outcome:
-          error instanceof Error &&
-          error.name ===
-            "AbortError"
-            ? `gemini_timeout_${model}`
-            : `gemini_exception_${model}`,
+          isAbort
+            ? `gemini_timeout_${modelConfig.name}`
+            : `gemini_exception_${modelConfig.name}`,
 
         error:
-          `Modèle ${model} — ${detail.slice(
+          `Modèle ${modelConfig.name} — ${detail.slice(
             0,
             500
           )}`,
@@ -1066,12 +1125,17 @@ ${evidence}
       lastFailure =
         failure;
 
+      /*
+       * IMPORTANT :
+       * Le fallback fonctionne aussi lorsqu'un modèle
+       * dépasse son timeout.
+       *
+       * Avant ce correctif, AbortError arrêtait
+       * directement toute la génération.
+       */
       if (
         modelIndex <
-          models.length - 1 &&
-        error instanceof Error &&
-        error.name !==
-          "AbortError"
+        models.length - 1
       ) {
         continue;
       }
@@ -1087,8 +1151,10 @@ ${evidence}
   return (
     lastFailure ?? {
       ok: false,
+
       outcome:
         "gemini_unavailable",
+
       error:
         "Aucun modèle Gemini disponible",
     }
@@ -1751,8 +1817,7 @@ function dateSimilarity(
   const hours =
     Math.abs(
       da - db
-    ) /
-    3600000;
+    ) / 3600000;
 
   if (
     hours <= 24
