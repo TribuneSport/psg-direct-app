@@ -478,17 +478,15 @@ export async function GET(req: NextRequest) {
             generatedResult.article
           );
 
+        /*
+         * On utilise "in" plutôt qu'un accès direct
+         * à expandedResult.error afin de garantir
+         * le narrowing TypeScript de l'union.
+         */
         if (
-          expandedResult.ok
+          "error" in
+          expandedResult
         ) {
-          generatedResult =
-            expandedResult;
-        } else {
-          /*
-           * TypeScript exige ici un test
-           * explicite sur ok === false avant
-           * d'accéder à la propriété error.
-           */
           geminiErrors.push(
             expandedResult.error
           );
@@ -500,7 +498,7 @@ export async function GET(req: NextRequest) {
             detail:
               expandedResult.error,
           });
-
+        } else {
           generatedResult =
             expandedResult;
         }
