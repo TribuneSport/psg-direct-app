@@ -24,7 +24,26 @@ const RSS_FEEDS = [
 ];
 
 const MAX_ITEMS_PER_SOURCE = 25;
-const MAX_NEW_ARTICLES = 1;
+
+/*
+ * Objectif quotidien :
+ * 20 articles minimum lorsqu'il existe suffisamment
+ * de sujets réellement différents.
+ *
+ * Il n'y a volontairement PAS de plafond quotidien.
+ * Les grosses journées PSG peuvent donc dépasser 20 articles.
+ */
+const DAILY_TARGET = 20;
+
+/*
+ * Nombre maximum d'articles générés par une seule
+ * exécution du cron.
+ *
+ * Cela évite de lancer trop d'appels Gemini dans
+ * une seule fonction Vercel.
+ */
+const MAX_NEW_ARTICLES_PER_RUN = 5;
+
 const MAX_SOURCES_PER_ARTICLE = 5;
 
 const RSS_TIMEOUT_MS = 4000;
@@ -90,6 +109,12 @@ export async function GET(req: NextRequest) {
   const rssErrors: string[] = [];
 
   try {
+    /*
+     * ---------------------------------------------------------
+     * 1. RÉCUPÉRATION DES RSS
+     * ---------------------------------------------------------
+     */
+
     const feeds = await Promise.all(
       RSS_FEEDS.map(async (feed) => {
         try {
@@ -130,6 +155,12 @@ export async function GET(req: NextRequest) {
       }
     }
 
+    /*
+     * ---------------------------------------------------------
+     * 2. FUSION DES SOURCES
+     * ---------------------------------------------------------
+     */
+
     const allItems = feeds.flatMap(
       (result) => result.items
     );
@@ -140,6 +171,12 @@ export async function GET(req: NextRequest) {
 
     const uniqueItems =
       deduplicateItems(relevantItems);
+
+    /*
+     * ---------------------------------------------------------
+     * 3. ARTICLES DÉJÀ PRÉSENTS
+     * ---------------------------------------------------------
+     */
 
     const recentArticles =
       await prisma.article.findMany({
@@ -162,6 +199,15 @@ export async function GET(req: NextRequest) {
         )
     );
 
+    /*
+     * ---------------------------------------------------------
+     * 4. CLUSTERISATION
+     * ---------------------------------------------------------
+     *
+     * Un même sujet provenant de plusieurs médias
+     * devient UN seul article.
+     */
+
     const clusters =
       buildSimpleClusters(newItems);
 
@@ -175,14 +221,93 @@ export async function GET(req: NextRequest) {
           clusterPriority(a)
       );
 
+    /*
+     * ---------------------------------------------------------
+     * 5. COMPTEUR QUOTIDIEN
+     * ---------------------------------------------------------
+     *
+     * On compte les articles IA PSG créés depuis
+     * le début de la journée.
+     *
+     * Ce compteur est un objectif et non un plafond.
+     */
+
+    const startOfToday =
+      getStartOfToday();
+
+    const articlesCreatedToday =
+      await prisma.article.count({
+        where: {
+          club: "PSG",
+          isAiGenerated: true,
+          createdAt: {
+            gte: startOfToday,
+          },
+        },
+      });
+
+    /*
+     * Combien manque-t-il pour atteindre l'objectif
+     * de 20 articles aujourd'hui ?
+     */
+    const remainingDailyTarget =
+      Math.max(
+        0,
+        DAILY_TARGET -
+          articlesCreatedToday
+      );
+
+    /*
+     * ---------------------------------------------------------
+     * 6. NOMBRE DE CLUSTERS À TRAITER
+     * ---------------------------------------------------------
+     *
+     * On génère au maximum 5 articles par passage.
+     *
+     * Si nous sommes sous l'objectif de 20,
+     * on essaie de rattraper le retard.
+     *
+     * Si nous sommes déjà à 20 ou plus,
+     * on continue quand même s'il existe de nouveaux
+     * sujets pertinents.
+     */
+
+    const requestedCount =
+      remainingDailyTarget > 0
+        ? Math.min(
+            MAX_NEW_ARTICLES_PER_RUN,
+            remainingDailyTarget,
+            candidateClusters.length
+          )
+        : Math.min(
+            MAX_NEW_ARTICLES_PER_RUN,
+            candidateClusters.length
+          );
+
     const selectedClusters =
       candidateClusters.slice(
         0,
-        MAX_NEW_ARTICLES
+        requestedCount
       );
 
     let created = 0;
     let skipped = 0;
+
+    /*
+     * Cette liste est enrichie au fur et à mesure
+     * qu'un article est créé afin d'éviter qu'un second
+     * cluster de la même exécution génère un titre
+     * quasiment identique.
+     */
+
+    const articlesForDuplicateCheck =
+      [...recentArticles];
+
+    /*
+     * ---------------------------------------------------------
+     * 7. GÉNÉRATION DES ARTICLES
+     * ---------------------------------------------------------
+     */
 
     for (
       let index = 0;
@@ -192,7 +317,7 @@ export async function GET(req: NextRequest) {
       const result =
         await processCluster(
           selectedClusters[index],
-          recentArticles,
+          articlesForDuplicateCheck,
           index + 1
         );
 
@@ -202,10 +327,32 @@ export async function GET(req: NextRequest) {
 
       if (result.created) {
         created++;
+
+        /*
+         * On ajoute immédiatement le titre généré
+         * à la mémoire locale.
+         */
+        articlesForDuplicateCheck.push({
+          title:
+            result.articleTitle || "",
+          slug: "",
+          sourceUrl:
+            result.sourceUrl || null,
+        });
       } else {
         skipped++;
       }
     }
+
+    /*
+     * ---------------------------------------------------------
+     * 8. NOUVEAU TOTAL DU JOUR
+     * ---------------------------------------------------------
+     */
+
+    const totalCreatedToday =
+      articlesCreatedToday +
+      created;
 
     return NextResponse.json({
       checked: allItems.length,
@@ -222,9 +369,19 @@ export async function GET(req: NextRequest) {
       ),
       created,
       skipped,
-      duplicates:
-        uniqueItems.length -
-        newItems.length,
+      articlesCreatedToday:
+        totalCreatedToday,
+      dailyTarget:
+        DAILY_TARGET,
+      remainingDailyTarget:
+        Math.max(
+          0,
+          DAILY_TARGET -
+            totalCreatedToday
+        ),
+      dailyTargetReached:
+        totalCreatedToday >=
+        DAILY_TARGET,
       sourcesOk: feeds
         .filter(
           (feed) => !feed.error
@@ -235,10 +392,14 @@ export async function GET(req: NextRequest) {
       sources: RSS_FEEDS.map(
         (feed) => feed.name
       ),
+      duplicates:
+        uniqueItems.length -
+        newItems.length,
       fusion: true,
       optimized: true,
       enrichment: true,
       simplified: true,
+      unlimitedDailyCap: true,
       diagnostics: {
         geminiCalls:
           diagnostics.filter(
@@ -323,6 +484,8 @@ async function processCluster(
   clusterNumber: number
 ): Promise<{
   created: boolean;
+  articleTitle: string | null;
+  sourceUrl: string | null;
   diagnostic: Diagnostic;
 }> {
   const sources = [
@@ -359,6 +522,8 @@ async function processCluster(
   if (generation.ok === false) {
     return {
       created: false,
+      articleTitle: null,
+      sourceUrl: null,
       diagnostic: {
         cluster: clusterNumber,
         sources,
@@ -385,6 +550,8 @@ async function processCluster(
   ) {
     return {
       created: false,
+      articleTitle: null,
+      sourceUrl: null,
       diagnostic: {
         cluster: clusterNumber,
         sources,
@@ -399,6 +566,7 @@ async function processCluster(
   const duplicate =
     recentArticles.some(
       (existing) =>
+        existing.title &&
         titleSimilarity(
           article.title,
           existing.title
@@ -408,6 +576,8 @@ async function processCluster(
   if (duplicate) {
     return {
       created: false,
+      articleTitle: null,
+      sourceUrl: null,
       diagnostic: {
         cluster: clusterNumber,
         sources,
@@ -429,6 +599,8 @@ async function processCluster(
   } catch (error) {
     return {
       created: false,
+      articleTitle: null,
+      sourceUrl: null,
       diagnostic: {
         cluster: clusterNumber,
         sources,
@@ -440,6 +612,9 @@ async function processCluster(
     };
   }
 
+  const sourceUrl =
+    sorted[0]?.link || null;
+
   try {
     await prisma.article.create({
       data: {
@@ -450,13 +625,14 @@ async function processCluster(
         club: "PSG",
         status: "DRAFT",
         isAiGenerated: true,
-        sourceUrl:
-          sorted[0]?.link || null,
+        sourceUrl,
       },
     });
 
     return {
       created: true,
+      articleTitle: article.title,
+      sourceUrl,
       diagnostic: {
         cluster: clusterNumber,
         sources,
@@ -469,6 +645,8 @@ async function processCluster(
   } catch (error) {
     return {
       created: false,
+      articleTitle: null,
+      sourceUrl: null,
       diagnostic: {
         cluster: clusterNumber,
         sources,
@@ -599,6 +777,32 @@ RÈGLES ABSOLUES :
 - Ne mentionne pas l'intelligence artificielle.
 - Ne copie pas les phrases originales.
 - Rédige dans un français naturel et journalistique.
+- Donne la priorité aux informations factuelles et vérifiables.
+- Lorsqu'une même information apparaît dans plusieurs sources, considère-la comme particulièrement fiable.
+- Lorsqu'une information n'apparaît que dans une seule source, tu peux l'utiliser si elle est clairement attribuée à cette source.
+- Ne transforme jamais une hypothèse en certitude.
+
+INFORMATIONS FACTUELLES À PRIVILÉGIER :
+
+- date du match
+- heure du match
+- compétition
+- journée
+- adversaire
+- stade
+- chaîne de télévision
+- plateforme de diffusion
+- compositions probables
+- absents
+- blessés
+- suspendus
+- arbitre
+- conférence de presse
+- déclarations présentes dans les sources
+- contexte sportif
+- classement lorsqu'il est présent dans les sources
+- forme récente lorsqu'elle est présente dans les sources
+- mercato et transferts uniquement lorsqu'ils sont réellement présents dans les sources
 
 STRUCTURE OBLIGATOIRE :
 
@@ -624,6 +828,8 @@ LONGUEUR :
 
 Entre 500 et 800 mots lorsque les informations disponibles le permettent.
 
+Si les sources ne permettent pas d'atteindre 500 mots sans inventer, écris moins long plutôt que d'inventer.
+
 FORMAT JSON STRICT :
 
 {
@@ -633,6 +839,8 @@ FORMAT JSON STRICT :
 }
 
 Le champ content doit être du Markdown.
+
+Le champ content doit conserver de vrais retours à la ligne entre les paragraphes.
 
 SOURCES :
 
@@ -690,7 +898,9 @@ ${sourceText}
           parsed.excerpt
         ),
       content:
-        parsed.content.trim(),
+        cleanArticleContent(
+          parsed.content
+        ),
     },
   };
 }
@@ -872,14 +1082,8 @@ function normalizeArticle(
   article: GeminiArticle
 ): GeminiArticle {
   let content =
-    article.content
-      .replace(/\r\n/g, "\n")
-      .replace(/\r/g, "\n");
-
-  content =
-    content.replace(
-      /\n{3,}/g,
-      "\n\n"
+    cleanArticleContent(
+      article.content
     );
 
   if (
@@ -909,9 +1113,13 @@ function normalizeArticle(
 
   return {
     title:
-      article.title.trim(),
+      cleanText(
+        article.title
+      ),
     excerpt:
-      article.excerpt.trim(),
+      cleanText(
+        article.excerpt
+      ),
     content:
       content.trim(),
   };
@@ -960,7 +1168,7 @@ function addBasicStructure(
       index === 1
     ) {
       result.push(
-        "## Les réactions"
+        "## Les informations importantes"
       );
     } else if (
       index === 2
@@ -1085,13 +1293,6 @@ function similarityToCluster(
       ),
     ];
 
-  /*
-   * Règle essentielle :
-   * si les deux sujets indiquent
-   * des adversaires différents,
-   * ils ne peuvent pas être
-   * dans le même cluster.
-   */
   if (
     itemOpponent &&
     clusterOpponents.length > 0 &&
@@ -1102,15 +1303,6 @@ function similarityToCluster(
     return 0;
   }
 
-  /*
-   * Si le cluster contient déjà
-   * un adversaire précis et que
-   * le nouvel article concerne
-   * aussi un match mais ne précise
-   * pas son adversaire, on ne le
-   * fusionne que s'il est réellement
-   * très proche d'un titre existant.
-   */
   if (
     !itemOpponent &&
     clusterOpponents.length >
@@ -1380,7 +1572,6 @@ function extractEvent(
     "déclarations",
     "conference",
     "conférence",
-    "conférence de presse",
     "conférence de presse",
   ];
 
@@ -1678,7 +1869,7 @@ function extractPageText(
   text =
     stripHtml(text);
 
-  return cleanText(
+  return cleanArticleContent(
     decodeHtmlEntities(
       text
     )
@@ -1966,6 +2157,44 @@ function cleanText(
     .trim();
 }
 
+/*
+ * Nettoyage du contenu d'article.
+ *
+ * Contrairement à cleanText(), cette fonction conserve
+ * les retours à la ligne afin que les paragraphes Markdown
+ * restent correctement séparés dans l'article.
+ */
+function cleanArticleContent(
+  text: string
+): string {
+  return decodeHtmlEntities(
+    stripHtml(
+      text
+    )
+  )
+    .replace(
+      /\r\n/g,
+      "\n"
+    )
+    .replace(
+      /\r/g,
+      "\n"
+    )
+    .replace(
+      /[ \t]+/g,
+      " "
+    )
+    .replace(
+      /\n[ \t]+/g,
+      "\n"
+    )
+    .replace(
+      /\n{3,}/g,
+      "\n\n"
+    )
+    .trim();
+}
+
 function stripHtml(
   text: string
 ): string {
@@ -2034,6 +2263,17 @@ function countWords(
     .split(/\s+/)
     .filter(Boolean)
     .length;
+}
+
+function getStartOfToday(): Date {
+  const now =
+    new Date();
+
+  return new Date(
+    now.getFullYear(),
+    now.getMonth(),
+    now.getDate()
+  );
 }
 
 async function makeUniqueSlug(
