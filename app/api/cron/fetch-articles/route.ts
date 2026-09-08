@@ -31,7 +31,7 @@ const MAX_SOURCES_PER_ARTICLE = 5;
 
 const RSS_TIMEOUT_MS = 4000;
 const SOURCE_TIMEOUT_MS = 3000;
-const GEMINI_TIMEOUT_MS = 5000;
+const GEMINI_TIMEOUT_MS = 8000;
 
 const MIN_ARTICLE_WORDS = 400;
 const MAX_ARTICLE_WORDS = 900;
@@ -114,9 +114,9 @@ export async function GET(req: NextRequest) {
 
   try {
     /*
-     * ---------------------------------------------------------
-     * 1. RÉCUPÉRATION RSS
-     * ---------------------------------------------------------
+     * =========================================================
+     * 1. RSS
+     * =========================================================
      */
 
     const feeds = await Promise.all(
@@ -147,7 +147,10 @@ export async function GET(req: NextRequest) {
           return {
             feed: feed.name,
             items: [] as FeedItem[],
-            error: getErrorMessage(error),
+            error:
+              getErrorMessage(
+                error
+              ),
           };
         }
       })
@@ -161,14 +164,16 @@ export async function GET(req: NextRequest) {
       }
     }
 
-    const allItems = feeds.flatMap(
-      (result) => result.items
-    );
+    const allItems =
+      feeds.flatMap(
+        (result) =>
+          result.items
+      );
 
     /*
-     * ---------------------------------------------------------
-     * 2. FILTRAGE PSG
-     * ---------------------------------------------------------
+     * =========================================================
+     * 2. FILTRE PSG
+     * =========================================================
      */
 
     const relevantItems =
@@ -177,9 +182,9 @@ export async function GET(req: NextRequest) {
       );
 
     /*
-     * ---------------------------------------------------------
-     * 3. DÉDUPLICATION RSS
-     * ---------------------------------------------------------
+     * =========================================================
+     * 3. DEDUPLICATION RSS
+     * =========================================================
      */
 
     const uniqueItems =
@@ -188,23 +193,28 @@ export async function GET(req: NextRequest) {
       );
 
     /*
-     * ---------------------------------------------------------
-     * 4. ARTICLES DÉJÀ PRÉSENTS
-     * ---------------------------------------------------------
+     * =========================================================
+     * 4. ARTICLES EXISTANTS
+     * =========================================================
      */
 
     const recentArticles =
-      await prisma.article.findMany({
-        orderBy: {
-          createdAt: "desc",
-        },
-        take: 150,
-        select: {
-          title: true,
-          slug: true,
-          sourceUrl: true,
-        },
-      });
+      await prisma.article.findMany(
+        {
+          orderBy: {
+            createdAt:
+              "desc",
+          },
+
+          take: 150,
+
+          select: {
+            title: true,
+            slug: true,
+            sourceUrl: true,
+          },
+        }
+      );
 
     const newItems =
       uniqueItems.filter(
@@ -216,9 +226,9 @@ export async function GET(req: NextRequest) {
       );
 
     /*
-     * ---------------------------------------------------------
-     * 5. REGROUPEMENT DES SUJETS
-     * ---------------------------------------------------------
+     * =========================================================
+     * 5. CLUSTERS
+     * =========================================================
      */
 
     const clusters =
@@ -230,33 +240,44 @@ export async function GET(req: NextRequest) {
       clusters
         .filter(
           (cluster) =>
-            cluster.length > 0
+            cluster.length >
+            0
         )
         .sort(
           (a, b) =>
-            clusterPriority(b) -
-            clusterPriority(a)
+            clusterPriority(
+              b
+            ) -
+            clusterPriority(
+              a
+            )
         );
 
     /*
-     * ---------------------------------------------------------
+     * =========================================================
      * 6. OBJECTIF QUOTIDIEN
-     * ---------------------------------------------------------
+     * =========================================================
      */
 
     const startOfToday =
       getStartOfToday();
 
     const articlesCreatedToday =
-      await prisma.article.count({
-        where: {
-          club: "PSG",
-          isAiGenerated: true,
-          createdAt: {
-            gte: startOfToday,
+      await prisma.article.count(
+        {
+          where: {
+            club: "PSG",
+
+            isAiGenerated:
+              true,
+
+            createdAt: {
+              gte:
+                startOfToday,
+            },
           },
-        },
-      });
+        }
+      );
 
     const remainingDailyTarget =
       Math.max(
@@ -266,7 +287,8 @@ export async function GET(req: NextRequest) {
       );
 
     const requestedCount =
-      remainingDailyTarget > 0
+      remainingDailyTarget >
+      0
         ? Math.min(
             MAX_NEW_ARTICLES_PER_RUN,
             remainingDailyTarget,
@@ -283,22 +305,18 @@ export async function GET(req: NextRequest) {
         requestedCount
       );
 
-    /*
-     * On garde une copie en mémoire afin
-     * d'éviter de créer deux fois le même
-     * article pendant le même run.
-     */
-
     const articlesForDuplicateCheck =
-      [...recentArticles];
+      [
+        ...recentArticles,
+      ];
 
     let created = 0;
     let skipped = 0;
 
     /*
-     * ---------------------------------------------------------
-     * 7. TRAITEMENT DES CLUSTERS
-     * ---------------------------------------------------------
+     * =========================================================
+     * 7. TRAITEMENT
+     * =========================================================
      */
 
     for (
@@ -309,7 +327,9 @@ export async function GET(req: NextRequest) {
     ) {
       const result =
         await processCluster(
-          selectedClusters[index],
+          selectedClusters[
+            index
+          ],
           articlesForDuplicateCheck,
           index + 1
         );
@@ -335,7 +355,9 @@ export async function GET(req: NextRequest) {
           .pageErrors
       );
 
-      if (result.created) {
+      if (
+        result.created
+      ) {
         created++;
 
         articlesForDuplicateCheck.push(
@@ -343,7 +365,9 @@ export async function GET(req: NextRequest) {
             title:
               result.articleTitle ||
               "",
+
             slug: "",
+
             sourceUrl:
               result.sourceUrl ||
               null,
@@ -353,12 +377,6 @@ export async function GET(req: NextRequest) {
         skipped++;
       }
     }
-
-    /*
-     * ---------------------------------------------------------
-     * 8. RÉSULTAT
-     * ---------------------------------------------------------
-     */
 
     const totalCreatedToday =
       articlesCreatedToday +
@@ -439,12 +457,14 @@ export async function GET(req: NextRequest) {
         geminiCalls:
           diagnostics.filter(
             (item) =>
-              item.outcome ===
-                "created" ||
-              item.outcome ===
-                "too_short" ||
-              item.outcome ===
-                "generation_error"
+              [
+                "created",
+                "too_short",
+                "invalid_json",
+                "generation_error",
+              ].includes(
+                item.outcome
+              )
           ).length,
 
         geminiSuccess:
@@ -516,7 +536,9 @@ export async function GET(req: NextRequest) {
     return NextResponse.json(
       {
         error:
-          getErrorMessage(error),
+          getErrorMessage(
+            error
+          ),
 
         elapsedMs:
           Date.now() -
@@ -531,7 +553,7 @@ export async function GET(req: NextRequest) {
 
 /*
  * =========================================================
- * TRAITEMENT D'UN CLUSTER
+ * PROCESS CLUSTER
  * =========================================================
  */
 
@@ -565,10 +587,6 @@ async function processCluster(
         item.title
     );
 
-  /*
-   * Priorité aux médias les plus intéressants.
-   */
-
   const sorted =
     [...cluster]
       .sort(
@@ -586,7 +604,7 @@ async function processCluster(
       );
 
   /*
-   * ENRICHISSEMENT AVANT GEMINI
+   * Enrichissement des pages originales.
    */
 
   const enrichment =
@@ -595,7 +613,7 @@ async function processCluster(
     );
 
   /*
-   * GÉNÉRATION
+   * Génération Gemini.
    */
 
   const generation =
@@ -630,10 +648,6 @@ async function processCluster(
     };
   }
 
-  /*
-   * NORMALISATION
-   */
-
   const article =
     normalizeArticle(
       generation.article
@@ -643,11 +657,6 @@ async function processCluster(
     countWords(
       article.content
     );
-
-  /*
-   * PROTECTION CONTRE LES ARTICLES
-   * TROP COURTS
-   */
 
   if (
     words <
@@ -678,7 +687,7 @@ async function processCluster(
   }
 
   /*
-   * DOUBLE VÉRIFICATION DES DOUBLONS
+   * Protection contre les doublons après génération.
    */
 
   const duplicate =
@@ -691,7 +700,9 @@ async function processCluster(
         ) >= 0.9
     );
 
-  if (duplicate) {
+  if (
+    duplicate
+  ) {
     return {
       created: false,
       articleTitle: null,
@@ -715,10 +726,6 @@ async function processCluster(
       enrichment,
     };
   }
-
-  /*
-   * SLUG
-   */
 
   let slug: string;
 
@@ -745,7 +752,9 @@ async function processCluster(
           "slug_error",
 
         detail:
-          getErrorMessage(error),
+          getErrorMessage(
+            error
+          ),
       },
 
       enrichment,
@@ -756,36 +765,34 @@ async function processCluster(
     sorted[0]?.link ||
     null;
 
-  /*
-   * CRÉATION EN BROUILLON
-   */
-
   try {
-    await prisma.article.create({
-      data: {
-        title:
-          article.title,
+    await prisma.article.create(
+      {
+        data: {
+          title:
+            article.title,
 
-        slug,
+          slug,
 
-        excerpt:
-          article.excerpt,
+          excerpt:
+            article.excerpt,
 
-        content:
-          article.content,
+          content:
+            article.content,
 
-        club:
-          "PSG",
+          club:
+            "PSG",
 
-        status:
-          "DRAFT",
+          status:
+            "DRAFT",
 
-        isAiGenerated:
-          true,
+          isAiGenerated:
+            true,
 
-        sourceUrl,
-      },
-    });
+          sourceUrl,
+        },
+      }
+    );
 
     return {
       created: true,
@@ -807,7 +814,7 @@ async function processCluster(
           "created",
 
         detail:
-          `words=${words}, sources=${enrichment.sources.length}, pages=${enrichment.pagesFetched}`,
+          `words=${words}, sources=${enrichment.sources.length}, pages=${enrichment.pagesFetched}, enriched=${enrichment.enrichedCharacters}`,
       },
 
       enrichment,
@@ -830,7 +837,9 @@ async function processCluster(
           "create_error",
 
         detail:
-          getErrorMessage(error),
+          getErrorMessage(
+            error
+          ),
       },
 
       enrichment,
@@ -840,7 +849,7 @@ async function processCluster(
 
 /*
  * =========================================================
- * ENRICHISSEMENT DES SOURCES
+ * ENRICHISSEMENT
  * =========================================================
  */
 
@@ -851,7 +860,8 @@ async function enrichSources(
   let pagesFailed = 0;
   let enrichedCharacters = 0;
 
-  const pageErrors: string[] = [];
+  const pageErrors: string[] =
+    [];
 
   const sources =
     await Promise.all(
@@ -862,11 +872,6 @@ async function enrichSources(
               item.description
             );
 
-          /*
-           * On tente maintenant beaucoup plus souvent
-           * de récupérer la page originale.
-           */
-
           const needsPage =
             shouldFetchSourcePage(
               item,
@@ -874,7 +879,9 @@ async function enrichSources(
               items
             );
 
-          if (!needsPage) {
+          if (
+            !needsPage
+          ) {
             return {
               title:
                 item.title,
@@ -912,12 +919,6 @@ async function enrichSources(
 
             pagesFetched++;
 
-            /*
-             * On ne remplace la description
-             * que si la page contient réellement
-             * davantage d'informations.
-             */
-
             if (
               extracted.length >
               description.length +
@@ -942,13 +943,10 @@ async function enrichSources(
           } catch (error) {
             pagesFailed++;
 
-            const message =
-              getErrorMessage(
-                error
-              );
-
             pageErrors.push(
-              `${item.source}: ${message}`
+              `${item.source}: ${getErrorMessage(
+                error
+              )}`
             );
           }
 
@@ -983,7 +981,7 @@ async function enrichSources(
 
 /*
  * =========================================================
- * DÉCISION D'ENRICHISSEMENT
+ * DÉCISION ENRICHISSEMENT
  * =========================================================
  */
 
@@ -1002,45 +1000,23 @@ function shouldFetchSourcePage(
       item.title
     );
 
-  /*
-   * Les sujets nécessitant souvent
-   * des informations précises.
-   */
-
   const concreteIntent =
-    /\b(heure|quelle chaine|quelle chaîne|chaine tv|chaîne tv|composition|compo|absent|absence|blesse|blessé|blessure|forfait|transfert|mercato|contrat|prolongation|arbitre|stade|diffusion|direct|ballon d'or)\b/i.test(
+    /\b(heure|quelle chaine|quelle chaîne|chaine tv|chaîne tv|composition|compo|compositions|blessure|blesse|blessé|forfait|transfert|transferts|mercato|contrat|prolongation|arbitre|stade|diffusion|direct|ballon d'or|ballon dor|absent|absents|absence)\b/i.test(
       title
     );
 
-  /*
-   * Plusieurs médias parlent du même sujet :
-   * on cherche alors à fusionner les informations.
-   */
-
   const repeatedSubject =
-    cluster.length > 1;
-
-  /*
-   * RMC / CulturePSG sont prioritaires.
-   */
+    cluster.length >
+    1;
 
   const highPriority =
     sourcePriority(
       item.source
     ) >= 4;
 
-  /*
-   * Description courte.
-   */
-
   const lowInformation =
     words <
     LOW_INFORMATION_WORDS;
-
-  /*
-   * Certaines descriptions RSS
-   * sont en réalité uniquement des teasers.
-   */
 
   const suspiciousDescription =
     description.length <
@@ -1093,124 +1069,231 @@ async function generateArticle(
 
             `Informations : ${source.description}`,
 
-            `Lien : ${source.link}`,
+            `URL : ${source.link}`,
           ].join("\n")
       )
       .join(
-        "\n\n"
+        "\n\n==============================\n\n"
       );
 
   const prompt = `
 Tu es le rédacteur en chef de PSG Direct.
 
-Transforme les informations fournies ci-dessous en UN seul article original de presse sportive consacré au Paris Saint-Germain.
+Ta mission est de transformer les sources ci-dessous en UN SEUL article original de presse sportive sur le Paris Saint-Germain.
+
+OBJECTIF :
+
+Produire un article factuel, précis, utile au lecteur et beaucoup plus riche que les simples titres RSS.
+
+IMPORTANT :
+
+Plusieurs sources peuvent parler exactement du même événement.
+
+Tu dois FUSIONNER ces sources.
+
+Exemple :
+
+Source A :
+Le PSG joue samedi à 21h.
+
+Source B :
+Le match est diffusé sur Canal+.
+
+Source C :
+Le match se joue au Parc des Princes.
+
+Tu dois produire UN article contenant les trois informations.
+
+Tu ne dois surtout pas produire trois articles différents.
 
 RÈGLES ABSOLUES :
 
-- Utilise uniquement les informations présentes dans les sources.
-- N'invente aucune information.
-- N'invente aucune date.
-- N'invente aucune heure.
-- N'invente aucun stade.
-- N'invente aucune chaîne TV.
-- N'invente aucune plateforme de diffusion.
-- N'invente aucun joueur.
-- N'invente aucun transfert.
-- N'invente aucun résultat.
-- N'invente aucune déclaration.
-- N'invente aucun classement.
-- Si une information n'est pas présente dans les sources, ne l'affirme pas.
-- Fusionne les sources uniquement lorsqu'elles concernent exactement le même sujet.
-- Ne mélange jamais deux matchs différents.
-- Ne mélange jamais deux transferts différents.
-- Ne mélange jamais deux joueurs différents.
-- Ne mentionne pas l'intelligence artificielle.
-- Ne copie pas les phrases originales.
-- Rédige dans un français naturel et journalistique.
-- Donne la priorité aux informations factuelles et vérifiables.
-- Une information présente dans plusieurs sources est particulièrement solide.
-- Une information présente dans une seule source peut être utilisée si elle est clairement attribuable à cette source.
-- Ne transforme jamais une hypothèse en certitude.
-- Si les sources ne donnent pas une information, ne la complète pas avec tes connaissances générales.
+1. Utilise uniquement les informations contenues dans les sources.
 
-INFORMATIONS FACTUELLES À PRIVILÉGIER :
+2. N'invente absolument aucune information.
+
+3. Si une information n'est pas présente dans les sources, ne la crée pas.
+
+4. Ne complète jamais avec tes connaissances personnelles.
+
+5. Ne devine jamais une heure.
+
+6. Ne devine jamais une date.
+
+7. Ne devine jamais un stade.
+
+8. Ne devine jamais une chaîne TV.
+
+9. Ne devine jamais une plateforme de streaming.
+
+10. Ne devine jamais une composition.
+
+11. Ne devine jamais une absence.
+
+12. Ne devine jamais une blessure.
+
+13. Ne devine jamais un résultat.
+
+14. Ne devine jamais une déclaration.
+
+15. Ne devine jamais un classement.
+
+16. Ne mélange jamais deux événements différents.
+
+17. Ne mélange jamais deux matchs différents.
+
+18. Ne mélange jamais deux joueurs différents.
+
+19. Ne mélange jamais deux transferts différents.
+
+20. Si deux sources parlent du même sujet, fusionne leurs informations.
+
+21. Une information présente dans plusieurs sources est particulièrement fiable.
+
+22. Une information provenant d'une seule source peut être utilisée si elle est clairement présentée dans cette source.
+
+23. Si une information est incertaine, présente-la comme telle.
+
+24. Ne mentionne jamais Gemini.
+
+25. Ne mentionne jamais l'IA.
+
+26. Ne copie jamais les phrases originales.
+
+27. Réécris entièrement l'information avec ton propre style journalistique.
+
+28. Le français doit être naturel.
+
+29. Évite les phrases génériques.
+
+30. Chaque paragraphe doit apporter une information utile.
+
+INFORMATIONS À RECHERCHER DANS LES SOURCES :
 
 - date du match
-- heure du match
+- heure
+- adversaire
 - compétition
 - journée
-- adversaire
 - stade
-- chaîne de télévision
-- plateforme de diffusion
-- compositions probables
+- diffusion TV
+- streaming
+- compositions
 - absents
 - blessés
 - suspendus
 - arbitre
 - conférence de presse
 - déclarations
-- contexte sportif
-- classement
+- contexte
 - forme récente
+- classement
 - mercato
-- transferts
-- contrats
-- prolongations
+- transfert
+- contrat
+- prolongation
+- entraînement
+- actualité du groupe
 
-IMPORTANT :
+IMPORTANT POUR LES INFORMATIONS MANQUANTES :
 
-Si plusieurs sources parlent du même événement, fusionne leurs informations afin de produire un article plus complet.
+Si les sources indiquent :
 
-Exemple :
+"Le match aura lieu samedi"
 
-SOURCE 1 :
-Le match aura lieu à 21h.
+mais ne donnent aucune heure :
 
-SOURCE 2 :
-Le match sera diffusé sur Canal+.
+écris simplement que le match est prévu samedi.
 
-SOURCE 3 :
-Le match aura lieu au Parc des Princes.
+N'invente pas l'heure.
 
-L'article final doit donc contenir ces trois informations.
+Si les sources indiquent :
 
-Mais si une information n'est présente dans aucune source, ne l'invente jamais.
+"Le match sera diffusé à la télévision"
 
-STRUCTURE OBLIGATOIRE :
+mais ne donnent pas la chaîne :
 
-- Un titre précis et informatif.
-- Un chapô de 2 à 3 phrases.
-- Une introduction factuelle.
-- 3 à 5 intertitres Markdown commençant par ##.
-- Des paragraphes courts.
-- Une conclusion.
+ne donne aucune chaîne.
 
-Le titre doit être précis et correspondre exactement au sujet.
+Si les sources donnent une information précise :
 
-Évite les titres vagues comme :
+conserve cette précision.
+
+OBJECTIF DE LONGUEUR :
+
+Essaie de produire entre 500 et 800 mots lorsque les informations disponibles le permettent.
+
+Cependant :
+
+Il est préférable de produire 350 mots factuels plutôt que 600 mots inventés.
+
+STRUCTURE :
+
+Titre :
+
+Un titre précis, informatif et journalistique.
+
+Chapô :
+
+2 ou 3 phrases résumant les informations principales.
+
+Corps :
+
+## Un premier intertitre informatif
+
+Paragraphes courts.
+
+## Deuxième intertitre informatif
+
+Paragraphes courts.
+
+## Troisième intertitre informatif
+
+Paragraphes courts.
+
+## Les dernières informations
+
+Paragraphes courts.
+
+Conclusion :
+
+Une courte conclusion utile.
+
+ÉVITE ABSOLUMENT les titres vagues comme :
 
 "PSG - Monaco : les détails à suivre"
 
-Privilégie un titre informatif lorsque les données disponibles le permettent.
+"Le PSG prépare son prochain match"
 
-LONGUEUR :
+"Une nouvelle importante pour le PSG"
 
-Entre 500 et 800 mots lorsque les informations disponibles le permettent.
+Le titre doit dire précisément ce qui est nouveau.
 
-Si les sources ne permettent pas d'atteindre 500 mots sans inventer, écris moins long plutôt que d'inventer.
+FORMAT DE SORTIE :
 
-FORMAT JSON STRICT :
+Retourne UNIQUEMENT un objet JSON valide.
+
+AUCUN texte avant le JSON.
+
+AUCUN texte après le JSON.
+
+AUCUNE balise Markdown autour du JSON.
+
+Format exact :
 
 {
-  "title": "...",
-  "excerpt": "...",
-  "content": "..."
+  "title": "Titre de l'article",
+  "excerpt": "Chapô de l'article",
+  "content": "Contenu complet en Markdown"
 }
 
-Le champ content doit être du Markdown.
+Le contenu peut contenir :
 
-Conserve de vrais retours à la ligne entre les paragraphes.
+## Intertitre
+
+Paragraphes.
+
+Conserve les retours à la ligne.
 
 SOURCES :
 
@@ -1227,8 +1310,10 @@ ${sourceText}
   ) {
     return {
       ok: false,
+
       reason:
         "generation_error",
+
       error:
         response.error,
     };
@@ -1242,8 +1327,10 @@ ${sourceText}
   if (!parsed) {
     return {
       ok: false,
+
       reason:
         "invalid_json",
+
       error:
         "Gemini response is not valid JSON",
     };
@@ -1256,8 +1343,10 @@ ${sourceText}
   ) {
     return {
       ok: false,
+
       reason:
         "invalid_json",
+
       error:
         "Missing title, excerpt or content",
     };
@@ -1308,7 +1397,8 @@ async function callGemini(
     "gemini-3.6-flash",
   ];
 
-  const errors: string[] = [];
+  const errors: string[] =
+    [];
 
   for (
     const model of models
@@ -1354,7 +1444,7 @@ async function callGemini(
                       0.2,
 
                     maxOutputTokens:
-                      2200,
+                      3000,
 
                     responseMimeType:
                       "application/json",
@@ -1412,6 +1502,7 @@ async function callGemini(
 
         return {
           ok: true,
+
           text,
         };
       } finally {
@@ -1441,50 +1532,115 @@ async function callGemini(
 
 /*
  * =========================================================
- * JSON GEMINI
+ * PARSING JSON ROBUSTE
  * =========================================================
  */
 
 function parseGeminiJson(
   text: string
 ): GeminiArticle | null {
+  if (
+    !text ||
+    !text.trim()
+  ) {
+    return null;
+  }
+
+  let cleaned =
+    text.trim();
+
+  /*
+   * Suppression des balises Markdown.
+   */
+
+  cleaned =
+    cleaned.replace(
+      /^\uFEFF/,
+      ""
+    );
+
+  cleaned =
+    cleaned.replace(
+      /^```(?:json)?\s*/i,
+      ""
+    );
+
+  cleaned =
+    cleaned.replace(
+      /\s*```$/i,
+      ""
+    );
+
+  cleaned =
+    cleaned.trim();
+
+  /*
+   * Premier essai :
+   * JSON complet.
+   */
+
   try {
-    let cleaned =
-      text.trim();
-
-    cleaned =
-      cleaned.replace(
-        /^```json/gi,
-        ""
-      );
-
-    cleaned =
-      cleaned.replace(
-        /^```/gi,
-        ""
-      );
-
-    cleaned =
-      cleaned.replace(
-        /```$/gi,
-        ""
-      );
-
-    cleaned =
-      cleaned.trim();
-
     const parsed =
       JSON.parse(
         cleaned
       );
 
     if (
-      typeof parsed?.title !==
-        "string" ||
-      typeof parsed?.excerpt !==
-        "string" ||
-      typeof parsed?.content !==
-        "string"
+      isValidGeminiArticle(
+        parsed
+      )
+    ) {
+      return {
+        title:
+          parsed.title,
+
+        excerpt:
+          parsed.excerpt,
+
+        content:
+          parsed.content,
+      };
+    }
+  } catch {
+    /*
+     * On continue avec
+     * l'extraction du JSON.
+     */
+  }
+
+  /*
+   * Gemini peut parfois répondre :
+   *
+   * Voici le JSON :
+   * {
+   *   ...
+   * }
+   *
+   * On récupère alors le premier
+   * objet JSON équilibré.
+   */
+
+  const jsonCandidate =
+    extractFirstJsonObject(
+      cleaned
+    );
+
+  if (
+    !jsonCandidate
+  ) {
+    return null;
+  }
+
+  try {
+    const parsed =
+      JSON.parse(
+        jsonCandidate
+      );
+
+    if (
+      !isValidGeminiArticle(
+        parsed
+      )
     ) {
       return null;
     }
@@ -1500,8 +1656,197 @@ function parseGeminiJson(
         parsed.content,
     };
   } catch {
+    /*
+     * Dernier niveau :
+     * tentative de nettoyage
+     * des caractères problématiques.
+     */
+
+    try {
+      const repaired =
+        repairJsonString(
+          jsonCandidate
+        );
+
+      const parsed =
+        JSON.parse(
+          repaired
+        );
+
+      if (
+        !isValidGeminiArticle(
+          parsed
+        )
+      ) {
+        return null;
+      }
+
+      return {
+        title:
+          parsed.title,
+
+        excerpt:
+          parsed.excerpt,
+
+        content:
+          parsed.content,
+      };
+    } catch {
+      return null;
+    }
+  }
+}
+
+/*
+ * =========================================================
+ * VALIDATION OBJET GEMINI
+ * =========================================================
+ */
+
+function isValidGeminiArticle(
+  value: unknown
+): value is GeminiArticle {
+  if (
+    typeof value !==
+    "object" ||
+    value === null
+  ) {
+    return false;
+  }
+
+  const object =
+    value as Record<
+      string,
+      unknown
+    >;
+
+  return (
+    typeof object.title ===
+      "string" &&
+    typeof object.excerpt ===
+      "string" &&
+    typeof object.content ===
+      "string"
+  );
+}
+
+/*
+ * =========================================================
+ * EXTRACTION OBJET JSON
+ * =========================================================
+ */
+
+function extractFirstJsonObject(
+  text: string
+): string | null {
+  const start =
+    text.indexOf(
+      "{"
+    );
+
+  if (
+    start === -1
+  ) {
     return null;
   }
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (
+    let index = start;
+    index <
+    text.length;
+    index++
+  ) {
+    const character =
+      text[index];
+
+    if (
+      inString
+    ) {
+      if (
+        escaped
+      ) {
+        escaped =
+          false;
+        continue;
+      }
+
+      if (
+        character ===
+        "\\"
+      ) {
+        escaped =
+          true;
+        continue;
+      }
+
+      if (
+        character ===
+        '"'
+      ) {
+        inString =
+          false;
+      }
+
+      continue;
+    }
+
+    if (
+      character ===
+      '"'
+    ) {
+      inString =
+        true;
+      continue;
+    }
+
+    if (
+      character ===
+      "{"
+    ) {
+      depth++;
+      continue;
+    }
+
+    if (
+      character ===
+      "}"
+    ) {
+      depth--;
+
+      if (
+        depth ===
+        0
+      ) {
+        return text.slice(
+          start,
+          index + 1
+        );
+      }
+    }
+  }
+
+  return null;
+}
+
+/*
+ * =========================================================
+ * RÉPARATION JSON
+ * =========================================================
+ */
+
+function repairJsonString(
+  text: string
+): string {
+  return text
+    .replace(
+      /[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g,
+      ""
+    )
+    .trim();
 }
 
 /*
@@ -1563,7 +1908,7 @@ function normalizeArticle(
 
 /*
  * =========================================================
- * STRUCTURE DE SECOURS
+ * STRUCTURE
  * =========================================================
  */
 
@@ -1636,7 +1981,7 @@ function addBasicStructure(
 
 /*
  * =========================================================
- * LIMITATION MOTS
+ * LIMITATION
  * =========================================================
  */
 
@@ -2008,7 +2353,7 @@ function extractOpponent(
 
 /*
  * =========================================================
- * TYPE D'ÉVÉNEMENT
+ * TYPE ÉVÉNEMENT
  * =========================================================
  */
 
@@ -2047,7 +2392,6 @@ function extractEvent(
     "déclarations",
     "conference",
     "conférence",
-    "conférence de presse",
   ];
 
   return (
@@ -2063,7 +2407,7 @@ function extractEvent(
 
 /*
  * =========================================================
- * DÉDUPLICATION RSS
+ * DÉDUPLICATION
  * =========================================================
  */
 
@@ -2124,7 +2468,7 @@ function deduplicateItems(
 
 /*
  * =========================================================
- * ARTICLE DÉJÀ STOCKÉ
+ * DÉJÀ STOCKÉ
  * =========================================================
  */
 
@@ -2166,7 +2510,7 @@ function isAlreadyStored(
 
 /*
  * =========================================================
- * FILTRE PSG
+ * PSG
  * =========================================================
  */
 
@@ -2196,7 +2540,7 @@ function isRelevantPSG(
 
 /*
  * =========================================================
- * RSS PARSER
+ * RSS
  * =========================================================
  */
 
@@ -2299,7 +2643,7 @@ function parseRSS(
 
 /*
  * =========================================================
- * EXTRACTION XML
+ * XML
  * =========================================================
  */
 
@@ -2323,7 +2667,7 @@ function extractXMLTag(
 
 /*
  * =========================================================
- * EXTRACTION PAGE WEB
+ * EXTRACTION PAGE
  * =========================================================
  */
 
@@ -2332,10 +2676,6 @@ function extractPageText(
 ): string {
   let text =
     html;
-
-  /*
-   * Suppression des éléments inutiles.
-   */
 
   text =
     text.replace(
@@ -2379,10 +2719,6 @@ function extractPageText(
       " "
     );
 
-  /*
-   * Priorité au contenu <article>.
-   */
-
   const articleMatch =
     text.match(
       /<article[^>]*>([\s\S]*?)<\/article>/i
@@ -2394,10 +2730,6 @@ function extractPageText(
     text =
       articleMatch[1];
   }
-
-  /*
-   * Conservation des paragraphes.
-   */
 
   text =
     text.replace(
@@ -2688,7 +3020,7 @@ function normalizeForComparison(
 
 /*
  * =========================================================
- * NORMALISATION URL
+ * URL
  * =========================================================
  */
 
@@ -2734,12 +3066,6 @@ function normalizeUrl(
   }
 }
 
-/*
- * =========================================================
- * URL PROPRE
- * =========================================================
- */
-
 function cleanUrl(
   url: string
 ): string {
@@ -2759,7 +3085,7 @@ function cleanUrl(
 
 /*
  * =========================================================
- * TEXTE PROPRE
+ * TEXTE
  * =========================================================
  */
 
@@ -2777,12 +3103,6 @@ function cleanText(
     )
     .trim();
 }
-
-/*
- * =========================================================
- * CONTENU ARTICLE PROPRE
- * =========================================================
- */
 
 function cleanArticleContent(
   text: string
@@ -2815,12 +3135,6 @@ function cleanArticleContent(
     .trim();
 }
 
-/*
- * =========================================================
- * SUPPRESSION HTML
- * =========================================================
- */
-
 function stripHtml(
   text: string
 ): string {
@@ -2832,7 +3146,7 @@ function stripHtml(
 
 /*
  * =========================================================
- * ENTITÉS HTML
+ * HTML ENTITIES
  * =========================================================
  */
 
@@ -2897,7 +3211,7 @@ function decodeHtmlEntities(
 
 /*
  * =========================================================
- * COMPTEUR MOTS
+ * MOTS
  * =========================================================
  */
 
@@ -2919,13 +3233,12 @@ function countWords(
     )
     .filter(
       Boolean
-    )
-    .length;
+    ).length;
 }
 
 /*
  * =========================================================
- * DÉBUT JOURNÉE
+ * JOUR
  * =========================================================
  */
 
@@ -2942,7 +3255,7 @@ function getStartOfToday(): Date {
 
 /*
  * =========================================================
- * SLUG UNIQUE
+ * SLUG
  * =========================================================
  */
 
@@ -2977,17 +3290,8 @@ async function makeUniqueSlug(
     return slug;
   }
 
-  slug =
-    `${base}-${Date.now()}`;
-
-  return slug;
+  return `${base}-${Date.now()}`;
 }
-
-/*
- * =========================================================
- * SLUGIFY
- * =========================================================
- */
 
 function slugify(
   text: string
@@ -3011,7 +3315,7 @@ function slugify(
 
 /*
  * =========================================================
- * FETCH AVEC TIMEOUT
+ * FETCH TIMEOUT
  * =========================================================
  */
 
@@ -3063,7 +3367,7 @@ async function fetchWithTimeout(
 
 /*
  * =========================================================
- * MESSAGE ERREUR
+ * ERREUR
  * =========================================================
  */
 
