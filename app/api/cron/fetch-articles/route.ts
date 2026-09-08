@@ -671,7 +671,7 @@ async function processCluster(
 
   /*
    * =========================================================
-   * RETRY AUTOMATIQUE SI ARTICLE TROP COURT
+   * RETRY / ENRICHISSEMENT DE LA PREMIÈRE VERSION
    * =========================================================
    */
 
@@ -684,7 +684,8 @@ async function processCluster(
     const retry =
       await generateArticle(
         enrichment.sources,
-        true
+        true,
+        article
       );
 
     if (
@@ -702,8 +703,8 @@ async function processCluster(
         );
 
       /*
-       * On conserve uniquement
-       * la meilleure version.
+       * On conserve toujours
+       * la version la plus longue.
        */
 
       if (
@@ -715,6 +716,57 @@ async function processCluster(
 
         words =
           retryWords;
+      }
+    }
+  }
+
+  /*
+   * =========================================================
+   * SECOND RETRY SI NÉCESSAIRE
+   * =========================================================
+   *
+   * Si Gemini n'a toujours pas fourni
+   * assez de matière, on lui demande
+   * une seconde extension ciblée.
+   */
+
+  if (
+    words <
+    MIN_ARTICLE_WORDS
+  ) {
+    geminiCalls++;
+
+    const secondRetry =
+      await generateArticle(
+        enrichment.sources,
+        true,
+        article,
+        true
+      );
+
+    if (
+      secondRetry.ok ===
+      true
+    ) {
+      const secondArticle =
+        normalizeArticle(
+          secondRetry.article
+        );
+
+      const secondWords =
+        countWords(
+          secondArticle.content
+        );
+
+      if (
+        secondWords >
+        words
+      ) {
+        article =
+          secondArticle;
+
+        words =
+          secondWords;
       }
     }
   }
@@ -1092,7 +1144,7 @@ function shouldFetchSourcePage(
     );
 
   const concreteIntent =
-    /\b(heure|quelle chaine|quelle chaîne|chaine tv|chaîne tv|composition|compo|compositions|blessure|blesse|blessé|forfait|transfert|transferts|mercato|contrat|prolongation|arbitre|stade|diffusion|direct|ballon d'or|ballon dor|absent|absents|absence)\b/i.test(
+    /\b(heure|quelle chaine|quelle chaîne|chaine tv|chaîne tv|composition|compo|compositions|blessure|blesse|blessé|forfait|transfert|transferts|mercato|contrat|prolongation|arbitre|stade|diffusion|direct|ballon d'or|ballon dor|absent|absents|absence|maillot|maillots|parc des princes|travaux|renovation|rénovation)\b/i.test(
       title
     );
 
@@ -1133,7 +1185,9 @@ function shouldFetchSourcePage(
 
 async function generateArticle(
   sources: ArticleInput[],
-  retry = false
+  retry = false,
+  previousArticle?: GeminiArticle,
+  secondRetry = false
 ): Promise<
   | {
       ok: true;
@@ -1168,34 +1222,121 @@ async function generateArticle(
         "\n\n==============================\n\n"
       );
 
+  const previousArticleText =
+    previousArticle
+      ? `
+VERSION ACTUELLE À ENRICHIR :
+
+Titre :
+${previousArticle.title}
+
+Chapô :
+${previousArticle.excerpt}
+
+Article :
+${previousArticle.content}
+
+IMPORTANT :
+Cette version contient déjà des informations valides.
+Tu dois la conserver comme base et l'enrichir avec les informations supplémentaires présentes dans les sources.
+Ne supprime pas les faits importants déjà présents.
+`
+      : "";
+
   const retryInstruction =
     retry
       ? `
-ATTENTION : une première version était trop courte.
+ATTENTION : la version précédente était trop courte.
 
-Tu dois maintenant produire une version nettement plus développée.
+Tu dois produire une version beaucoup plus développée.
 
-Objectif : environ 600 à 800 mots.
+OBJECTIF :
+600 à 800 mots minimum.
 
-Développe uniquement les informations réellement présentes dans les sources :
-- contexte
-- date
-- heure
+Tu dois exploiter au maximum les informations factuelles disponibles dans les sources.
+
+Recherche et intègre, UNIQUEMENT lorsqu'elles sont présentes :
+
+- date précise
+- heure précise
 - adversaire
 - compétition
+- journée
 - stade
-- diffusion
+- lieu
+- diffusion TV
+- chaîne
+- streaming
 - compositions
-- absents
+- joueurs titulaires
+- joueurs absents
 - blessures
-- déclarations
+- suspensions
+- forfaits
 - arbitre
+- conférence de presse
+- déclarations
+- entraîneur
+- contexte
+- forme récente
+- résultats récents
+- classement
 - enjeux
-- informations récentes
+- mercato
+- transfert
+- contrat
+- prolongation
+- entraînement
+- maillot
+- travaux
+- rénovation
+- informations concernant le Parc des Princes
+- toute autre information concrète présente dans les sources
 
-Ne répète pas artificiellement les mêmes phrases.
+Ne fais surtout pas une simple répétition de la première version.
 
-N'invente absolument rien pour atteindre la longueur demandée.
+Chaque nouvelle information factuelle pertinente doit être intégrée naturellement.
+
+Si les sources contiennent suffisamment de matière, développe l'article jusqu'à environ 600 à 800 mots.
+
+Si plusieurs sources parlent du même sujet, fusionne leurs informations.
+
+Si une source contient un sujet secondaire différent, ne l'utilise pas pour changer le sujet principal.
+
+N'invente absolument rien.
+`
+      : "";
+
+  const secondRetryInstruction =
+    secondRetry
+      ? `
+DEUXIÈME TENTATIVE D'ENRICHISSEMENT.
+
+La version précédente reste insuffisamment développée.
+
+Tu dois impérativement produire un article d'au moins 500 mots lorsque les sources permettent de le faire.
+
+Ne raccourcis pas le contenu.
+
+Ajoute des paragraphes utiles à partir des informations réellement présentes dans les sources.
+
+Analyse particulièrement les informations longues récupérées depuis les pages des médias.
+
+Cherche les détails concrets :
+- qui ?
+- quoi ?
+- quand ?
+- où ?
+- pourquoi ?
+- comment ?
+- conséquences ?
+- contexte ?
+- prochaines échéances ?
+
+Utilise toutes les informations vérifiables qui concernent le sujet principal.
+
+Ne remplis pas artificiellement.
+N'invente rien.
 `
       : "";
 
@@ -1206,11 +1347,27 @@ Ta mission est de transformer plusieurs sources d'actualité en UN SEUL article 
 
 ${retryInstruction}
 
-OBJECTIF :
+${secondRetryInstruction}
 
-Fusionner les informations provenant de plusieurs médias lorsqu'ils parlent du même événement.
+${previousArticleText}
 
-Les doublons ne doivent PAS produire plusieurs articles.
+============================================================
+OBJECTIF ÉDITORIAL
+============================================================
+
+Produire un véritable article de presse sportive.
+
+L'article doit être concret, informatif et utile au lecteur.
+
+Il ne doit jamais être une reformulation vague des titres RSS.
+
+Les informations détaillées présentes dans les pages des médias doivent être exploitées.
+
+============================================================
+FUSION DES SOURCES
+============================================================
+
+Plusieurs sources peuvent parler du même événement.
 
 Exemple :
 
@@ -1223,9 +1380,15 @@ Le match est diffusé sur Canal+.
 Source C :
 Le match se joue au Parc des Princes.
 
-L'article final doit réunir ces informations dans un seul article.
+L'article final doit réunir ces informations dans UN SEUL article.
 
-RÈGLES ABSOLUES :
+Les doublons servent à enrichir l'article.
+
+Ils ne doivent jamais créer plusieurs articles.
+
+============================================================
+RÈGLES ABSOLUES
+============================================================
 
 1. Utilise uniquement les informations présentes dans les sources.
 
@@ -1265,7 +1428,7 @@ RÈGLES ABSOLUES :
 
 19. Ne mélange jamais deux transferts différents.
 
-20. Si une source mentionne plusieurs événements, utilise uniquement les informations concernant le sujet principal du cluster.
+20. Si une source mentionne plusieurs événements, utilise uniquement les informations concernant le sujet principal.
 
 21. Une information présente dans plusieurs sources est particulièrement fiable.
 
@@ -1287,7 +1450,19 @@ RÈGLES ABSOLUES :
 
 30. Évite les phrases génériques.
 
-INFORMATIONS À RECHERCHER :
+31. Ne répète pas inutilement la même information.
+
+32. Ne transforme pas l'article en liste de faits.
+
+33. Utilise des paragraphes journalistiques.
+
+34. Les intertitres doivent apporter une vraie information.
+
+============================================================
+INFORMATIONS À EXPLOITER
+============================================================
+
+Lorsque présentes dans les sources :
 
 - date
 - heure
@@ -1295,28 +1470,57 @@ INFORMATIONS À RECHERCHER :
 - compétition
 - journée
 - stade
+- lieu
 - diffusion TV
+- chaîne
 - streaming
 - compositions
+- joueurs
 - absents
 - blessés
 - suspendus
+- forfaits
 - arbitre
 - conférence de presse
 - déclarations
+- entraîneur
 - contexte
 - forme récente
+- résultats récents
 - classement
+- enjeux
 - mercato
 - transfert
 - contrat
 - prolongation
 - entraînement
-- actualité du groupe
+- maillot
+- Parc des Princes
+- travaux
+- rénovation
+- calendrier
+- prochaine échéance
+- toute information concrète disponible
 
-IMPORTANT :
+============================================================
+SOURCES MULTI-SUJETS
+============================================================
 
-Si l'information n'est pas dans les sources, ne l'invente pas.
+Si un titre contient plusieurs sujets, par exemple :
+
+"PSG-Monaco & PSG-Bratislava"
+
+ce titre ne doit pas permettre de mélanger les deux événements.
+
+Utilise uniquement les informations correspondant au sujet principal du cluster.
+
+============================================================
+ABSENCE D'INFORMATION
+============================================================
+
+Si l'information n'est pas dans les sources :
+
+ne l'invente pas.
 
 Exemple :
 
@@ -1332,7 +1536,38 @@ Si les sources ne donnent pas de chaîne TV :
 
 ne donne aucune chaîne.
 
-STRUCTURE :
+============================================================
+STYLE
+============================================================
+
+Le style doit être celui d'un média sportif professionnel français.
+
+Évite :
+
+"Le PSG s'apprête à vivre un moment important."
+
+"Cette rencontre sera très intéressante."
+
+"Les supporters attendent avec impatience."
+
+Ces phrases sont trop génériques lorsqu'elles ne contiennent aucun fait.
+
+Privilégie :
+
+des faits,
+des informations,
+du contexte,
+des dates,
+des horaires,
+des noms,
+des lieux,
+des enjeux,
+des déclarations,
+des informations de groupe.
+
+============================================================
+STRUCTURE
+============================================================
 
 Titre :
 
@@ -1346,33 +1581,47 @@ Corps :
 
 ## Premier intertitre informatif
 
-Paragraphes courts.
+Plusieurs paragraphes apportant les faits essentiels.
 
 ## Deuxième intertitre informatif
 
-Paragraphes courts.
+Informations complémentaires et contexte.
 
 ## Troisième intertitre informatif
 
-Paragraphes courts.
+Détails disponibles dans les différentes sources.
 
 ## Les dernières informations
 
-Paragraphes courts.
+Informations récentes ou prochaines échéances lorsqu'elles sont présentes.
 
 Conclusion :
 
 Courte conclusion utile.
 
-LONGUEUR :
+============================================================
+LONGUEUR
+============================================================
 
-${retry ? "Environ 600 à 800 mots." : "Environ 500 à 800 mots."}
+Première génération :
+
+environ 500 à 800 mots.
+
+Deuxième génération :
+
+600 à 800 mots lorsque les sources le permettent.
+
+Deuxième tentative d'enrichissement :
+
+au moins 500 mots lorsque les informations disponibles le permettent.
 
 Ne remplis jamais artificiellement l'article.
 
 Il vaut mieux un article plus court mais totalement factuel qu'un article long contenant des informations inventées.
 
-FORMAT :
+============================================================
+FORMAT
+============================================================
 
 Retourne UNIQUEMENT un objet JSON valide.
 
@@ -1392,7 +1641,9 @@ Format :
 
 Le contenu peut contenir des retours à la ligne.
 
-SOURCES :
+============================================================
+SOURCES
+============================================================
 
 ${sourceText}
 `;
@@ -1541,7 +1792,7 @@ async function callGemini(
                       0.2,
 
                     maxOutputTokens:
-                      3500,
+                      4500,
 
                     responseMimeType:
                       "application/json",
@@ -2118,6 +2369,44 @@ function buildSimpleClusters(
   for (
     const item of items
   ) {
+    const normalizedTitle =
+      normalizeForComparison(
+        item.title
+      );
+
+    /*
+     * =======================================================
+     * IMPORTANT :
+     * Un titre qui contient plusieurs adversaires
+     * est considéré comme ambigu.
+     *
+     * Exemple :
+     *
+     * PSG-Monaco & PSG-Bratislava
+     *
+     * Il ne doit pas pouvoir polluer
+     * le cluster Monaco ou Bratislava.
+     * =======================================================
+     */
+
+    const opponents =
+      extractAllOpponents(
+        normalizedTitle
+      );
+
+    if (
+      opponents.length >
+      1
+    ) {
+      continue;
+    }
+
+    /*
+     * =======================================================
+     * Recherche du meilleur cluster.
+     * =======================================================
+     */
+
     let bestCluster:
       FeedItem[] | null =
       null;
@@ -2178,10 +2467,26 @@ function similarityToCluster(
       item.title
     );
 
-  const itemOpponent =
-    extractOpponent(
+  const itemOpponents =
+    extractAllOpponents(
       itemTitle
     );
+
+  /*
+   * Un titre ambigu ne peut jamais
+   * être fusionné.
+   */
+
+  if (
+    itemOpponents.length >
+    1
+  ) {
+    return 0;
+  }
+
+  const itemOpponent =
+    itemOpponents[0] ||
+    null;
 
   const clusterOpponents =
     [
@@ -2189,12 +2494,13 @@ function similarityToCluster(
         cluster
           .map(
             (entry) =>
-              extractOpponent(
+              extractAllOpponents(
                 normalizeForComparison(
                   entry.title
                 )
               )
           )
+          .flat()
           .filter(
             (
               opponent
@@ -2208,7 +2514,6 @@ function similarityToCluster(
 
   /*
    * =======================================================
-   * RÈGLE IMPORTANTE :
    * DEUX ADVERSAIRES DIFFÉRENTS =
    * JAMAIS LE MÊME CLUSTER
    * =======================================================
@@ -2231,46 +2536,6 @@ function similarityToCluster(
     ) {
       return 0;
     }
-  }
-
-  /*
-   * =======================================================
-   * DÉTECTION DE PLUSIEURS ADVERSAIRES
-   * DANS UN MÊME TITRE
-   * =======================================================
-   */
-
-  const titleOpponents =
-    extractAllOpponents(
-      itemTitle
-    );
-
-  if (
-    titleOpponents.length >
-    1
-  ) {
-    /*
-     * Un titre comme :
-     *
-     * PSG-Monaco (1-2) &
-     * PSG-Bratislava
-     *
-     * ne doit pas servir à
-     * fusionner deux événements.
-     */
-
-    if (
-      itemOpponent &&
-      clusterOpponents.length >
-        0 &&
-      !clusterOpponents.includes(
-        itemOpponent
-      )
-    ) {
-      return 0;
-    }
-
-    return 0;
   }
 
   let best = 0;
@@ -2322,8 +2587,8 @@ function simpleStorySimilarity(
     );
 
   /*
-   * Plusieurs adversaires dans un titre :
-   * on évite les fusions hasardeuses.
+   * Titres ambigus :
+   * aucune fusion automatique.
    */
 
   if (
@@ -2598,6 +2863,11 @@ function extractEvent(
     "déclarations",
     "conference",
     "conférence",
+    "maillot",
+    "maillots",
+    "travaux",
+    "renovation",
+    "rénovation",
   ];
 
   return (
