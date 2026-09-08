@@ -486,7 +486,7 @@ export async function GET(req: NextRequest) {
             expandedResult;
         } else {
           geminiErrors.push(
-            expandedResult.error
+            expandedResult.ok === false
           );
         }
       }
