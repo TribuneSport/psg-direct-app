@@ -106,15 +106,23 @@ export async function GET(req: NextRequest) {
 
     if (!CRON_SECRET || secret !== CRON_SECRET) {
       return NextResponse.json(
-        { error: "Unauthorized" },
-        { status: 401 }
+        {
+          error: "Unauthorized",
+        },
+        {
+          status: 401,
+        }
       );
     }
 
     if (!GEMINI_API_KEY) {
       return NextResponse.json(
-        { error: "GEMINI_API_KEY manquante" },
-        { status: 500 }
+        {
+          error: "GEMINI_API_KEY manquante",
+        },
+        {
+          status: 500,
+        }
       );
     }
 
@@ -151,70 +159,83 @@ export async function GET(req: NextRequest) {
           a.publishedAt.getTime()
       );
 
-    const uniqueItems = dedupeFeedItems(filteredItems);
+    const uniqueItems = dedupeFeedItems(
+      filteredItems
+    );
 
-    const clusters = buildClusters(uniqueItems);
+    const clusters = buildClusters(
+      uniqueItems
+    );
 
-    const recentArticles = await prisma.article.findMany({
-      orderBy: {
-        createdAt: "desc",
-      },
-      take: 100,
-      select: {
-        title: true,
-        sourceUrl: true,
-        createdAt: true,
-      },
-    });
+    const recentArticles =
+      await prisma.article.findMany({
+        orderBy: {
+          createdAt: "desc",
+        },
+        take: 100,
+        select: {
+          title: true,
+          sourceUrl: true,
+          createdAt: true,
+        },
+      });
 
-    const candidateClusters = clusters.filter((cluster) => {
-      const hasExistingSource = cluster.some((item) =>
-        recentArticles.some(
-          (article) =>
-            article.sourceUrl &&
-            normalizeUrl(article.sourceUrl) ===
-              normalizeUrl(item.link)
-        )
-      );
+    const candidateClusters =
+      clusters.filter((cluster) => {
+        const hasExistingSource =
+          cluster.some((item) =>
+            recentArticles.some(
+              (article) =>
+                article.sourceUrl &&
+                normalizeUrl(
+                  article.sourceUrl
+                ) ===
+                  normalizeUrl(
+                    item.link
+                  )
+            )
+          );
 
-      if (hasExistingSource) {
-        return false;
-      }
-
-      const hasSimilarExistingArticle = cluster.some((item) =>
-        recentArticles.some(
-          (article) =>
-            titleSimilarity(
-              item.title,
-              article.title
-            ) >= 0.88
-        )
-      );
-
-      return !hasSimilarExistingArticle;
-    });
-
-    const clustersToProcess = candidateClusters
-      .sort((a, b) => {
-        const scoreA =
-          clusterPriorityScore(a);
-
-        const scoreB =
-          clusterPriorityScore(b);
-
-        if (scoreA !== scoreB) {
-          return scoreB - scoreA;
+        if (hasExistingSource) {
+          return false;
         }
 
-        return (
-          b[0].publishedAt.getTime() -
-          a[0].publishedAt.getTime()
+        const hasSimilarExistingArticle =
+          cluster.some((item) =>
+            recentArticles.some(
+              (article) =>
+                titleSimilarity(
+                  item.title,
+                  article.title
+                ) >= 0.88
+            )
+          );
+
+        return !hasSimilarExistingArticle;
+      });
+
+    const clustersToProcess =
+      candidateClusters
+        .sort((a, b) => {
+          const scoreA =
+            clusterPriorityScore(a);
+
+          const scoreB =
+            clusterPriorityScore(b);
+
+          if (scoreA !== scoreB) {
+            return scoreB - scoreA;
+          }
+
+          return (
+            b[0].publishedAt.getTime() -
+            a[0].publishedAt.getTime()
+          );
+        })
+        .slice(
+          0,
+          MAX_CLUSTERS_TO_PROCESS
         );
-      })
-      .slice(
-        0,
-        MAX_CLUSTERS_TO_PROCESS
-      );
 
     const diagnostics: Diagnostic[] = [];
 
@@ -234,7 +255,8 @@ export async function GET(req: NextRequest) {
       index++
     ) {
       if (
-        created >= MAX_NEW_ARTICLES
+        created >=
+        MAX_NEW_ARTICLES
       ) {
         break;
       }
@@ -284,7 +306,15 @@ export async function GET(req: NextRequest) {
             enrichment.sources
           );
 
-        if (!generation.ok) {
+        /*
+         * IMPORTANT :
+         * Utilisation explicite de === false
+         * pour que TypeScript reconnaisse
+         * correctement GenerationFailure.
+         */
+        if (
+          generation.ok === false
+        ) {
           diagnostic.outcome =
             "generation_error";
 
@@ -318,7 +348,9 @@ export async function GET(req: NextRequest) {
               enrichment.sources
             );
 
-          if (expanded.ok) {
+          if (
+            expanded.ok === true
+          ) {
             article =
               expanded.result;
 
@@ -397,7 +429,9 @@ export async function GET(req: NextRequest) {
           [...cluster].sort(
             (a, b) =>
               b.priority -
-              a.priority
+                a.priority ||
+              b.publishedAt.getTime() -
+                a.publishedAt.getTime()
           )[0];
 
         const existingBySource =
@@ -427,14 +461,21 @@ export async function GET(req: NextRequest) {
           data: {
             title:
               article.title,
+
             slug,
+
             content:
               article.content,
+
             excerpt:
               article.excerpt,
+
             club: "PSG",
+
             status: "DRAFT",
+
             isAiGenerated: true,
+
             sourceUrl:
               primarySource.link,
           },
@@ -490,14 +531,17 @@ export async function GET(req: NextRequest) {
       processedClusters:
         clustersToProcess.length,
 
-      deferred: Math.max(
-        0,
-        candidateClusters.length -
-          clustersToProcess.length
-      ),
+      deferred:
+        Math.max(
+          0,
+          candidateClusters.length -
+            clustersToProcess.length
+        ),
 
       created,
+
       skipped,
+
       duplicates,
 
       sourcesOk,
@@ -509,7 +553,9 @@ export async function GET(req: NextRequest) {
         ),
 
       fusion: true,
+
       optimized: true,
+
       enrichment: true,
 
       diagnostics: {
@@ -591,7 +637,9 @@ export async function GET(req: NextRequest) {
             ? error.message
             : String(error),
       },
-      { status: 500 }
+      {
+        status: 500,
+      }
     );
   }
 }
@@ -608,9 +656,12 @@ async function fetchRSS(feed: {
     new AbortController();
 
   const timeout =
-    setTimeout(() => {
-      controller.abort();
-    }, RSS_TIMEOUT_MS);
+    setTimeout(
+      () => {
+        controller.abort();
+      },
+      RSS_TIMEOUT_MS
+    );
 
   try {
     const response =
@@ -625,7 +676,8 @@ async function fetchRSS(feed: {
               "PSGDirectBot/1.0 (+https://psg-direct-app-1ktj.vercel.app)",
           },
 
-          cache: "no-store",
+          cache:
+            "no-store",
 
           signal:
             controller.signal,
@@ -641,8 +693,11 @@ async function fetchRSS(feed: {
     const xml =
       await response.text();
 
+    const parsed =
+      parseRSS(xml);
+
     const items =
-      parseRSS(xml)
+      parsed
         .slice(
           0,
           MAX_ITEMS_PER_SOURCE
@@ -819,7 +874,6 @@ function isRelevantPSGItem(
     "psg",
     "paris saint germain",
     "paris sg",
-    "paris-sg",
     "paris saint-germain",
     "paris saintgermain",
   ];
@@ -900,10 +954,10 @@ function dedupeFeedItems(
 }
 
 /**
- * Regroupement strict des histoires.
+ * Regroupement strict.
  *
- * Deux articles ne sont regroupés que lorsqu'ils
- * présentent suffisamment de signaux communs.
+ * Le simple mot "PSG" ne permet plus
+ * de regrouper deux articles.
  */
 function buildClusters(
   items: FeedItem[]
@@ -918,7 +972,8 @@ function buildClusters(
       FeedItem[] | null =
       null;
 
-    let bestScore = 0;
+    let bestScore =
+      0;
 
     for (
       const cluster of clusters
@@ -963,7 +1018,8 @@ function clusterSimilarity(
   item: FeedItem,
   cluster: FeedItem[]
 ): number {
-  let bestScore = 0;
+  let best =
+    0;
 
   for (
     const other of cluster
@@ -976,14 +1032,14 @@ function clusterSimilarity(
 
     if (
       score >
-      bestScore
+      best
     ) {
-      bestScore =
+      best =
         score;
     }
   }
 
-  return bestScore;
+  return best;
 }
 
 function storyCompatibility(
@@ -1006,10 +1062,6 @@ function storyCompatibility(
       b.title
     );
 
-  /*
-   * Deux adversaires différents =
-   * deux histoires différentes.
-   */
   if (
     signalsA.opponents.length >
       0 &&
@@ -1023,10 +1075,6 @@ function storyCompatibility(
     return 0;
   }
 
-  /*
-   * Deux personnes différentes et aucun
-   * rapprochement fort = histoires différentes.
-   */
   if (
     signalsA.people.length >
       0 &&
@@ -1042,10 +1090,6 @@ function storyCompatibility(
     return 0;
   }
 
-  /*
-   * Deux types d'événements différents
-   * ne doivent pas être fusionnés.
-   */
   if (
     signalsA.eventType !==
       "general" &&
@@ -1087,9 +1131,6 @@ function storyCompatibility(
     signalsA.eventType ===
     signalsB.eventType;
 
-  /*
-   * Même adversaire + même événement.
-   */
   if (
     opponentOverlap &&
     sameEventType &&
@@ -1104,9 +1145,6 @@ function storyCompatibility(
     );
   }
 
-  /*
-   * Même personne + même événement.
-   */
   if (
     peopleOverlap &&
     sameEventType &&
@@ -1121,9 +1159,6 @@ function storyCompatibility(
     );
   }
 
-  /*
-   * Titres presque identiques.
-   */
   if (
     titleScore >=
     0.84
@@ -1163,9 +1198,6 @@ function storyCompatibility(
       0.16;
   }
 
-  /*
-   * PSG / Paris / Ligue 1 seuls ne suffisent jamais.
-   */
   if (
     !opponentOverlap &&
     !peopleOverlap &&
@@ -1262,12 +1294,10 @@ function extractStorySignals(
       text,
       [
         "critique",
-        "critique",
         "accuse",
         "accusation",
         "scandalise",
         "scandale",
-        "colere",
         "colere",
         "tacle",
         "attaque",
@@ -1275,7 +1305,7 @@ function extractStorySignals(
         "reproches",
         "avis",
         "declaration",
-        "declaration",
+        "declarations",
         "sort du silence",
       ]
     )
@@ -1296,7 +1326,6 @@ function extractStorySignals(
         "nul",
         "score",
         "resultat",
-        "resultat",
       ]
     )
   ) {
@@ -1312,7 +1341,7 @@ function extractStorySignals(
         "prix",
         "recompense",
         "nommes",
-        "nommes",
+        "nomines",
       ]
     )
   ) {
@@ -1412,10 +1441,9 @@ const KNOWN_PEOPLE = [
   "warren zaire emery",
   "zaire emery",
   "lucas hernandez",
-  "hermoso",
   "luis enrique",
-  "rothen",
   "jerome rothen",
+  "rothen",
 ];
 
 const KNOWN_OPPONENTS = [
@@ -1762,7 +1790,8 @@ function titleSimilarity(
     return 0;
   }
 
-  let intersection = 0;
+  let intersection =
+    0;
 
   for (
     const token of tokensA
@@ -1856,9 +1885,14 @@ async function enrichCluster(
     EnrichedSource[] =
     [];
 
-  let pagesFetched = 0;
-  let pagesFailed = 0;
-  let characters = 0;
+  let pagesFetched =
+    0;
+
+  let pagesFailed =
+    0;
+
+  let characters =
+    0;
 
   const errors: string[] =
     [];
@@ -1880,7 +1914,8 @@ async function enrichCluster(
   for (
     const item of sortedCluster
   ) {
-    let pageText = "";
+    let pageText =
+      "";
 
     if (
       item.description &&
@@ -1954,9 +1989,13 @@ async function enrichCluster(
 
   return {
     sources,
+
     pagesFetched,
+
     pagesFailed,
+
     characters,
+
     errors,
   };
 }
@@ -1968,9 +2007,12 @@ async function fetchSourcePage(
     new AbortController();
 
   const timeout =
-    setTimeout(() => {
-      controller.abort();
-    }, SOURCE_PAGE_TIMEOUT_MS);
+    setTimeout(
+      () => {
+        controller.abort();
+      },
+      SOURCE_PAGE_TIMEOUT_MS
+    );
 
   try {
     const response =
@@ -1985,7 +2027,8 @@ async function fetchSourcePage(
               "PSGDirectBot/1.0 (+https://psg-direct-app-1ktj.vercel.app)",
           },
 
-          cache: "no-store",
+          cache:
+            "no-store",
 
           signal:
             controller.signal,
@@ -2014,7 +2057,8 @@ async function fetchSourcePage(
 function extractPageContent(
   html: string
 ): string {
-  let cleaned = html;
+  let cleaned =
+    html;
 
   cleaned =
     cleaned.replace(
@@ -2040,7 +2084,8 @@ function extractPageContent(
       " "
     );
 
-  let content = "";
+  let content =
+    "";
 
   const articleMatch =
     cleaned.match(
@@ -2242,7 +2287,7 @@ Réponds UNIQUEMENT avec un JSON valide :
     );
 
   if (
-    !result.ok
+    result.ok === false
   ) {
     return result;
   }
@@ -2393,7 +2438,7 @@ Réponds uniquement en JSON :
     );
 
   if (
-    !result.ok
+    result.ok === false
   ) {
     return result;
   }
@@ -2459,12 +2504,14 @@ async function callGemini(
     {
       model:
         "gemini-3.5-flash-lite",
-      timeout: 4500,
+      timeout:
+        4500,
     },
     {
       model:
         "gemini-3.6-flash",
-      timeout: 1500,
+      timeout:
+        1500,
     },
   ];
 
@@ -2478,9 +2525,12 @@ async function callGemini(
       new AbortController();
 
     const timeout =
-      setTimeout(() => {
-        controller.abort();
-      }, config.timeout);
+      setTimeout(
+        () => {
+          controller.abort();
+        },
+        config.timeout
+      );
 
     try {
       const response =
@@ -2501,6 +2551,7 @@ async function callGemini(
                   {
                     role:
                       "user",
+
                     parts: [
                       {
                         text:
@@ -2908,11 +2959,14 @@ function ensureParagraphBreaks(
     if (
       paragraph
         .join(" ")
-        .split(/\s+/)
+        .split(
+          /\s+/
+        )
         .length >=
       75
     ) {
       flush();
+
       result.push(
         ""
       );
@@ -2935,8 +2989,9 @@ function trimArticleToWordLimit(
   maxWords: number
 ): string {
   const words =
-    content
-      .split(/\s+/);
+    content.split(
+      /\s+/
+    );
 
   if (
     words.length <=
@@ -2990,6 +3045,7 @@ async function makeUniqueSlug(
           where: {
             slug,
           },
+
           select: {
             id: true,
           },
