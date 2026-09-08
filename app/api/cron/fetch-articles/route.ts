@@ -450,12 +450,46 @@ export async function GET(req: NextRequest) {
             .slice(0, 5),
       };
 
+      /*
+       * Première génération.
+       */
       geminiCalls++;
 
-      const generatedResult =
+      let generatedResult =
         await generateArticle(
           cluster
         );
+
+      /*
+       * Si Gemini produit moins de 400 mots,
+       * on lance une seconde génération spécialisée
+       * pour développer l'article à partir des mêmes faits.
+       */
+      if (
+        generatedResult.ok &&
+        countWords(
+          generatedResult.article.content
+        ) < 400
+      ) {
+        geminiCalls++;
+
+        const expandedResult =
+          await expandArticle(
+            cluster,
+            generatedResult.article
+          );
+
+        if (
+          expandedResult.ok
+        ) {
+          generatedResult =
+            expandedResult;
+        } else {
+          geminiErrors.push(
+            expandedResult.error
+          );
+        }
+      }
 
       if (
         generatedResult.ok === false
@@ -491,11 +525,9 @@ export async function GET(req: NextRequest) {
         generatedResult.article;
 
       const wordCount =
-        generated.content
-          .trim()
-          .split(/\s+/)
-          .filter(Boolean)
-          .length;
+        countWords(
+          generated.content
+        );
 
       if (
         generated.title.length <
@@ -720,7 +752,9 @@ Transforme les sources ci-dessous en UN SEUL article original consacré au Paris
 
 OBJECTIF :
 
-Produire un véritable article de presse sportive française, précis, factuel, informatif et suffisamment développé.
+Produire un véritable article de presse sportive française.
+
+L'article doit être informatif, précis, factuel, développé et utile au lecteur.
 
 RÈGLE ABSOLUE :
 
@@ -728,41 +762,47 @@ N'INVENTE AUCUNE INFORMATION.
 
 Utilise uniquement les faits présents dans les sources.
 
-Lorsque l'information est disponible, indique notamment :
+Lorsque l'information est disponible, indique :
 
-- date du match
-- heure du match
+- date
+- heure
 - stade
 - compétition
 - journée
 - adversaire
 - chaîne TV
 - plateforme de diffusion
-- joueurs concernés
+- joueurs
 - entraîneur
-- composition probable
+- composition
 - blessure
 - suspension
 - mercato
 - déclaration
 - résultat
-- contexte sportif
-- enjeu du match
+- contexte
+- enjeu
 - procédure disciplinaire
 - décision officielle
-- conséquences annoncées
+- conséquences
 
 Si une information n'est pas présente dans les sources, ne l'invente pas.
 
-Si plusieurs sources parlent du même événement, fusionne leurs informations au lieu de répéter les mêmes faits.
+Si plusieurs sources parlent du même événement, fusionne leurs informations.
 
-Une information présente dans plusieurs sources peut être considérée comme davantage confirmée.
+Une information présente dans plusieurs sources est considérée comme mieux confirmée.
 
-Une information présente dans une seule source peut être utilisée, mais ne doit jamais être transformée en fait certain si la source la présente comme une hypothèse ou une information non confirmée.
+Une information provenant d'une seule source doit rester attribuée à cette source lorsqu'elle est présentée comme une information ou une hypothèse.
 
-Ne fais pas de remplissage.
+Le contenu doit contenir AU MINIMUM 400 MOTS.
 
-Évite absolument les phrases génériques comme :
+Le contenu doit comporter plusieurs paragraphes.
+
+Chaque paragraphe doit apporter une information concrète ou développer un fait réellement présent dans les sources.
+
+N'utilise aucune phrase de remplissage.
+
+INTERDICTION des formulations génériques sans information nouvelle :
 
 "Cette rencontre s'annonce passionnante."
 
@@ -774,37 +814,32 @@ Ne fais pas de remplissage.
 
 "Le club parisien devra maintenant se tourner vers la suite."
 
-Ces phrases sont interdites lorsqu'elles n'apportent aucun fait concret.
+Ne répète pas artificiellement les mêmes informations.
+
+Tu peux développer :
+
+- la chronologie des faits
+- le contexte
+- les personnes concernées
+- les déclarations
+- les décisions
+- les conséquences
+- les enjeux
+- les informations sportives disponibles
+
+mais uniquement à partir des sources.
+
+Si les sources sont pauvres, explique précisément ce qui est connu et ce qui ne l'est pas.
+
+NE COMPLÈTE JAMAIS une information absente avec tes connaissances générales.
 
 Le PSG doit rester au centre de l'article.
 
-IMPORTANT :
-
-Le contenu doit contenir AU MINIMUM 400 MOTS.
-
-L'article doit comporter plusieurs paragraphes distincts.
-
-Chaque paragraphe doit apporter une information concrète, un élément de contexte ou une explication utile.
-
-Même lorsqu'une seule source est disponible, développe l'article à partir de tous les faits réellement présents dans cette source.
-
-Tu peux expliquer la chronologie des faits, le contexte de l'événement, les personnes concernées, la procédure engagée, les déclarations disponibles et les conséquences annoncées lorsqu'elles sont présentes dans les informations fournies.
-
-N'ajoute aucune information extérieure pour atteindre 400 mots.
-
-Ne répète pas artificiellement les mêmes phrases pour atteindre 400 mots.
-
-Si les sources ne permettent pas de fournir certains détails, indique simplement ce qui est connu et ce qui ne l'est pas.
-
-Ne transforme jamais une absence d'information en affirmation.
-
-Si une date, une heure, un stade, une chaîne TV, une compétition, une journée, un joueur ou une décision est présent dans les sources, cette information doit apparaître dans l'article lorsqu'elle est pertinente.
-
-Le titre doit être informatif et spécifique.
+Le titre doit être précis et informatif.
 
 L'extrait doit résumer les faits principaux.
 
-Le contenu doit développer les informations disponibles avec plusieurs paragraphes.
+Le contenu doit être structuré en plusieurs paragraphes.
 
 Style :
 
@@ -812,15 +847,13 @@ Style :
 - naturel
 - journalistique
 - sportif
-- précis
 - professionnel
+- précis
 - lisible
 
 Ne mets pas de Markdown dans le titre.
 
-Ne mets pas de préambule avant le JSON.
-
-Retourne uniquement ce JSON :
+Retourne uniquement le JSON :
 
 {
   "title": "...",
@@ -833,15 +866,111 @@ SOURCES :
 ${evidence}
 `;
 
-  /*
-   * Gemini 3.5 Flash-Lite est utilisé en priorité :
-   * il est destiné aux tâches à faible latence et à fort volume.
-   *
-   * Le second modèle sert de fallback.
-   *
-   * Le timeout est volontairement réparti afin de rester
-   * compatible avec le temps d'exécution du cron.
-   */
+  return callGemini(
+    prompt
+  );
+}
+
+async function expandArticle(
+  cluster: FeedItem[],
+  article: ArticleResult
+): Promise<GenerationResult> {
+  const orderedCluster =
+    [...cluster].sort(
+      (a, b) =>
+        a.priority - b.priority
+    );
+
+  const evidence =
+    orderedCluster
+      .map(
+        (item, index) =>
+          [
+            `SOURCE ${index + 1} — ${item.source}`,
+            `Titre: ${item.title}`,
+            `Date de publication: ${
+              item.publishedAt ??
+              "non précisée"
+            }`,
+            `URL: ${item.url}`,
+            `Informations: ${
+              item.description ||
+              "Aucune description disponible"
+            }`,
+          ].join("\n")
+      )
+      .join("\n\n");
+
+  const prompt = `
+Tu es le rédacteur sportif de PSG Direct.
+
+L'article ci-dessous a été généré à partir de sources RSS mais il est trop court.
+
+Tu dois le REECRIRE intégralement en un article de presse sportive française d'AU MINIMUM 400 MOTS.
+
+IMPORTANT :
+
+N'INVENTE AUCUNE INFORMATION.
+
+Utilise exclusivement les informations présentes dans les sources.
+
+Tu dois conserver tous les faits exacts déjà présents dans l'article.
+
+Tu dois développer l'article uniquement en expliquant davantage les faits réellement disponibles :
+
+- chronologie
+- contexte
+- personnes concernées
+- déclarations
+- faits sportifs
+- procédure
+- décision
+- conséquences
+- enjeu
+- suite connue
+
+Si une information n'est pas présente dans les sources, ne l'ajoute pas.
+
+Ne complète pas avec tes connaissances générales.
+
+Ne répète pas artificiellement une phrase pour atteindre 400 mots.
+
+Chaque paragraphe doit apporter une information ou une explication concrète.
+
+Le résultat final doit comporter au minimum 400 mots.
+
+ARTICLE ACTUEL :
+
+Titre :
+${article.title}
+
+Extrait :
+${article.excerpt}
+
+Contenu :
+${article.content}
+
+SOURCES :
+
+${evidence}
+
+Retourne uniquement :
+
+{
+  "title": "...",
+  "excerpt": "...",
+  "content": "..."
+}
+`;
+
+  return callGemini(
+    prompt
+  );
+}
+
+async function callGemini(
+  prompt: string
+): Promise<GenerationResult> {
   const models: GeminiModel[] = [
     {
       name:
@@ -964,13 +1093,6 @@ ${evidence}
         lastFailure =
           failure;
 
-        /*
-         * On passe systématiquement au modèle
-         * suivant en cas d'erreur HTTP.
-         *
-         * Cela permet de récupérer un article même
-         * lorsqu'un modèle est temporairement indisponible.
-         */
         if (
           modelIndex <
           models.length - 1
@@ -1125,14 +1247,6 @@ ${evidence}
       lastFailure =
         failure;
 
-      /*
-       * IMPORTANT :
-       * Le fallback fonctionne aussi lorsqu'un modèle
-       * dépasse son timeout.
-       *
-       * Avant ce correctif, AbortError arrêtait
-       * directement toute la génération.
-       */
       if (
         modelIndex <
         models.length - 1
@@ -1159,6 +1273,16 @@ ${evidence}
         "Aucun modèle Gemini disponible",
     }
   );
+}
+
+function countWords(
+  value: string
+): number {
+  return value
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .length;
 }
 
 function parseGeminiJSON(
