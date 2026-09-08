@@ -485,13 +485,24 @@ export async function GET(req: NextRequest) {
             expandedResult;
         } else {
           /*
-           * expandedResult est explicitement
-           * identifié comme une erreur grâce
-           * au test ok === false.
+           * TypeScript exige ici un test
+           * explicite sur ok === false avant
+           * d'accéder à la propriété error.
            */
           geminiErrors.push(
             expandedResult.error
           );
+
+          diagnostics.push({
+            ...diagnosticBase,
+            outcome:
+              expandedResult.outcome,
+            detail:
+              expandedResult.error,
+          });
+
+          generatedResult =
+            expandedResult;
         }
       }
 
@@ -798,11 +809,19 @@ Une information présente dans plusieurs sources est considérée comme mieux co
 
 Une information provenant d'une seule source doit rester attribuée à cette source lorsqu'elle est présentée comme une information ou une hypothèse.
 
+IMPORTANT POUR LA LONGUEUR :
+
 Le contenu doit contenir AU MINIMUM 400 MOTS.
 
-Le contenu doit comporter au minimum 6 paragraphes distincts.
+Le contenu doit comporter entre 6 et 8 paragraphes distincts.
+
+Chaque paragraphe doit comporter plusieurs phrases.
 
 Chaque paragraphe doit apporter une information concrète ou développer un fait réellement présent dans les sources.
+
+Ne produis pas un résumé de 150 ou 200 mots.
+
+Ne termine pas l'article avant d'avoir développé tous les faits disponibles.
 
 N'utilise aucune phrase de remplissage.
 
@@ -939,9 +958,17 @@ Ne complète pas avec tes connaissances générales.
 
 Ne répète pas artificiellement une phrase pour atteindre 400 mots.
 
-Le résultat final doit comporter au minimum 400 mots et au minimum 6 paragraphes distincts.
+Le résultat final doit comporter au minimum 400 mots.
+
+Le résultat final doit comporter entre 6 et 8 paragraphes distincts.
+
+Chaque paragraphe doit comporter plusieurs phrases.
 
 Chaque paragraphe doit apporter une information ou une explication concrète.
+
+Ne produis surtout pas une version de 150 ou 200 mots.
+
+Développe réellement les informations déjà disponibles.
 
 ARTICLE ACTUEL :
 
