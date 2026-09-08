@@ -326,10 +326,9 @@ export async function GET(req: NextRequest) {
       [];
 
     /*
-     * IMPORTANT :
-     * On élimine d'abord les clusters déjà connus.
-     * Cela évite que le cluster le plus récent bloque
-     * indéfiniment les nouveaux sujets.
+     * On élimine d'abord les sujets déjà connus.
+     * Cela permet au cron de passer au prochain
+     * véritable nouveau sujet.
      */
     const candidateClusters =
       clusters
@@ -494,11 +493,17 @@ export async function GET(req: NextRequest) {
       const generated =
         generatedResult.article;
 
+      const wordCount =
+        generated.content
+          .trim()
+          .split(/\s+/)
+          .filter(Boolean)
+          .length;
+
       if (
         generated.title.length <
           20 ||
-        generated.content.length <
-          300
+        wordCount < 400
       ) {
         tooShort++;
         deferred++;
@@ -508,7 +513,7 @@ export async function GET(req: NextRequest) {
           outcome:
             "too_short",
           detail:
-            `title=${generated.title.length}, excerpt=${generated.excerpt.length}, content=${generated.content.length}`,
+            `title=${generated.title.length}, words=${wordCount}, excerpt=${generated.excerpt.length}`,
         });
 
         continue;
@@ -586,6 +591,8 @@ export async function GET(req: NextRequest) {
           ...diagnosticBase,
           outcome:
             "created",
+          detail:
+            `words=${wordCount}`,
         });
       } catch (error) {
         createErrors++;
@@ -717,7 +724,7 @@ Transforme les sources ci-dessous en UN SEUL article original consacré au Paris
 
 OBJECTIF :
 
-Produire un article de presse sportive française précis, factuel et utile.
+Produire un véritable article de presse sportive française, précis, factuel, informatif et suffisamment développé.
 
 RÈGLE ABSOLUE :
 
@@ -745,52 +752,82 @@ Lorsque l'information est disponible, indique notamment :
 - résultat
 - contexte sportif
 - enjeu du match
+- procédure disciplinaire
+- décision officielle
+- conséquences annoncées
 
 Si une information n'est pas présente dans les sources, ne l'invente pas.
 
 Si plusieurs sources parlent du même événement, fusionne leurs informations au lieu de répéter les mêmes faits.
 
-Une information présente dans deux sources peut être considérée comme fortement confirmée.
+Une information présente dans plusieurs sources peut être considérée comme davantage confirmée.
 
-Une information présente dans une seule source peut être utilisée mais doit être formulée prudemment si nécessaire.
+Une information présente dans une seule source peut être utilisée, mais ne doit jamais être transformée en fait certain si la source la présente comme une hypothèse ou une information non confirmée.
 
 Ne fais pas de remplissage.
 
-Évite les phrases génériques comme :
-"Cette rencontre s'annonce passionnante"
-"Les supporters attendent avec impatience"
-"Le PSG devra être concentré"
-si elles n'apportent aucune information concrète.
+Évite absolument les phrases génériques comme :
+
+"Cette rencontre s'annonce passionnante."
+
+"Les supporters attendent avec impatience."
+
+"Le PSG devra être concentré."
+
+"Cette affaire fait beaucoup parler."
+
+"Le club parisien devra maintenant se tourner vers la suite."
+
+Ces phrases sont interdites lorsqu'elles n'apportent aucun fait concret.
 
 Le PSG doit rester au centre de l'article.
+
+IMPORTANT :
+
+Le contenu doit contenir AU MINIMUM 400 MOTS.
+
+Même lorsqu'une seule source est disponible, développe l'article à partir de tous les faits réellement présents dans cette source.
+
+Tu peux expliquer la chronologie des faits, le contexte de l'événement, les personnes concernées, la procédure engagée, les déclarations disponibles et les conséquences annoncées lorsqu'elles sont présentes dans les informations fournies.
+
+N'ajoute aucune information extérieure pour atteindre 400 mots.
+
+Ne répète pas artificiellement les mêmes phrases pour atteindre 400 mots.
+
+Si les sources ne permettent pas de fournir certains détails, indique simplement ce qui est connu et ce qui ne l'est pas.
+
+Ne transforme jamais une absence d'information en affirmation.
+
+Si une date, une heure, un stade, une chaîne TV, une compétition, une journée, un joueur ou une décision est présent dans les sources, cette information doit apparaître dans l'article lorsqu'elle est pertinente.
 
 Le titre doit être informatif et spécifique.
 
 L'extrait doit résumer les faits principaux.
 
-Le contenu doit développer les informations disponibles.
+Le contenu doit développer les informations disponibles avec plusieurs paragraphes.
 
-IMPORTANT :
+Structure recommandée :
 
-Si les sources donnent une heure, une date, un stade ou une diffusion,
-ces informations doivent apparaître dans l'article.
-
-Si plusieurs sources donnent des informations complémentaires,
-combine-les dans le même article.
-
-Ne transforme jamais une absence d'information en affirmation.
+1. introduction factuelle
+2. rappel du contexte
+3. faits précis
+4. personnes ou institutions concernées
+5. procédure ou conséquences
+6. suite attendue lorsqu'elle est connue
 
 Style :
+
 - français
 - naturel
 - journalistique
 - sportif
 - précis
-- lisible
 - professionnel
+- lisible
 
-Lorsque les sources contiennent suffisamment de matière,
-vise environ 400 à 700 mots.
+Ne mets pas de Markdown dans le titre.
+
+Ne mets pas de préambule avant le JSON.
 
 Retourne uniquement ce JSON :
 
