@@ -204,46 +204,59 @@ export async function GET(request: Request) {
       isRelevantPSG(item),
     );
 
-    const deduplicatedItems = deduplicateItems(relevantItems);
+    const deduplicatedItems = deduplicateItems(
+      relevantItems,
+    );
 
     const duplicates =
-      relevantItems.length - deduplicatedItems.length;
+      relevantItems.length -
+      deduplicatedItems.length;
 
-    const recentArticles = await prisma.article.findMany({
-      orderBy: {
-        createdAt: "desc",
-      },
-      take: 150,
-      select: {
-        id: true,
-        title: true,
-        sourceUrl: true,
-        slug: true,
-      },
-    });
+    const recentArticles =
+      await prisma.article.findMany({
+        orderBy: {
+          createdAt: "desc",
+        },
+        take: 150,
+        select: {
+          id: true,
+          title: true,
+          sourceUrl: true,
+          slug: true,
+        },
+      });
 
     const newItems = deduplicatedItems.filter(
-      (item) => !isAlreadyStored(item, recentArticles),
+      (item) =>
+        !isAlreadyStored(
+          item,
+          recentArticles,
+        ),
     );
 
-    const clusters = buildSimpleClusters(newItems);
+    const clusters =
+      buildSimpleClusters(newItems);
 
-    const candidateClusters = clusters.filter(
-      (cluster) => cluster.items.length > 0,
-    );
+    const candidateClusters =
+      clusters.filter(
+        (cluster) =>
+          cluster.items.length > 0,
+      );
 
     const maxClusters = Math.min(
       MAX_NEW_ARTICLES_PER_RUN,
       remainingDailyTarget,
     );
 
-    const prioritizedClusters = [...candidateClusters]
-      .sort(clusterPriority)
-      .slice(0, maxClusters);
+    const prioritizedClusters =
+      [...candidateClusters]
+        .sort(clusterPriority)
+        .slice(0, maxClusters);
 
     const deferred = Math.max(
       0,
-      candidateClusters.length - prioritizedClusters.length,
+      candidateClusters.length -
+        prioritizedClusters.length,
     );
 
     let created = 0;
@@ -264,53 +277,85 @@ export async function GET(request: Request) {
     const geminiErrors: string[] = [];
     const sourcePageErrors: string[] = [];
 
-    const clusterDiagnostics: Array<Record<string, unknown>> = [];
+    const clusterDiagnostics: Array<
+      Record<string, unknown>
+    > = [];
 
     for (
       let index = 0;
-      index < prioritizedClusters.length;
+      index <
+      prioritizedClusters.length;
       index++
     ) {
-      const cluster = prioritizedClusters[index];
+      const cluster =
+        prioritizedClusters[index];
 
-      const result = await processCluster(cluster, {
-        onGeminiCall: () => {
-          geminiCalls++;
-        },
-        onGeminiSuccess: () => {
-          geminiSuccess++;
-        },
-        onInvalidJson: () => {
-          invalidJson++;
-        },
-        onTooShort: () => {
-          tooShort++;
-        },
-        onTooShortAfterRetry: () => {
-          tooShortAfterRetry++;
-        },
-        onSlugError: () => {
-          slugErrors++;
-        },
-        onCreateError: () => {
-          createErrors++;
-        },
-        onGeminiError: (message) => {
-          geminiErrors.push(message);
-        },
-        onSourcePageFetched: () => {
-          sourcePagesFetched++;
-        },
-        onSourcePageFailed: (message) => {
-          sourcePagesFailed++;
-          sourcePageErrors.push(message);
-        },
-        onEnrichedCharacters: (count) => {
-          enrichedCharacters += count;
-        },
-      });
+      const result =
+        await processCluster(
+          cluster,
+          {
+            onGeminiCall: () => {
+              geminiCalls++;
+            },
 
-      if (result.outcome === "created") {
+            onGeminiSuccess: () => {
+              geminiSuccess++;
+            },
+
+            onInvalidJson: () => {
+              invalidJson++;
+            },
+
+            onTooShort: () => {
+              tooShort++;
+            },
+
+            onTooShortAfterRetry: () => {
+              tooShortAfterRetry++;
+            },
+
+            onSlugError: () => {
+              slugErrors++;
+            },
+
+            onCreateError: () => {
+              createErrors++;
+            },
+
+            onGeminiError: (
+              message,
+            ) => {
+              geminiErrors.push(
+                message,
+              );
+            },
+
+            onSourcePageFetched: () => {
+              sourcePagesFetched++;
+            },
+
+            onSourcePageFailed: (
+              message,
+            ) => {
+              sourcePagesFailed++;
+              sourcePageErrors.push(
+                message,
+              );
+            },
+
+            onEnrichedCharacters: (
+              count,
+            ) => {
+              enrichedCharacters +=
+                count;
+            },
+          },
+        );
+
+      if (
+        result.outcome ===
+        "created"
+      ) {
         created++;
       } else {
         skipped++;
@@ -318,47 +363,91 @@ export async function GET(request: Request) {
 
       clusterDiagnostics.push({
         cluster: index + 1,
-        sources: result.sources || [
-          ...new Set(
-            cluster.items.map((item) => item.source),
+
+        sources:
+          result.sources ||
+          [
+            ...new Set(
+              cluster.items.map(
+                (item) =>
+                  item.source,
+              ),
+            ),
+          ],
+
+        titles:
+          cluster.items.map(
+            (item) =>
+              item.title,
           ),
-        ],
-        titles: cluster.items.map((item) => item.title),
-        outcome: result.outcome,
-        detail: result.detail,
+
+        outcome:
+          result.outcome,
+
+        detail:
+          result.detail,
       });
     }
 
     const finalArticlesCreatedToday =
       await getArticlesCreatedToday();
 
-    const finalRemainingDailyTarget = Math.max(
-      0,
-      DAILY_TARGET - finalArticlesCreatedToday,
-    );
+    const finalRemainingDailyTarget =
+      Math.max(
+        0,
+        DAILY_TARGET -
+          finalArticlesCreatedToday,
+      );
 
     return NextResponse.json({
       checked,
-      newItems: newItems.length,
-      clusters: clusters.length,
-      candidateClusters: candidateClusters.length,
-      processedClusters: prioritizedClusters.length,
+
+      newItems:
+        newItems.length,
+
+      clusters:
+        clusters.length,
+
+      candidateClusters:
+        candidateClusters.length,
+
+      processedClusters:
+        prioritizedClusters.length,
+
       deferred,
+
       created,
+
       skipped,
-      articlesCreatedToday: finalArticlesCreatedToday,
-      dailyTarget: DAILY_TARGET,
-      remainingDailyTarget: finalRemainingDailyTarget,
+
+      articlesCreatedToday:
+        finalArticlesCreatedToday,
+
+      dailyTarget:
+        DAILY_TARGET,
+
+      remainingDailyTarget:
+        finalRemainingDailyTarget,
+
       dailyTargetReached:
         finalRemainingDailyTarget <= 0,
+
       sourcesOk,
-      sources: RSS_FEEDS.map((feed) => feed.name),
+
+      sources:
+        RSS_FEEDS.map(
+          (feed) =>
+            feed.name,
+        ),
+
       duplicates,
+
       fusion: true,
       optimized: true,
       enrichment: true,
       simplified: true,
       unlimitedDailyCap: true,
+
       diagnostics: {
         geminiCalls,
         geminiSuccess,
@@ -373,9 +462,13 @@ export async function GET(request: Request) {
         sourcePagesFailed,
         enrichedCharacters,
         sourcePageErrors,
-        clusters: clusterDiagnostics,
+        clusters:
+          clusterDiagnostics,
       },
-      elapsedMs: Date.now() - startedAt,
+
+      elapsedMs:
+        Date.now() -
+        startedAt,
     });
   } catch (error) {
     console.error(
@@ -385,8 +478,12 @@ export async function GET(request: Request) {
 
     return NextResponse.json(
       {
-        error: getErrorMessage(error),
-        elapsedMs: Date.now() - startedAt,
+        error:
+          getErrorMessage(error),
+
+        elapsedMs:
+          Date.now() -
+          startedAt,
       },
       { status: 500 },
     );
@@ -403,140 +500,207 @@ async function processCluster(
     onTooShortAfterRetry: () => void;
     onSlugError: () => void;
     onCreateError: () => void;
-    onGeminiError: (message: string) => void;
+    onGeminiError: (
+      message: string,
+    ) => void;
     onSourcePageFetched: () => void;
-    onSourcePageFailed: (message: string) => void;
-    onEnrichedCharacters: (count: number) => void;
+    onSourcePageFailed: (
+      message: string,
+    ) => void;
+    onEnrichedCharacters: (
+      count: number,
+    ) => void;
   },
 ): Promise<ProcessResult> {
   try {
-    const enrichment = await enrichSources(
-      cluster.items,
-      callbacks,
-    );
+    const enrichment =
+      await enrichSources(
+        cluster.items,
+        callbacks,
+      );
 
-    if (!enrichment.sources.length) {
+    if (
+      !enrichment.sources.length
+    ) {
       return {
-        outcome: "no_sources",
-        detail: "Aucune source exploitable",
+        outcome:
+          "no_sources",
+
+        detail:
+          "Aucune source exploitable",
       };
     }
 
-    const generated = await generateArticle(
-      enrichment.sources,
-      false,
-      undefined,
-      callbacks,
-    );
+    const generated =
+      await generateArticle(
+        enrichment.sources,
+        false,
+        undefined,
+        callbacks,
+      );
 
     if (!generated) {
       return {
-        outcome: "gemini_error",
-        detail: `title=${
-          cluster.items[0]?.title?.length || 0
-        }`,
-        sources: enrichment.sources.map(
-          (source) => source.source,
-        ),
-        pages: enrichment.pagesFetched,
-        enriched: enrichment.enrichedCharacters,
+        outcome:
+          "gemini_error",
+
+        detail:
+          `title=${cluster.items[0]?.title?.length || 0}`,
+
+        sources:
+          enrichment.sources.map(
+            (source) =>
+              source.source,
+          ),
+
+        pages:
+          enrichment.pagesFetched,
+
+        enriched:
+          enrichment.enrichedCharacters,
       };
     }
 
     let article = generated;
-    let generatedWords = countWords(
-      article.content,
-    );
 
-    if (generatedWords < MIN_ARTICLE_WORDS) {
+    let generatedWords =
+      countWords(
+        article.content,
+      );
+
+    if (
+      generatedWords <
+      MIN_ARTICLE_WORDS
+    ) {
       callbacks.onTooShort();
 
       console.log(
         `Article trop court (${generatedWords} mots), lancement de l'expansion Gemini...`,
       );
 
-      const expanded = await generateArticle(
-        enrichment.sources,
-        true,
-        {
-          title: article.title,
-          excerpt: article.excerpt,
-          content: article.content,
-        },
-        callbacks,
-      );
+      const expanded =
+        await generateArticle(
+          enrichment.sources,
+          true,
+          {
+            title:
+              article.title,
+
+            excerpt:
+              article.excerpt,
+
+            content:
+              article.content,
+          },
+          callbacks,
+        );
 
       if (expanded) {
-        const expandedWords = countWords(
-          expanded.content,
-        );
+        const expandedWords =
+          countWords(
+            expanded.content,
+          );
 
         console.log(
           `Expansion Gemini : ${generatedWords} → ${expandedWords} mots`,
         );
 
-        if (expandedWords > generatedWords) {
+        if (
+          expandedWords >
+          generatedWords
+        ) {
           article = expanded;
-          generatedWords = expandedWords;
+          generatedWords =
+            expandedWords;
         }
       }
     }
 
-    if (generatedWords < MIN_ARTICLE_WORDS) {
+    if (
+      generatedWords <
+      MIN_ARTICLE_WORDS
+    ) {
       callbacks.onTooShortAfterRetry();
 
       return {
-        outcome: "too_short_after_retry",
-        detail: `title=${article.title.length}, words=${generatedWords}, excerpt=${article.excerpt.length}`,
-        sources: enrichment.sources.map(
-          (source) => source.source,
-        ),
-        pages: enrichment.pagesFetched,
-        enriched: enrichment.enrichedCharacters,
+        outcome:
+          "too_short_after_retry",
+
+        detail:
+          `title=${article.title.length}, words=${generatedWords}, excerpt=${article.excerpt.length}`,
+
+        sources:
+          enrichment.sources.map(
+            (source) =>
+              source.source,
+          ),
+
+        pages:
+          enrichment.pagesFetched,
+
+        enriched:
+          enrichment.enrichedCharacters,
       };
     }
 
-    article.content = cleanArticleContent(
-      article.content,
-    );
+    article.content =
+      cleanArticleContent(
+        article.content,
+      );
 
-    article.content = addBasicStructure(
-      article.content,
-    );
+    article.content =
+      addBasicStructure(
+        article.content,
+      );
 
-    article.content = trimToWords(
-      article.content,
-      MAX_ARTICLE_WORDS,
-    );
+    article.content =
+      trimToWords(
+        article.content,
+        MAX_ARTICLE_WORDS,
+      );
 
-    article.excerpt = cleanText(
-      article.excerpt,
-    );
+    article.excerpt =
+      cleanText(
+        article.excerpt,
+      );
 
-    article.title = cleanText(
-      article.title,
-    );
+    article.title =
+      cleanText(
+        article.title,
+      );
 
-    article.seoTitle = cleanText(
-      article.seoTitle,
-    );
+    article.seoTitle =
+      cleanText(
+        article.seoTitle,
+      );
 
-    article.seoDescription = cleanText(
-      article.seoDescription,
-    );
+    article.seoDescription =
+      cleanText(
+        article.seoDescription,
+      );
 
     if (
       !article.title ||
       !article.content
     ) {
       return {
-        outcome: "invalid_article",
-        detail: "Titre ou contenu vide",
-        sources: enrichment.sources.map(
-          (source) => source.source,
-        ),
-        pages: enrichment.pagesFetched,
-        enriched: enrichment.enrichedCharacters,
+        outcome:
+          "invalid_article",
+
+        detail:
+          "Titre ou contenu vide",
+
+        sources:
+          enrichment.sources.map(
+            (source) =>
+              source.source,
+          ),
+
+        pages:
+          enrichment.pagesFetched,
+
+        enriched:
+          enrichment.enrichedCharacters,
       };
     }
 
@@ -548,49 +712,87 @@ async function processCluster(
 
     if (duplicateTitle) {
       return {
-        outcome: "duplicate_title",
-        detail: `title=${article.title}`,
-        sources: enrichment.sources.map(
-          (source) => source.source,
-        ),
-        pages: enrichment.pagesFetched,
-        enriched: enrichment.enrichedCharacters,
+        outcome:
+          "duplicate_title",
+
+        detail:
+          `title=${article.title}`,
+
+        sources:
+          enrichment.sources.map(
+            (source) =>
+              source.source,
+          ),
+
+        pages:
+          enrichment.pagesFetched,
+
+        enriched:
+          enrichment.enrichedCharacters,
       };
     }
 
     let slug: string;
 
     try {
-      slug = await makeUniqueSlug(
-        article.title,
-      );
+      slug =
+        await makeUniqueSlug(
+          article.title,
+        );
     } catch (error) {
       callbacks.onSlugError();
 
       return {
-        outcome: "slug_error",
-        detail: getErrorMessage(error),
-        sources: enrichment.sources.map(
-          (source) => source.source,
-        ),
-        pages: enrichment.pagesFetched,
-        enriched: enrichment.enrichedCharacters,
+        outcome:
+          "slug_error",
+
+        detail:
+          getErrorMessage(
+            error,
+          ),
+
+        sources:
+          enrichment.sources.map(
+            (source) =>
+              source.source,
+          ),
+
+        pages:
+          enrichment.pagesFetched,
+
+        enriched:
+          enrichment.enrichedCharacters,
       };
     }
 
     try {
       await prisma.article.create({
         data: {
-          title: article.title,
+          title:
+            article.title,
+
           slug,
-          excerpt: article.excerpt,
-          content: article.content,
-          club: "PSG",
-          status: "DRAFT",
-          isAiGenerated: true,
+
+          excerpt:
+            article.excerpt,
+
+          content:
+            article.content,
+
+          club:
+            "PSG",
+
+          status:
+            "DRAFT",
+
+          isAiGenerated:
+            true,
+
           sourceUrl:
-            cluster.items[0]?.link ||
-            enrichment.sources[0]?.url ||
+            cluster.items[0]
+              ?.link ||
+            enrichment.sources[0]
+              ?.url ||
             null,
         },
       });
@@ -598,39 +800,54 @@ async function processCluster(
       callbacks.onCreateError();
 
       return {
-        outcome: "create_error",
-        detail: getErrorMessage(error),
-        sources: enrichment.sources.map(
-          (source) => source.source,
-        ),
-        pages: enrichment.pagesFetched,
-        enriched: enrichment.enrichedCharacters,
+        outcome:
+          "create_error",
+
+        detail:
+          getErrorMessage(
+            error,
+          ),
+
+        sources:
+          enrichment.sources.map(
+            (source) =>
+              source.source,
+          ),
+
+        pages:
+          enrichment.pagesFetched,
+
+        enriched:
+          enrichment.enrichedCharacters,
       };
     }
 
-    callbacks.onGeminiSuccess();
-
     return {
-      outcome: "created",
-      detail: `words=${countWords(
-        article.content,
-      )}, sources=${
-        enrichment.sources.length
-      }, pages=${
-        enrichment.pagesFetched
-      }, enriched=${
-        enrichment.enrichedCharacters
-      }`,
-      sources: enrichment.sources.map(
-        (source) => source.source,
-      ),
-      pages: enrichment.pagesFetched,
-      enriched: enrichment.enrichedCharacters,
+      outcome:
+        "created",
+
+      detail:
+        `words=${countWords(article.content)}, sources=${enrichment.sources.length}, pages=${enrichment.pagesFetched}, enriched=${enrichment.enrichedCharacters}`,
+
+      sources:
+        enrichment.sources.map(
+          (source) =>
+            source.source,
+        ),
+
+      pages:
+        enrichment.pagesFetched,
+
+      enriched:
+        enrichment.enrichedCharacters,
     };
   } catch (error) {
     return {
-      outcome: "error",
-      detail: getErrorMessage(error),
+      outcome:
+        "error",
+
+      detail:
+        getErrorMessage(error),
     };
   }
 }
@@ -647,131 +864,180 @@ async function enrichSources(
     ) => void;
   },
 ): Promise<EnrichmentResult> {
-  const selected = [...items]
-    .sort(
-      (a, b) =>
-        sourcePriority(b) -
-        sourcePriority(a),
-    )
-    .slice(
-      0,
-      MAX_SOURCES_PER_ARTICLE,
+  const selected =
+    [...items]
+      .sort(
+        (a, b) =>
+          sourcePriority(b) -
+          sourcePriority(a),
+      )
+      .slice(
+        0,
+        MAX_SOURCES_PER_ARTICLE,
+      );
+
+  const results =
+    await Promise.all(
+      selected.map(
+        async (item) => {
+          const base: EnrichedSource =
+            {
+              source:
+                item.source,
+
+              title:
+                cleanText(
+                  item.title,
+                ),
+
+              url:
+                cleanUrl(
+                  item.link,
+                ),
+
+              description:
+                cleanText(
+                  item.contentSnippet ||
+                    item.content ||
+                    "",
+                ),
+
+              publishedAt:
+                item.pubDate,
+            };
+
+          if (
+            !shouldFetchSourcePage(
+              item,
+            )
+          ) {
+            return {
+              source: base,
+              fetched: false,
+              failed: false,
+              chars:
+                base.description
+                  .length,
+            };
+          }
+
+          try {
+            const response =
+              await fetchWithTimeout(
+                cleanUrl(
+                  item.link,
+                ),
+                SOURCE_TIMEOUT_MS,
+              );
+
+            if (!response.ok) {
+              const message =
+                `${item.source}: HTTP ${response.status} ${response.statusText}`;
+
+              callbacks.onSourcePageFailed(
+                message,
+              );
+
+              return {
+                source: base,
+                fetched: false,
+                failed: true,
+                chars:
+                  base.description
+                    .length,
+              };
+            }
+
+            const html =
+              await response.text();
+
+            const text =
+              extractPageText(
+                html,
+              );
+
+            const enriched =
+              cleanText(
+                text.slice(
+                  0,
+                  MAX_SOURCE_PAGE_CHARS,
+                ),
+              );
+
+            const source: EnrichedSource =
+              {
+                ...base,
+
+                enrichedContent:
+                  enriched ||
+                  base.description,
+              };
+
+            callbacks.onSourcePageFetched();
+
+            callbacks.onEnrichedCharacters(
+              source
+                .enrichedContent
+                ?.length || 0,
+            );
+
+            return {
+              source,
+
+              fetched: true,
+
+              failed: false,
+
+              chars:
+                source
+                  .enrichedContent
+                  ?.length || 0,
+            };
+          } catch (error) {
+            const message =
+              `${item.source}: ${getErrorMessage(error)}`;
+
+            callbacks.onSourcePageFailed(
+              message,
+            );
+
+            return {
+              source: base,
+              fetched: false,
+              failed: true,
+              chars:
+                base.description
+                  .length,
+            };
+          }
+        },
+      ),
     );
 
-  const results = await Promise.all(
-    selected.map(async (item) => {
-      const base: EnrichedSource = {
-        source: item.source,
-        title: cleanText(item.title),
-        url: cleanUrl(item.link),
-        description: cleanText(
-          item.contentSnippet ||
-            item.content ||
-            "",
-        ),
-        publishedAt: item.pubDate,
-      };
-
-      if (!shouldFetchSourcePage(item)) {
-        return {
-          source: base,
-          fetched: false,
-          failed: false,
-          chars: base.description.length,
-        };
-      }
-
-      try {
-        const response =
-          await fetchWithTimeout(
-            cleanUrl(item.link),
-            SOURCE_TIMEOUT_MS,
-          );
-
-        if (!response.ok) {
-          const message =
-            `${item.source}: HTTP ${response.status} ${response.statusText}`;
-
-          callbacks.onSourcePageFailed(
-            message,
-          );
-
-          return {
-            source: base,
-            fetched: false,
-            failed: true,
-            chars: base.description.length,
-          };
-        }
-
-        const html =
-          await response.text();
-
-        const text =
-          extractPageText(html);
-
-        const enriched = cleanText(
-          text.slice(
-            0,
-            MAX_SOURCE_PAGE_CHARS,
-          ),
-        );
-
-        const source: EnrichedSource =
-          {
-            ...base,
-            enrichedContent:
-              enriched ||
-              base.description,
-          };
-
-        callbacks.onSourcePageFetched();
-
-        callbacks.onEnrichedCharacters(
-          source.enrichedContent
-            ?.length || 0,
-        );
-
-        return {
-          source,
-          fetched: true,
-          failed: false,
-          chars:
-            source.enrichedContent
-              ?.length || 0,
-        };
-      } catch (error) {
-        const message =
-          `${item.source}: ${getErrorMessage(error)}`;
-
-        callbacks.onSourcePageFailed(
-          message,
-        );
-
-        return {
-          source: base,
-          fetched: false,
-          failed: true,
-          chars: base.description.length,
-        };
-      }
-    }),
-  );
-
   return {
-    sources: results.map(
-      (result) => result.source,
-    ),
-    pagesFetched: results.filter(
-      (result) => result.fetched,
-    ).length,
-    pagesFailed: results.filter(
-      (result) => result.failed,
-    ).length,
+    sources:
+      results.map(
+        (result) =>
+          result.source,
+      ),
+
+    pagesFetched:
+      results.filter(
+        (result) =>
+          result.fetched,
+      ).length,
+
+    pagesFailed:
+      results.filter(
+        (result) =>
+          result.failed,
+      ).length,
+
     enrichedCharacters:
       results.reduce(
         (total, result) =>
-          total + result.chars,
+          total +
+          result.chars,
         0,
       ),
   };
@@ -822,30 +1088,20 @@ async function generateArticle(
 ): Promise<GeneratedArticle | null> {
   const sourceMaterial =
     sources
-      .map((source, index) => {
-        return `
+      .map(
+        (source, index) => {
+          return `
 ===== SOURCE ${index + 1} =====
 Source : ${source.source}
 Titre : ${source.title}
 URL : ${source.url}
-Date : ${
-          source.publishedAt ||
-          "Non précisée"
-        }
-
-CONTENU RSS :
-${
-  source.description || ""
-}
+Date : ${source.publishedAt || "Non précisée"}
 
 CONTENU ENRICHI :
-${
-  source.enrichedContent ||
-  source.description ||
-  ""
-}
+${source.enrichedContent || source.description || ""}
 `;
-      })
+        },
+      )
       .join("\n\n");
 
   const expansionContext =
@@ -961,16 +1217,6 @@ ${sourceMaterial}
 
 23. Les informations pratiques comme l'heure, la chaîne, le stade ou la date doivent uniquement être ajoutées lorsqu'elles sont réellement disponibles.
 
-24. Les sources peuvent contenir plusieurs articles concernant le même événement. Regroupe-les et utilise les informations complémentaires de chaque source.
-
-25. Donne la priorité aux informations précises et vérifiables : noms de joueurs, adversaire, compétition, date, heure, stade, chaîne, composition, absences, blessures, déclarations, statistiques et contexte.
-
-26. Si une information importante apparaît dans une seule source mais que cette source est clairement identifiée, tu peux l'utiliser en l'attribuant.
-
-27. Ne transforme jamais une information provenant d'une source en fait confirmé par plusieurs sources si elle n'est confirmée que par une seule.
-
-28. Ne cite jamais une information provenant d'une source qui n'est pas réellement présente dans le matériel fourni.
-
 ===== FORMAT DE RÉPONSE OBLIGATOIRE =====
 
 Retourne UNIQUEMENT un objet JSON valide avec exactement ces champs :
@@ -992,7 +1238,9 @@ Aucun texte après le JSON.
     callbacks?.onGeminiCall();
 
     const result =
-      await callGemini(prompt);
+      await callGemini(
+        prompt,
+      );
 
     if (!result) {
       return null;
@@ -1008,6 +1256,7 @@ Aucun texte après le JSON.
       )
     ) {
       callbacks?.onInvalidJson();
+
       return null;
     }
 
@@ -1048,8 +1297,9 @@ async function callGemini(
     "gemini-3.6-flash",
   ];
 
-  let lastError: Error | null =
-    null;
+  let lastError:
+    | Error
+    | null = null;
 
   for (const model of models) {
     try {
@@ -1069,10 +1319,12 @@ async function callGemini(
             `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
             {
               method: "POST",
+
               headers: {
                 "Content-Type":
                   "application/json",
               },
+
               body: JSON.stringify({
                 contents: [
                   {
@@ -1083,12 +1335,15 @@ async function callGemini(
                     ],
                   },
                 ],
+
                 generationConfig: {
                   temperature: 0.25,
+
                   responseMimeType:
                     "application/json",
                 },
               }),
+
               signal:
                 controller.signal,
             },
@@ -1099,10 +1354,7 @@ async function callGemini(
             await response.text();
 
           throw new Error(
-            `Gemini HTTP ${response.status}: ${text.slice(
-              0,
-              500,
-            )}`,
+            `Gemini HTTP ${response.status}: ${text.slice(0, 500)}`,
           );
         }
 
@@ -1183,7 +1435,9 @@ function parseGeminiJson(
 
   try {
     const parsed =
-      JSON.parse(extracted);
+      JSON.parse(
+        extracted,
+      );
 
     if (
       isValidGeminiArticle(
@@ -1203,7 +1457,9 @@ function parseGeminiJson(
       );
 
     const parsed =
-      JSON.parse(repaired);
+      JSON.parse(
+        repaired,
+      );
 
     if (
       isValidGeminiArticle(
@@ -1247,9 +1503,11 @@ function isValidGeminiArticle(
       "string" &&
     typeof article.seoDescription ===
       "string" &&
-    article.title.trim()
+    article.title
+      .trim()
       .length > 10 &&
-    article.content.trim()
+    article.content
+      .trim()
       .length > 100
   );
 }
@@ -1319,24 +1577,25 @@ function repairJsonString(
   let repaired =
     text.trim();
 
-  repaired = repaired
-    .replace(
-      /^\uFEFF/,
-      "",
-    )
-    .replace(
-      /^```json\s*/i,
-      "",
-    )
-    .replace(
-      /^```\s*/i,
-      "",
-    )
-    .replace(
-      /\s*```$/i,
-      "",
-    )
-    .trim();
+  repaired =
+    repaired
+      .replace(
+        /^\uFEFF/,
+        "",
+      )
+      .replace(
+        /^```json\s*/i,
+        "",
+      )
+      .replace(
+        /^```\s*/i,
+        "",
+      )
+      .replace(
+        /\s*```$/i,
+        "",
+      )
+      .trim();
 
   repaired =
     repaired.replace(
@@ -1356,16 +1615,23 @@ function normalizeArticle(
     );
 
   return {
-    title: cleanText(
-      article.title,
-    ),
-    excerpt: cleanText(
-      article.excerpt,
-    ),
+    title:
+      cleanText(
+        article.title,
+      ),
+
+    excerpt:
+      cleanText(
+        article.excerpt,
+      ),
+
     content,
-    seoTitle: cleanText(
-      article.seoTitle,
-    ),
+
+    seoTitle:
+      cleanText(
+        article.seoTitle,
+      ),
+
     seoDescription:
       cleanText(
         article.seoDescription,
@@ -1415,7 +1681,8 @@ function trimToWords(
       .filter(Boolean);
 
   if (
-    words.length <= maxWords
+    words.length <=
+    maxWords
   ) {
     return text;
   }
@@ -1433,38 +1700,32 @@ function buildSimpleClusters(
   const clusters: StoryCluster[] =
     [];
 
-  /*
-   * Un titre qui parle explicitement
-   * de plusieurs adversaires ou plusieurs
-   * matchs ne doit pas servir à fusionner
-   * plusieurs événements.
-   *
-   * Exemple :
-   * PSG/Monaco & PSG/Bratislava
-   */
   const safeItems =
-    items.filter((item) => {
-      const opponents =
-        extractAllOpponents(
-          normalizeForComparison(
-            item.title,
-          ),
+    items.filter(
+      (item) => {
+        const opponents =
+          extractAllOpponents(
+            normalizeForComparison(
+              item.title,
+            ),
+          );
+
+        return (
+          opponents.length <= 1
         );
+      },
+    );
 
-      return (
-        opponents.length <= 1
-      );
-    });
+  const sorted =
+    [...safeItems].sort(
+      (a, b) =>
+        sourcePriority(b) -
+        sourcePriority(a),
+    );
 
-  const sorted = [
-    ...safeItems,
-  ].sort(
-    (a, b) =>
-      sourcePriority(b) -
-      sourcePriority(a),
-  );
-
-  for (const item of sorted) {
+  for (
+    const item of sorted
+  ) {
     let bestCluster:
       | StoryCluster
       | null = null;
@@ -1528,7 +1789,8 @@ function similarityToCluster(
     if (
       similarity > best
     ) {
-      best = similarity;
+      best =
+        similarity;
     }
   }
 
@@ -1608,7 +1870,9 @@ function simpleStorySimilarity(
   const common =
     tokensA.filter(
       (token) =>
-        tokensB.includes(token),
+        tokensB.includes(
+          token,
+        ),
     );
 
   const tokenScore =
@@ -1674,8 +1938,11 @@ function extractAllOpponents(
 
   const patterns = [
     /psg\s*[-–—/]\s*([a-z0-9àâäéèêëîïôöùûüç' .]+)/i,
+
     /paris saint-germain\s*[-–—/]\s*([a-z0-9àâäéèêëîïôöùûüç' .]+)/i,
+
     /([a-z0-9àâäéèêëîïôöùûüç' .]+)\s*[-–—/]\s*psg/i,
+
     /([a-z0-9àâäéèêëîïôöùûüç' .]+)\s*[-–—/]\s*paris saint-germain/i,
   ];
 
@@ -1914,7 +2181,9 @@ function deduplicateItems(
     }
 
     if (url) {
-      seenUrls.add(url);
+      seenUrls.add(
+        url,
+      );
     }
 
     if (title) {
@@ -1932,7 +2201,7 @@ function deduplicateItems(
 function isAlreadyStored(
   item: RSSItem,
   recentArticles: Array<{
-    id: number;
+    id: string;
     title: string;
     sourceUrl: string | null;
     slug: string;
@@ -2023,8 +2292,7 @@ function isRelevantPSG(
   const text =
     normalizeForComparison(
       `${item.title} ${
-        item.contentSnippet ||
-        ""
+        item.contentSnippet || ""
       } ${
         item.content || ""
       }`,
@@ -2042,185 +2310,29 @@ function isRelevantPSG(
   return hasPSG;
 }
 
-/**
- * Parse RSS/Atom XML nativement.
- *
- * Aucun package externe nécessaire.
- */
+/* =========================================================
+   RSS PARSER SANS rss-parser
+   ========================================================= */
+
 async function parseRSS(
   feed: {
     name: string;
     url: string;
   },
 ): Promise<RSSItem[]> {
-  const xml =
-    await fetchRSSXml(
-      feed.url,
-    );
-
-  const items: RSSItem[] =
-    [];
-
-  const rssItemMatches = [
-    ...xml.matchAll(
-      /<item\b[^>]*>([\s\S]*?)<\/item>/gi,
-    ),
-  ];
-
-  /*
-   * Si le flux est Atom plutôt que RSS,
-   * on utilise <entry>.
-   */
-  const atomEntryMatches =
-    rssItemMatches.length ===
-    0
-      ? [
-          ...xml.matchAll(
-            /<entry\b[^>]*>([\s\S]*?)<\/entry>/gi,
-          ),
-        ]
-      : [];
-
-  const blocks =
-    rssItemMatches.length >
-    0
-      ? rssItemMatches.map(
-          (match) =>
-            match[1],
-        )
-      : atomEntryMatches.map(
-          (match) =>
-            match[1],
-        );
-
-  for (
-    const block of blocks
-      .slice(
-        0,
-        MAX_ITEMS_PER_SOURCE,
-      )
-  ) {
-    const title =
-      extractXMLTag(
-        block,
-        "title",
-      );
-
-    let link =
-      extractXMLTag(
-        block,
-        "link",
-      );
-
-    /*
-     * Atom utilise souvent :
-     * <link href="..." />
-     */
-    if (!link) {
-      const atomLink =
-        block.match(
-          /<link\b[^>]*href=["']([^"']+)["'][^>]*\/?>/i,
-        );
-
-      if (atomLink?.[1]) {
-        link = atomLink[1];
-      }
-    }
-
-    /*
-     * Certains flux utilisent guid
-     * comme URL lorsque link est absent.
-     */
-    if (!link) {
-      link =
-        extractXMLTag(
-          block,
-          "guid",
-        );
-    }
-
-    if (!title || !link) {
-      continue;
-    }
-
-    const description =
-      extractXMLTag(
-        block,
-        "description",
-      );
-
-    const contentEncoded =
-      extractXMLTag(
-        block,
-        "content:encoded",
-      );
-
-    const summary =
-      extractXMLTag(
-        block,
-        "summary",
-      );
-
-    const content =
-      contentEncoded ||
-      description ||
-      summary ||
-      "";
-
-    const pubDate =
-      extractXMLTag(
-        block,
-        "pubDate",
-      ) ||
-      extractXMLTag(
-        block,
-        "published",
-      ) ||
-      extractXMLTag(
-        block,
-        "updated",
-      ) ||
-      undefined;
-
-    const cleanedLink =
-      decodeXmlText(
-        link,
-      ).trim();
-
-    items.push({
-      title:
-        decodeXmlText(
-          title,
-        ).trim(),
-      link: cleanedLink,
-      pubDate: pubDate
-        ? decodeXmlText(
-            pubDate,
-          ).trim()
-        : undefined,
-      content:
-        decodeXmlText(
-          content,
-        ),
-      contentSnippet:
-        cleanText(
-          content,
-        ),
-      source:
-        feed.name,
-    });
-  }
-
-  return items;
-}
-
-async function fetchRSSXml(
-  url: string,
-): Promise<string> {
   const response =
     await fetchWithTimeout(
-      url,
+      feed.url,
       RSS_TIMEOUT_MS,
+      {
+        headers: {
+          Accept:
+            "application/rss+xml, application/xml, text/xml, */*",
+
+          "User-Agent":
+            "PSG-Direct/1.0 RSS Reader",
+        },
+      },
     );
 
   if (!response.ok) {
@@ -2229,7 +2341,297 @@ async function fetchRSSXml(
     );
   }
 
-  return response.text();
+  const xml =
+    await response.text();
+
+  if (!xml.trim()) {
+    throw new Error(
+      "Flux RSS vide",
+    );
+  }
+
+  const itemBlocks =
+    extractRSSItemBlocks(
+      xml,
+    );
+
+  const parsedItems: RSSItem[] =
+    [];
+
+  for (
+    const block of itemBlocks
+  ) {
+    const title =
+      cleanText(
+        extractXMLTag(
+          block,
+          "title",
+        ),
+      );
+
+    const link =
+      extractRSSLink(
+        block,
+      );
+
+    const pubDate =
+      cleanText(
+        extractXMLTag(
+          block,
+          "pubDate",
+        ) ||
+          extractXMLTag(
+            block,
+            "published",
+          ) ||
+          extractXMLTag(
+            block,
+            "updated",
+          ),
+      );
+
+    const description =
+      cleanText(
+        extractXMLTag(
+          block,
+          "description",
+        ),
+      );
+
+    const encodedContent =
+      cleanText(
+        extractXMLTag(
+          block,
+          "content:encoded",
+        ),
+      );
+
+    const content =
+      cleanText(
+        encodedContent ||
+          extractXMLTag(
+            block,
+            "content",
+          ) ||
+          description,
+      );
+
+    const contentSnippet =
+      cleanText(
+        description ||
+          encodedContent ||
+          content,
+      );
+
+    if (!title || !link) {
+      continue;
+    }
+
+    parsedItems.push({
+      title,
+      link,
+      pubDate:
+        pubDate || undefined,
+      content:
+        content || undefined,
+      contentSnippet:
+        contentSnippet ||
+        undefined,
+      source: feed.name,
+    });
+  }
+
+  /*
+   * Certains flux peuvent utiliser Atom <entry>
+   * plutôt que RSS <item>.
+   */
+  if (!parsedItems.length) {
+    const entryBlocks =
+      extractAtomEntryBlocks(
+        xml,
+      );
+
+    for (
+      const block of entryBlocks
+    ) {
+      const title =
+        cleanText(
+          extractXMLTag(
+            block,
+            "title",
+          ),
+        );
+
+      const link =
+        extractAtomLink(
+          block,
+        );
+
+      const pubDate =
+        cleanText(
+          extractXMLTag(
+            block,
+            "published",
+          ) ||
+            extractXMLTag(
+              block,
+              "updated",
+            ),
+        );
+
+      const description =
+        cleanText(
+          extractXMLTag(
+            block,
+            "summary",
+          ) ||
+            extractXMLTag(
+              block,
+              "description",
+            ),
+        );
+
+      const content =
+        cleanText(
+          extractXMLTag(
+            block,
+            "content",
+          ) ||
+            description,
+        );
+
+      if (!title || !link) {
+        continue;
+      }
+
+      parsedItems.push({
+        title,
+        link,
+        pubDate:
+          pubDate || undefined,
+        content:
+          content || undefined,
+        contentSnippet:
+          description ||
+          content ||
+          undefined,
+        source: feed.name,
+      });
+    }
+  }
+
+  /*
+   * Les plus récentes en premier.
+   */
+  parsedItems.sort(
+    (a, b) => {
+      const dateA =
+        a.pubDate
+          ? Date.parse(
+              a.pubDate,
+            )
+          : 0;
+
+      const dateB =
+        b.pubDate
+          ? Date.parse(
+              b.pubDate,
+            )
+          : 0;
+
+      return dateB - dateA;
+    },
+  );
+
+  return parsedItems.slice(
+    0,
+    MAX_ITEMS_PER_SOURCE,
+  );
+}
+
+function extractRSSItemBlocks(
+  xml: string,
+): string[] {
+  const matches =
+    xml.match(
+      /<item\b[^>]*>[\s\S]*?<\/item>/gi,
+    );
+
+  return matches || [];
+}
+
+function extractAtomEntryBlocks(
+  xml: string,
+): string[] {
+  const matches =
+    xml.match(
+      /<entry\b[^>]*>[\s\S]*?<\/entry>/gi,
+    );
+
+  return matches || [];
+}
+
+function extractRSSLink(
+  block: string,
+): string {
+  const directLink =
+    extractXMLTag(
+      block,
+      "link",
+    );
+
+  if (
+    directLink.trim()
+  ) {
+    return cleanUrl(
+      directLink.trim(),
+    );
+  }
+
+  /*
+   * Cas où le lien est contenu
+   * dans CDATA.
+   */
+  const hrefMatch =
+    block.match(
+      /<link\b[^>]*href=["']([^"']+)["'][^>]*\/?>/i,
+    );
+
+  if (hrefMatch?.[1]) {
+    return cleanUrl(
+      hrefMatch[1],
+    );
+  }
+
+  return "";
+}
+
+function extractAtomLink(
+  block: string,
+): string {
+  const alternate =
+    block.match(
+      /<link\b[^>]*rel=["']alternate["'][^>]*href=["']([^"']+)["'][^>]*\/?>/i,
+    );
+
+  if (alternate?.[1]) {
+    return cleanUrl(
+      alternate[1],
+    );
+  }
+
+  const anyHref =
+    block.match(
+      /<link\b[^>]*href=["']([^"']+)["'][^>]*\/?>/i,
+    );
+
+  if (anyHref?.[1]) {
+    return cleanUrl(
+      anyHref[1],
+    );
+  }
+
+  return "";
 }
 
 function extractXMLTag(
@@ -2244,48 +2646,38 @@ function extractXMLTag(
 
   const regex =
     new RegExp(
-      `<${escapedTag}\\b[^>]*>([\\s\\S]*?)<\\/${escapedTag}>`,
+      `<${escapedTag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${escapedTag}>`,
       "i",
     );
 
   const match =
     regex.exec(xml);
 
-  if (!match?.[1]) {
+  if (match?.[1]) {
+    return match[1];
+  }
+
+  /*
+   * Support des balises auto-fermantes.
+   */
+  const selfClosing =
+    new RegExp(
+      `<${escapedTag}(?:\\s[^>]*)?\\/\\s*>`,
+      "i",
+    );
+
+  if (
+    selfClosing.test(xml)
+  ) {
     return "";
   }
 
-  return match[1]
-    .replace(
-      /^<!\[CDATA\[/i,
-      "",
-    )
-    .replace(
-      /\]\]>$/i,
-      "",
-    )
-    .trim();
+  return "";
 }
 
-function decodeXmlText(
-  text: string,
-): string {
-  if (!text) {
-    return "";
-  }
-
-  return decodeHtmlEntities(
-    text
-      .replace(
-        /^<!\[CDATA\[/i,
-        "",
-      )
-      .replace(
-        /\]\]>$/i,
-        "",
-      ),
-  );
-}
+/* =========================================================
+   EXTRACTION DES PAGES SOURCES
+   ========================================================= */
 
 function extractPageText(
   html: string,
@@ -2316,21 +2708,15 @@ function extractPageText(
       " ",
     );
 
-  text = stripHtml(
-    text,
-  );
+  text =
+    stripHtml(text);
 
   text =
-    decodeHtmlEntities(
-      text,
-    );
+    decodeHtmlEntities(text);
 
   text =
     text
-      .replace(
-        /\s+/g,
-        " ",
-      )
+      .replace(/\s+/g, " ")
       .trim();
 
   return text;
@@ -2344,9 +2730,7 @@ function clusterPriority(
     Math.max(
       ...a.items.map(
         (item) =>
-          sourcePriority(
-            item,
-          ),
+          sourcePriority(item),
       ),
     ) +
     a.items.length * 10;
@@ -2355,9 +2739,7 @@ function clusterPriority(
     Math.max(
       ...b.items.map(
         (item) =>
-          sourcePriority(
-            item,
-          ),
+          sourcePriority(item),
       ),
     ) +
     b.items.length * 10;
@@ -2460,7 +2842,9 @@ function meaningfulTokens(
     .filter(
       (token) =>
         token.length >= 3 &&
-        !stopWords.has(token),
+        !stopWords.has(
+          token,
+        ),
     );
 }
 
@@ -2645,7 +3029,8 @@ function cleanArticleContent(
     return "";
   }
 
-  let cleaned = content;
+  let cleaned =
+    content;
 
   cleaned =
     cleaned.replace(
@@ -2759,14 +3144,20 @@ function decodeHtmlEntities(
     )
     .replace(
       /&#(\d+);/g,
-      (_, code) =>
+      (
+        _,
+        code,
+      ) =>
         String.fromCharCode(
           Number(code),
         ),
     )
     .replace(
       /&#x([0-9a-f]+);/gi,
-      (_, code) =>
+      (
+        _,
+        code,
+      ) =>
         String.fromCharCode(
           parseInt(
             code,
@@ -2820,22 +3211,21 @@ function getStartOfToday(): Date {
   );
 }
 
-/**
- * Génération locale du slug.
- *
- * Remplace complètement slugify.
- */
-function createBaseSlug(
-  title: string,
+/* =========================================================
+   SLUG LOCAL — SANS slugify
+   ========================================================= */
+
+function createSlug(
+  value: string,
 ): string {
-  let slug =
-    cleanText(title)
-      .toLowerCase()
+  const slug =
+    cleanText(value)
       .normalize("NFD")
       .replace(
         /[\u0300-\u036f]/g,
         "",
       )
+      .toLowerCase()
       .replace(
         /œ/g,
         "oe",
@@ -2845,10 +3235,6 @@ function createBaseSlug(
         "ae",
       )
       .replace(
-        /&/g,
-        " et ",
-      )
-      .replace(
         /[^a-z0-9]+/g,
         "-",
       )
@@ -2856,27 +3242,19 @@ function createBaseSlug(
         /^-+|-+$/g,
         "",
       )
-      .replace(
-        /-{2,}/g,
-        "-",
-      );
+      .slice(0, 120);
 
-  /*
-   * Évite un slug vide dans les cas
-   * très particuliers.
-   */
-  if (!slug) {
-    slug = "article-psg";
-  }
-
-  return slug;
+  return (
+    slug ||
+    `article-${Date.now()}`
+  );
 }
 
 async function makeUniqueSlug(
   title: string,
 ): Promise<string> {
   const baseSlug =
-    createBaseSlug(title);
+    createSlug(title);
 
   if (!baseSlug) {
     throw new Error(
@@ -2896,6 +3274,7 @@ async function makeUniqueSlug(
           where: {
             slug,
           },
+
           select: {
             id: true,
           },
@@ -2935,6 +3314,7 @@ function getErrorMessage(
 async function fetchWithTimeout(
   url: string,
   timeoutMs: number,
+  options?: RequestInit,
 ): Promise<Response> {
   const controller =
     new AbortController();
@@ -2950,14 +3330,19 @@ async function fetchWithTimeout(
     return await fetch(
       url,
       {
+        ...options,
+
         signal:
           controller.signal,
+
         headers: {
           "User-Agent":
             "PSG-Direct/1.0",
-          Accept:
-            "application/rss+xml, application/atom+xml, application/xml, text/xml, text/html;q=0.9, */*;q=0.8",
+
+          ...(options?.headers ||
+            {}),
         },
+
         cache:
           "no-store",
       },
