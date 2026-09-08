@@ -1,16 +1,7 @@
 import { NextResponse } from "next/server";
-import Parser from "rss-parser";
 import { PrismaClient } from "@prisma/client";
-import slugify from "slugify";
 
 const prisma = new PrismaClient();
-
-const parser = new Parser({
-  timeout: 4000,
-  headers: {
-    "User-Agent": "PSG-Direct/1.0 RSS Reader",
-  },
-});
 
 const RSS_FEEDS = [
   {
@@ -209,11 +200,14 @@ export async function GET(request: Request) {
 
     const checked = allItems.length;
 
-    const relevantItems = allItems.filter((item) => isRelevantPSG(item));
+    const relevantItems = allItems.filter((item) =>
+      isRelevantPSG(item),
+    );
 
     const deduplicatedItems = deduplicateItems(relevantItems);
 
-    const duplicates = relevantItems.length - deduplicatedItems.length;
+    const duplicates =
+      relevantItems.length - deduplicatedItems.length;
 
     const recentArticles = await prisma.article.findMany({
       orderBy: {
@@ -272,7 +266,11 @@ export async function GET(request: Request) {
 
     const clusterDiagnostics: Array<Record<string, unknown>> = [];
 
-    for (let index = 0; index < prioritizedClusters.length; index++) {
+    for (
+      let index = 0;
+      index < prioritizedClusters.length;
+      index++
+    ) {
       const cluster = prioritizedClusters[index];
 
       const result = await processCluster(cluster, {
@@ -321,7 +319,9 @@ export async function GET(request: Request) {
       clusterDiagnostics.push({
         cluster: index + 1,
         sources: result.sources || [
-          ...new Set(cluster.items.map((item) => item.source)),
+          ...new Set(
+            cluster.items.map((item) => item.source),
+          ),
         ],
         titles: cluster.items.map((item) => item.title),
         outcome: result.outcome,
@@ -329,7 +329,8 @@ export async function GET(request: Request) {
       });
     }
 
-    const finalArticlesCreatedToday = await getArticlesCreatedToday();
+    const finalArticlesCreatedToday =
+      await getArticlesCreatedToday();
 
     const finalRemainingDailyTarget = Math.max(
       0,
@@ -348,7 +349,8 @@ export async function GET(request: Request) {
       articlesCreatedToday: finalArticlesCreatedToday,
       dailyTarget: DAILY_TARGET,
       remainingDailyTarget: finalRemainingDailyTarget,
-      dailyTargetReached: finalRemainingDailyTarget <= 0,
+      dailyTargetReached:
+        finalRemainingDailyTarget <= 0,
       sourcesOk,
       sources: RSS_FEEDS.map((feed) => feed.name),
       duplicates,
@@ -376,7 +378,10 @@ export async function GET(request: Request) {
       elapsedMs: Date.now() - startedAt,
     });
   } catch (error) {
-    console.error("fetch-articles error:", error);
+    console.error(
+      "fetch-articles error:",
+      error,
+    );
 
     return NextResponse.json(
       {
@@ -405,7 +410,10 @@ async function processCluster(
   },
 ): Promise<ProcessResult> {
   try {
-    const enrichment = await enrichSources(cluster.items, callbacks);
+    const enrichment = await enrichSources(
+      cluster.items,
+      callbacks,
+    );
 
     if (!enrichment.sources.length) {
       return {
@@ -424,15 +432,21 @@ async function processCluster(
     if (!generated) {
       return {
         outcome: "gemini_error",
-        detail: `title=${cluster.items[0]?.title?.length || 0}`,
-        sources: enrichment.sources.map((source) => source.source),
+        detail: `title=${
+          cluster.items[0]?.title?.length || 0
+        }`,
+        sources: enrichment.sources.map(
+          (source) => source.source,
+        ),
         pages: enrichment.pagesFetched,
         enriched: enrichment.enrichedCharacters,
       };
     }
 
     let article = generated;
-    let generatedWords = countWords(article.content);
+    let generatedWords = countWords(
+      article.content,
+    );
 
     if (generatedWords < MIN_ARTICLE_WORDS) {
       callbacks.onTooShort();
@@ -453,7 +467,9 @@ async function processCluster(
       );
 
       if (expanded) {
-        const expandedWords = countWords(expanded.content);
+        const expandedWords = countWords(
+          expanded.content,
+        );
 
         console.log(
           `Expansion Gemini : ${generatedWords} → ${expandedWords} mots`,
@@ -472,46 +488,71 @@ async function processCluster(
       return {
         outcome: "too_short_after_retry",
         detail: `title=${article.title.length}, words=${generatedWords}, excerpt=${article.excerpt.length}`,
-        sources: enrichment.sources.map((source) => source.source),
+        sources: enrichment.sources.map(
+          (source) => source.source,
+        ),
         pages: enrichment.pagesFetched,
         enriched: enrichment.enrichedCharacters,
       };
     }
 
-    article.content = cleanArticleContent(article.content);
+    article.content = cleanArticleContent(
+      article.content,
+    );
 
-    article.content = addBasicStructure(article.content);
+    article.content = addBasicStructure(
+      article.content,
+    );
 
-    article.content = trimToWords(article.content, MAX_ARTICLE_WORDS);
+    article.content = trimToWords(
+      article.content,
+      MAX_ARTICLE_WORDS,
+    );
 
-    article.excerpt = cleanText(article.excerpt);
+    article.excerpt = cleanText(
+      article.excerpt,
+    );
 
-    article.title = cleanText(article.title);
+    article.title = cleanText(
+      article.title,
+    );
 
-    article.seoTitle = cleanText(article.seoTitle);
+    article.seoTitle = cleanText(
+      article.seoTitle,
+    );
 
-    article.seoDescription = cleanText(article.seoDescription);
+    article.seoDescription = cleanText(
+      article.seoDescription,
+    );
 
-    if (!article.title || !article.content) {
+    if (
+      !article.title ||
+      !article.content
+    ) {
       return {
         outcome: "invalid_article",
         detail: "Titre ou contenu vide",
-        sources: enrichment.sources.map((source) => source.source),
+        sources: enrichment.sources.map(
+          (source) => source.source,
+        ),
         pages: enrichment.pagesFetched,
         enriched: enrichment.enrichedCharacters,
       };
     }
 
-    const duplicateTitle = recentTitleDuplicate(
-      article.title,
-      cluster.items,
-    );
+    const duplicateTitle =
+      recentTitleDuplicate(
+        article.title,
+        cluster.items,
+      );
 
     if (duplicateTitle) {
       return {
         outcome: "duplicate_title",
         detail: `title=${article.title}`,
-        sources: enrichment.sources.map((source) => source.source),
+        sources: enrichment.sources.map(
+          (source) => source.source,
+        ),
         pages: enrichment.pagesFetched,
         enriched: enrichment.enrichedCharacters,
       };
@@ -520,14 +561,18 @@ async function processCluster(
     let slug: string;
 
     try {
-      slug = await makeUniqueSlug(article.title);
+      slug = await makeUniqueSlug(
+        article.title,
+      );
     } catch (error) {
       callbacks.onSlugError();
 
       return {
         outcome: "slug_error",
         detail: getErrorMessage(error),
-        sources: enrichment.sources.map((source) => source.source),
+        sources: enrichment.sources.map(
+          (source) => source.source,
+        ),
         pages: enrichment.pagesFetched,
         enriched: enrichment.enrichedCharacters,
       };
@@ -543,7 +588,10 @@ async function processCluster(
           club: "PSG",
           status: "DRAFT",
           isAiGenerated: true,
-          sourceUrl: cluster.items[0]?.link || enrichment.sources[0]?.url || null,
+          sourceUrl:
+            cluster.items[0]?.link ||
+            enrichment.sources[0]?.url ||
+            null,
         },
       });
     } catch (error) {
@@ -552,7 +600,9 @@ async function processCluster(
       return {
         outcome: "create_error",
         detail: getErrorMessage(error),
-        sources: enrichment.sources.map((source) => source.source),
+        sources: enrichment.sources.map(
+          (source) => source.source,
+        ),
         pages: enrichment.pagesFetched,
         enriched: enrichment.enrichedCharacters,
       };
@@ -562,8 +612,18 @@ async function processCluster(
 
     return {
       outcome: "created",
-      detail: `words=${countWords(article.content)}, sources=${enrichment.sources.length}, pages=${enrichment.pagesFetched}, enriched=${enrichment.enrichedCharacters}`,
-      sources: enrichment.sources.map((source) => source.source),
+      detail: `words=${countWords(
+        article.content,
+      )}, sources=${
+        enrichment.sources.length
+      }, pages=${
+        enrichment.pagesFetched
+      }, enriched=${
+        enrichment.enrichedCharacters
+      }`,
+      sources: enrichment.sources.map(
+        (source) => source.source,
+      ),
       pages: enrichment.pagesFetched,
       enriched: enrichment.enrichedCharacters,
     };
@@ -579,13 +639,24 @@ async function enrichSources(
   items: RSSItem[],
   callbacks: {
     onSourcePageFetched: () => void;
-    onSourcePageFailed: (message: string) => void;
-    onEnrichedCharacters: (count: number) => void;
+    onSourcePageFailed: (
+      message: string,
+    ) => void;
+    onEnrichedCharacters: (
+      count: number,
+    ) => void;
   },
 ): Promise<EnrichmentResult> {
   const selected = [...items]
-    .sort((a, b) => sourcePriority(b) - sourcePriority(a))
-    .slice(0, MAX_SOURCES_PER_ARTICLE);
+    .sort(
+      (a, b) =>
+        sourcePriority(b) -
+        sourcePriority(a),
+    )
+    .slice(
+      0,
+      MAX_SOURCES_PER_ARTICLE,
+    );
 
   const results = await Promise.all(
     selected.map(async (item) => {
@@ -594,7 +665,9 @@ async function enrichSources(
         title: cleanText(item.title),
         url: cleanUrl(item.link),
         description: cleanText(
-          item.contentSnippet || item.content || "",
+          item.contentSnippet ||
+            item.content ||
+            "",
         ),
         publishedAt: item.pubDate,
       };
@@ -609,15 +682,19 @@ async function enrichSources(
       }
 
       try {
-        const response = await fetchWithTimeout(
-          cleanUrl(item.link),
-          SOURCE_TIMEOUT_MS,
-        );
+        const response =
+          await fetchWithTimeout(
+            cleanUrl(item.link),
+            SOURCE_TIMEOUT_MS,
+          );
 
         if (!response.ok) {
-          const message = `${item.source}: HTTP ${response.status} ${response.statusText}`;
+          const message =
+            `${item.source}: HTTP ${response.status} ${response.statusText}`;
 
-          callbacks.onSourcePageFailed(message);
+          callbacks.onSourcePageFailed(
+            message,
+          );
 
           return {
             source: base,
@@ -627,35 +704,49 @@ async function enrichSources(
           };
         }
 
-        const html = await response.text();
+        const html =
+          await response.text();
 
-        const text = extractPageText(html);
+        const text =
+          extractPageText(html);
 
         const enriched = cleanText(
-          text.slice(0, MAX_SOURCE_PAGE_CHARS),
+          text.slice(
+            0,
+            MAX_SOURCE_PAGE_CHARS,
+          ),
         );
 
-        const source: EnrichedSource = {
-          ...base,
-          enrichedContent: enriched || base.description,
-        };
+        const source: EnrichedSource =
+          {
+            ...base,
+            enrichedContent:
+              enriched ||
+              base.description,
+          };
 
         callbacks.onSourcePageFetched();
 
         callbacks.onEnrichedCharacters(
-          source.enrichedContent?.length || 0,
+          source.enrichedContent
+            ?.length || 0,
         );
 
         return {
           source,
           fetched: true,
           failed: false,
-          chars: source.enrichedContent?.length || 0,
+          chars:
+            source.enrichedContent
+              ?.length || 0,
         };
       } catch (error) {
-        const message = `${item.source}: ${getErrorMessage(error)}`;
+        const message =
+          `${item.source}: ${getErrorMessage(error)}`;
 
-        callbacks.onSourcePageFailed(message);
+        callbacks.onSourcePageFailed(
+          message,
+        );
 
         return {
           source: base,
@@ -668,26 +759,44 @@ async function enrichSources(
   );
 
   return {
-    sources: results.map((result) => result.source),
-    pagesFetched: results.filter((result) => result.fetched).length,
-    pagesFailed: results.filter((result) => result.failed).length,
-    enrichedCharacters: results.reduce(
-      (total, result) => total + result.chars,
-      0,
+    sources: results.map(
+      (result) => result.source,
     ),
+    pagesFetched: results.filter(
+      (result) => result.fetched,
+    ).length,
+    pagesFailed: results.filter(
+      (result) => result.failed,
+    ).length,
+    enrichedCharacters:
+      results.reduce(
+        (total, result) =>
+          total + result.chars,
+        0,
+      ),
   };
 }
 
-function shouldFetchSourcePage(item: RSSItem): boolean {
+function shouldFetchSourcePage(
+  item: RSSItem,
+): boolean {
   if (!item.link) {
     return false;
   }
 
-  if (!/^https?:\/\//i.test(item.link)) {
+  if (
+    !/^https?:\/\//i.test(
+      item.link,
+    )
+  ) {
     return false;
   }
 
-  if (item.link.includes("news.google.com")) {
+  if (
+    item.link.includes(
+      "news.google.com",
+    )
+  ) {
     return false;
   }
 
@@ -706,26 +815,42 @@ async function generateArticle(
     onGeminiCall: () => void;
     onGeminiSuccess: () => void;
     onInvalidJson: () => void;
-    onGeminiError: (message: string) => void;
+    onGeminiError: (
+      message: string,
+    ) => void;
   },
 ): Promise<GeneratedArticle | null> {
-  const sourceMaterial = sources
-    .map((source, index) => {
-      return `
+  const sourceMaterial =
+    sources
+      .map((source, index) => {
+        return `
 ===== SOURCE ${index + 1} =====
 Source : ${source.source}
 Titre : ${source.title}
 URL : ${source.url}
-Date : ${source.publishedAt || "Non précisée"}
+Date : ${
+          source.publishedAt ||
+          "Non précisée"
+        }
+
+CONTENU RSS :
+${
+  source.description || ""
+}
 
 CONTENU ENRICHI :
-${source.enrichedContent || source.description || ""}
+${
+  source.enrichedContent ||
+  source.description ||
+  ""
+}
 `;
-    })
-    .join("\n\n");
+      })
+      .join("\n\n");
 
   const expansionContext =
-    expandExisting && existingArticle
+    expandExisting &&
+    existingArticle
       ? `
 ===== BROUILLON EXISTANT À AMÉLIORER =====
 
@@ -836,6 +961,16 @@ ${sourceMaterial}
 
 23. Les informations pratiques comme l'heure, la chaîne, le stade ou la date doivent uniquement être ajoutées lorsqu'elles sont réellement disponibles.
 
+24. Les sources peuvent contenir plusieurs articles concernant le même événement. Regroupe-les et utilise les informations complémentaires de chaque source.
+
+25. Donne la priorité aux informations précises et vérifiables : noms de joueurs, adversaire, compétition, date, heure, stade, chaîne, composition, absences, blessures, déclarations, statistiques et contexte.
+
+26. Si une information importante apparaît dans une seule source mais que cette source est clairement identifiée, tu peux l'utiliser en l'attribuant.
+
+27. Ne transforme jamais une information provenant d'une source en fait confirmé par plusieurs sources si elle n'est confirmée que par une seule.
+
+28. Ne cite jamais une information provenant d'une source qui n'est pas réellement présente dans le matériel fourni.
+
 ===== FORMAT DE RÉPONSE OBLIGATOIRE =====
 
 Retourne UNIQUEMENT un objet JSON valide avec exactement ces champs :
@@ -856,36 +991,56 @@ Aucun texte après le JSON.
   try {
     callbacks?.onGeminiCall();
 
-    const result = await callGemini(prompt);
+    const result =
+      await callGemini(prompt);
 
     if (!result) {
       return null;
     }
 
-    const parsed = parseGeminiJson(result);
+    const parsed =
+      parseGeminiJson(result);
 
-    if (!parsed || !isValidGeminiArticle(parsed)) {
+    if (
+      !parsed ||
+      !isValidGeminiArticle(
+        parsed,
+      )
+    ) {
       callbacks?.onInvalidJson();
       return null;
     }
 
-    return normalizeArticle(parsed);
+    return normalizeArticle(
+      parsed,
+    );
   } catch (error) {
-    const message = getErrorMessage(error);
+    const message =
+      getErrorMessage(error);
 
-    callbacks?.onGeminiError(message);
+    callbacks?.onGeminiError(
+      message,
+    );
 
-    console.error("Gemini generation error:", message);
+    console.error(
+      "Gemini generation error:",
+      message,
+    );
 
     return null;
   }
 }
 
-async function callGemini(prompt: string): Promise<string | null> {
-  const apiKey = process.env.GEMINI_API_KEY;
+async function callGemini(
+  prompt: string,
+): Promise<string | null> {
+  const apiKey =
+    process.env.GEMINI_API_KEY;
 
   if (!apiKey) {
-    throw new Error("GEMINI_API_KEY manquant");
+    throw new Error(
+      "GEMINI_API_KEY manquant",
+    );
   }
 
   const models = [
@@ -893,70 +1048,97 @@ async function callGemini(prompt: string): Promise<string | null> {
     "gemini-3.6-flash",
   ];
 
-  let lastError: Error | null = null;
+  let lastError: Error | null =
+    null;
 
   for (const model of models) {
     try {
-      const controller = new AbortController();
+      const controller =
+        new AbortController();
 
-      const timeout = setTimeout(
-        () => controller.abort(),
-        GEMINI_TIMEOUT_MS,
-      );
-
-      try {
-        const response = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-              contents: [
-                {
-                  parts: [
-                    {
-                      text: prompt,
-                    },
-                  ],
-                },
-              ],
-              generationConfig: {
-                temperature: 0.25,
-                responseMimeType: "application/json",
-              },
-            }),
-            signal: controller.signal,
-          },
+      const timeout =
+        setTimeout(
+          () =>
+            controller.abort(),
+          GEMINI_TIMEOUT_MS,
         );
 
+      try {
+        const response =
+          await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
+            {
+              method: "POST",
+              headers: {
+                "Content-Type":
+                  "application/json",
+              },
+              body: JSON.stringify({
+                contents: [
+                  {
+                    parts: [
+                      {
+                        text: prompt,
+                      },
+                    ],
+                  },
+                ],
+                generationConfig: {
+                  temperature: 0.25,
+                  responseMimeType:
+                    "application/json",
+                },
+              }),
+              signal:
+                controller.signal,
+            },
+          );
+
         if (!response.ok) {
-          const text = await response.text();
+          const text =
+            await response.text();
 
           throw new Error(
-            `Gemini HTTP ${response.status}: ${text.slice(0, 500)}`,
+            `Gemini HTTP ${response.status}: ${text.slice(
+              0,
+              500,
+            )}`,
           );
         }
 
-        const data = await response.json();
+        const data =
+          await response.json();
 
         const text =
-          data?.candidates?.[0]?.content?.parts?.[0]?.text;
+          data?.candidates?.[0]
+            ?.content?.parts?.[0]
+            ?.text;
 
-        if (!text || typeof text !== "string") {
-          throw new Error("Réponse Gemini vide");
+        if (
+          !text ||
+          typeof text !==
+            "string"
+        ) {
+          throw new Error(
+            "Réponse Gemini vide",
+          );
         }
 
         return text;
       } finally {
-        clearTimeout(timeout);
+        clearTimeout(
+          timeout,
+        );
       }
     } catch (error) {
       lastError =
         error instanceof Error
           ? error
-          : new Error(getErrorMessage(error));
+          : new Error(
+              getErrorMessage(
+                error,
+              ),
+            );
 
       console.error(
         `Gemini model ${model} failed:`,
@@ -976,37 +1158,58 @@ function parseGeminiJson(
   raw: string,
 ): GeneratedArticle | null {
   try {
-    const direct = JSON.parse(raw);
+    const direct =
+      JSON.parse(raw);
 
-    if (isValidGeminiArticle(direct)) {
+    if (
+      isValidGeminiArticle(
+        direct,
+      )
+    ) {
       return direct;
     }
   } catch {
-    // Continue with extraction.
+    // Continue.
   }
 
-  const extracted = extractFirstJsonObject(raw);
+  const extracted =
+    extractFirstJsonObject(
+      raw,
+    );
 
   if (!extracted) {
     return null;
   }
 
   try {
-    const parsed = JSON.parse(extracted);
+    const parsed =
+      JSON.parse(extracted);
 
-    if (isValidGeminiArticle(parsed)) {
+    if (
+      isValidGeminiArticle(
+        parsed,
+      )
+    ) {
       return parsed;
     }
   } catch {
-    // Continue with repair.
+    // Continue.
   }
 
   try {
-    const repaired = repairJsonString(extracted);
+    const repaired =
+      repairJsonString(
+        extracted,
+      );
 
-    const parsed = JSON.parse(repaired);
+    const parsed =
+      JSON.parse(repaired);
 
-    if (isValidGeminiArticle(parsed)) {
+    if (
+      isValidGeminiArticle(
+        parsed,
+      )
+    ) {
       return parsed;
     }
   } catch {
@@ -1019,27 +1222,43 @@ function parseGeminiJson(
 function isValidGeminiArticle(
   value: unknown,
 ): value is GeneratedArticle {
-  if (!value || typeof value !== "object") {
+  if (
+    !value ||
+    typeof value !==
+      "object"
+  ) {
     return false;
   }
 
-  const article = value as Record<string, unknown>;
+  const article =
+    value as Record<
+      string,
+      unknown
+    >;
 
   return (
-    typeof article.title === "string" &&
-    typeof article.excerpt === "string" &&
-    typeof article.content === "string" &&
-    typeof article.seoTitle === "string" &&
-    typeof article.seoDescription === "string" &&
-    article.title.trim().length > 10 &&
-    article.content.trim().length > 100
+    typeof article.title ===
+      "string" &&
+    typeof article.excerpt ===
+      "string" &&
+    typeof article.content ===
+      "string" &&
+    typeof article.seoTitle ===
+      "string" &&
+    typeof article.seoDescription ===
+      "string" &&
+    article.title.trim()
+      .length > 10 &&
+    article.content.trim()
+      .length > 100
   );
 }
 
 function extractFirstJsonObject(
   text: string,
 ): string | null {
-  const start = text.indexOf("{");
+  const start =
+    text.indexOf("{");
 
   if (start === -1) {
     return null;
@@ -1049,7 +1268,11 @@ function extractFirstJsonObject(
   let inString = false;
   let escaped = false;
 
-  for (let i = start; i < text.length; i++) {
+  for (
+    let i = start;
+    i < text.length;
+    i++
+  ) {
     const char = text[i];
 
     if (escaped) {
@@ -1073,11 +1296,16 @@ function extractFirstJsonObject(
 
     if (char === "{") {
       depth++;
-    } else if (char === "}") {
+    } else if (
+      char === "}"
+    ) {
       depth--;
 
       if (depth === 0) {
-        return text.slice(start, i + 1);
+        return text.slice(
+          start,
+          i + 1,
+        );
       }
     }
   }
@@ -1085,20 +1313,36 @@ function extractFirstJsonObject(
   return null;
 }
 
-function repairJsonString(text: string): string {
-  let repaired = text.trim();
+function repairJsonString(
+  text: string,
+): string {
+  let repaired =
+    text.trim();
 
   repaired = repaired
-    .replace(/^\uFEFF/, "")
-    .replace(/^```json\s*/i, "")
-    .replace(/^```\s*/i, "")
-    .replace(/\s*```$/i, "")
+    .replace(
+      /^\uFEFF/,
+      "",
+    )
+    .replace(
+      /^```json\s*/i,
+      "",
+    )
+    .replace(
+      /^```\s*/i,
+      "",
+    )
+    .replace(
+      /\s*```$/i,
+      "",
+    )
     .trim();
 
-  repaired = repaired.replace(
-    /[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g,
-    " ",
-  );
+  repaired =
+    repaired.replace(
+      /[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g,
+      " ",
+    );
 
   return repaired;
 }
@@ -1106,92 +1350,155 @@ function repairJsonString(text: string): string {
 function normalizeArticle(
   article: GeneratedArticle,
 ): GeneratedArticle {
-  const content = cleanArticleContent(article.content);
+  const content =
+    cleanArticleContent(
+      article.content,
+    );
 
   return {
-    title: cleanText(article.title),
-    excerpt: cleanText(article.excerpt),
+    title: cleanText(
+      article.title,
+    ),
+    excerpt: cleanText(
+      article.excerpt,
+    ),
     content,
-    seoTitle: cleanText(article.seoTitle),
-    seoDescription: cleanText(article.seoDescription),
+    seoTitle: cleanText(
+      article.seoTitle,
+    ),
+    seoDescription:
+      cleanText(
+        article.seoDescription,
+      ),
   };
 }
 
-function addBasicStructure(content: string): string {
-  const cleaned = cleanArticleContent(content);
+function addBasicStructure(
+  content: string,
+): string {
+  const cleaned =
+    cleanArticleContent(
+      content,
+    );
 
   if (!cleaned) {
     return "";
   }
 
-  const paragraphs = cleaned
-    .split(/\n{2,}/)
-    .map((paragraph) => paragraph.trim())
-    .filter(Boolean);
+  const paragraphs =
+    cleaned
+      .split(/\n{2,}/)
+      .map(
+        (paragraph) =>
+          paragraph.trim(),
+      )
+      .filter(Boolean);
 
-  if (paragraphs.length <= 1) {
+  if (
+    paragraphs.length <= 1
+  ) {
     return cleaned;
   }
 
-  return paragraphs.join("\n\n");
+  return paragraphs.join(
+    "\n\n",
+  );
 }
 
 function trimToWords(
   text: string,
   maxWords: number,
 ): string {
-  const words = text.split(/\s+/).filter(Boolean);
+  const words =
+    text
+      .split(/\s+/)
+      .filter(Boolean);
 
-  if (words.length <= maxWords) {
+  if (
+    words.length <= maxWords
+  ) {
     return text;
   }
 
-  return words.slice(0, maxWords).join(" ") + "...";
+  return (
+    words
+      .slice(0, maxWords)
+      .join(" ") + "..."
+  );
 }
 
 function buildSimpleClusters(
   items: RSSItem[],
 ): StoryCluster[] {
-  const clusters: StoryCluster[] = [];
+  const clusters: StoryCluster[] =
+    [];
 
   /*
-   * IMPORTANT :
-   * Un titre qui parle explicitement de plusieurs adversaires
-   * ou de plusieurs matchs ne doit pas être utilisé pour fusionner
-   * deux événements différents.
+   * Un titre qui parle explicitement
+   * de plusieurs adversaires ou plusieurs
+   * matchs ne doit pas servir à fusionner
+   * plusieurs événements.
    *
    * Exemple :
-   * "PSG/Monaco & PSG/Bratislava"
-   *
-   * Ce titre est ignoré pour le clustering.
+   * PSG/Monaco & PSG/Bratislava
    */
-  const safeItems = items.filter((item) => {
-    const opponents = extractAllOpponents(
-      normalizeForComparison(item.title),
-    );
+  const safeItems =
+    items.filter((item) => {
+      const opponents =
+        extractAllOpponents(
+          normalizeForComparison(
+            item.title,
+          ),
+        );
 
-    return opponents.length <= 1;
-  });
+      return (
+        opponents.length <= 1
+      );
+    });
 
-  const sorted = [...safeItems].sort(
-    (a, b) => sourcePriority(b) - sourcePriority(a),
+  const sorted = [
+    ...safeItems,
+  ].sort(
+    (a, b) =>
+      sourcePriority(b) -
+      sourcePriority(a),
   );
 
   for (const item of sorted) {
-    let bestCluster: StoryCluster | null = null;
+    let bestCluster:
+      | StoryCluster
+      | null = null;
+
     let bestSimilarity = 0;
 
-    for (const cluster of clusters) {
-      const similarity = similarityToCluster(item, cluster);
+    for (
+      const cluster of clusters
+    ) {
+      const similarity =
+        similarityToCluster(
+          item,
+          cluster,
+        );
 
-      if (similarity > bestSimilarity) {
-        bestSimilarity = similarity;
-        bestCluster = cluster;
+      if (
+        similarity >
+        bestSimilarity
+      ) {
+        bestSimilarity =
+          similarity;
+
+        bestCluster =
+          cluster;
       }
     }
 
-    if (bestCluster && bestSimilarity >= 0.42) {
-      bestCluster.items.push(item);
+    if (
+      bestCluster &&
+      bestSimilarity >= 0.42
+    ) {
+      bestCluster.items.push(
+        item,
+      );
     } else {
       clusters.push({
         items: [item],
@@ -1208,13 +1515,19 @@ function similarityToCluster(
 ): number {
   let best = 0;
 
-  for (const clusterItem of cluster.items) {
-    const similarity = simpleStorySimilarity(
-      item,
-      clusterItem,
-    );
+  for (
+    const clusterItem of
+      cluster.items
+  ) {
+    const similarity =
+      simpleStorySimilarity(
+        item,
+        clusterItem,
+      );
 
-    if (similarity > best) {
+    if (
+      similarity > best
+    ) {
       best = similarity;
     }
   }
@@ -1226,26 +1539,47 @@ function simpleStorySimilarity(
   a: RSSItem,
   b: RSSItem,
 ): number {
-  const titleA = normalizeForComparison(a.title);
-  const titleB = normalizeForComparison(b.title);
+  const titleA =
+    normalizeForComparison(
+      a.title,
+    );
 
-  const opponentsA = extractAllOpponents(titleA);
-  const opponentsB = extractAllOpponents(titleB);
+  const titleB =
+    normalizeForComparison(
+      b.title,
+    );
 
-  if (opponentsA.length > 1 || opponentsB.length > 1) {
+  const opponentsA =
+    extractAllOpponents(
+      titleA,
+    );
+
+  const opponentsB =
+    extractAllOpponents(
+      titleB,
+    );
+
+  if (
+    opponentsA.length > 1 ||
+    opponentsB.length > 1
+  ) {
     return 0;
   }
 
   if (
     opponentsA.length &&
     opponentsB.length &&
-    opponentsA[0] !== opponentsB[0]
+    opponentsA[0] !==
+      opponentsB[0]
   ) {
     return 0;
   }
 
-  const eventA = extractEvent(titleA);
-  const eventB = extractEvent(titleB);
+  const eventA =
+    extractEvent(titleA);
+
+  const eventB =
+    extractEvent(titleB);
 
   if (
     eventA &&
@@ -1255,56 +1589,88 @@ function simpleStorySimilarity(
     return 0;
   }
 
-  const similarity = titleSimilarity(titleA, titleB);
+  const similarity =
+    titleSimilarity(
+      titleA,
+      titleB,
+    );
 
-  const tokensA = meaningfulTokens(titleA);
-  const tokensB = meaningfulTokens(titleB);
+  const tokensA =
+    meaningfulTokens(
+      titleA,
+    );
 
-  const common = tokensA.filter((token) =>
-    tokensB.includes(token),
-  );
+  const tokensB =
+    meaningfulTokens(
+      titleB,
+    );
+
+  const common =
+    tokensA.filter(
+      (token) =>
+        tokensB.includes(token),
+    );
 
   const tokenScore =
     common.length /
     Math.max(
       1,
-      Math.min(tokensA.length, tokensB.length),
+      Math.min(
+        tokensA.length,
+        tokensB.length,
+      ),
     );
 
-  let score = similarity * 0.65 + tokenScore * 0.35;
+  let score =
+    similarity * 0.65 +
+    tokenScore * 0.35;
 
   if (
     opponentsA.length &&
     opponentsB.length &&
-    opponentsA[0] === opponentsB[0]
+    opponentsA[0] ===
+      opponentsB[0]
   ) {
     score += 0.18;
   }
 
-  if (eventA && eventB && eventA === eventB) {
+  if (
+    eventA &&
+    eventB &&
+    eventA === eventB
+  ) {
     score += 0.08;
   }
 
-  return Math.min(1, score);
+  return Math.min(
+    1,
+    score,
+  );
 }
 
 function extractAllOpponents(
   title: string,
 ): string[] {
-  const normalized = normalizeForComparison(title);
+  const normalized =
+    normalizeForComparison(
+      title,
+    );
 
-  /*
-   * Bratislava / Slovan Bratislava est toujours ramené
-   * à la même entité.
-   */
   if (
-    normalized.includes("bratislava") ||
-    normalized.includes("slovan")
+    normalized.includes(
+      "bratislava",
+    ) ||
+    normalized.includes(
+      "slovan",
+    )
   ) {
-    return ["slovan bratislava"];
+    return [
+      "slovan bratislava",
+    ];
   }
 
-  const opponents = new Set<string>();
+  const opponents =
+    new Set<string>();
 
   const patterns = [
     /psg\s*[-–—/]\s*([a-z0-9àâäéèêëîïôöùûüç' .]+)/i,
@@ -1313,120 +1679,194 @@ function extractAllOpponents(
     /([a-z0-9àâäéèêëîïôöùûüç' .]+)\s*[-–—/]\s*paris saint-germain/i,
   ];
 
-  for (const pattern of patterns) {
-    const match = normalized.match(pattern);
-
-    if (match?.[1]) {
-      const opponent = cleanOpponent(match[1]);
-
-      if (opponent) {
-        opponents.add(opponent);
-      }
-    }
-  }
-
-  const slashMatches = normalized.match(
-    /\bpsg\s*\/\s*([a-z0-9àâäéèêëîïôöùûüç' .]+)/gi,
-  );
-
-  if (slashMatches) {
-    for (const match of slashMatches) {
-      const opponent = cleanOpponent(
-        match.replace(/^psg\s*\/\s*/i, ""),
+  for (
+    const pattern of patterns
+  ) {
+    const match =
+      normalized.match(
+        pattern,
       );
 
+    if (match?.[1]) {
+      const opponent =
+        cleanOpponent(
+          match[1],
+        );
+
       if (opponent) {
-        opponents.add(opponent);
+        opponents.add(
+          opponent,
+        );
       }
     }
   }
 
-  return [...opponents];
+  const slashMatches =
+    normalized.match(
+      /\bpsg\s*\/\s*([a-z0-9àâäéèêëîïôöùûüç' .]+)/gi,
+    );
+
+  if (slashMatches) {
+    for (
+      const match of
+        slashMatches
+    ) {
+      const opponent =
+        cleanOpponent(
+          match.replace(
+            /^psg\s*\/\s*/i,
+            "",
+          ),
+        );
+
+      if (opponent) {
+        opponents.add(
+          opponent,
+        );
+      }
+    }
+  }
+
+  return [
+    ...opponents,
+  ];
 }
 
 function extractOpponent(
   title: string,
 ): string {
-  return extractAllOpponents(title)[0] || "";
+  return (
+    extractAllOpponents(
+      title,
+    )[0] || ""
+  );
 }
 
 function cleanOpponent(
   value: string,
 ): string {
-  let opponent = value
-    .replace(
-      /\b(à quelle heure|sur quelle chaîne|quelle chaîne|voir le match|match|direct|live|pronostics|pronostic|compositions?|composition|les notes|notes|pour|face à|contre|avant|apres|après|et|du|de|la|le|un|une|en|ligue|champions|league|football)\b.*$/i,
-      "",
-    )
-    .trim();
+  let opponent =
+    value
+      .replace(
+        /\b(à quelle heure|sur quelle chaîne|quelle chaîne|voir le match|match|direct|live|pronostics|pronostic|compositions?|composition|les notes|notes|pour|face à|contre|avant|apres|après|et|du|de|la|le|un|une|en|ligue|champions|league|football)\b.*$/i,
+        "",
+      )
+      .trim();
 
-  opponent = opponent
-    .replace(/[?!:;,.\-–—]+$/g, "")
-    .trim();
+  opponent =
+    opponent
+      .replace(
+        /[?!:;,.\-–—]+$/g,
+        "",
+      )
+      .trim();
 
-  return opponent.length >= 3 ? opponent : "";
+  return opponent.length >= 3
+    ? opponent
+    : "";
 }
 
 function extractEvent(
   title: string,
 ): string {
-  const normalized = normalizeForComparison(title);
+  const normalized =
+    normalizeForComparison(
+      title,
+    );
 
   if (
-    normalized.includes("composition") ||
-    normalized.includes("compose") ||
-    normalized.includes("compositions")
+    normalized.includes(
+      "composition",
+    ) ||
+    normalized.includes(
+      "compose",
+    ) ||
+    normalized.includes(
+      "compositions",
+    )
   ) {
     return "composition";
   }
 
   if (
-    normalized.includes("absent") ||
-    normalized.includes("forfait") ||
-    normalized.includes("blessure") ||
-    normalized.includes("blesse")
+    normalized.includes(
+      "absent",
+    ) ||
+    normalized.includes(
+      "forfait",
+    ) ||
+    normalized.includes(
+      "blessure",
+    ) ||
+    normalized.includes(
+      "blesse",
+    )
   ) {
     return "absence";
   }
 
   if (
-    normalized.includes("arbitre")
+    normalized.includes(
+      "arbitre",
+    )
   ) {
     return "arbitre";
   }
 
   if (
-    normalized.includes("heure") ||
-    normalized.includes("chaine") ||
-    normalized.includes("tv") ||
-    normalized.includes("diffusion")
+    normalized.includes(
+      "heure",
+    ) ||
+    normalized.includes(
+      "chaine",
+    ) ||
+    normalized.includes(
+      "tv",
+    ) ||
+    normalized.includes(
+      "diffusion",
+    )
   ) {
     return "diffusion";
   }
 
   if (
-    normalized.includes("maillot") ||
-    normalized.includes("equipement")
+    normalized.includes(
+      "maillot",
+    ) ||
+    normalized.includes(
+      "equipement",
+    )
   ) {
     return "maillot";
   }
 
   if (
-    normalized.includes("parc des princes") ||
-    normalized.includes("travaux")
+    normalized.includes(
+      "parc des princes",
+    ) ||
+    normalized.includes(
+      "travaux",
+    )
   ) {
     return "stade";
   }
 
   if (
-    normalized.includes("podcast")
+    normalized.includes(
+      "podcast",
+    )
   ) {
     return "podcast";
   }
 
   if (
-    normalized.includes("conference") ||
-    normalized.includes("presse")
+    normalized.includes(
+      "conference",
+    ) ||
+    normalized.includes(
+      "presse",
+    )
   ) {
     return "conference";
   }
@@ -1437,19 +1877,39 @@ function extractEvent(
 function deduplicateItems(
   items: RSSItem[],
 ): RSSItem[] {
-  const result: RSSItem[] = [];
-  const seenUrls = new Set<string>();
-  const seenTitles = new Set<string>();
+  const result: RSSItem[] =
+    [];
 
-  for (const item of items) {
-    const url = normalizeUrl(item.link);
-    const title = normalizeForComparison(item.title);
+  const seenUrls =
+    new Set<string>();
 
-    if (url && seenUrls.has(url)) {
+  const seenTitles =
+    new Set<string>();
+
+  for (
+    const item of items
+  ) {
+    const url =
+      normalizeUrl(
+        item.link,
+      );
+
+    const title =
+      normalizeForComparison(
+        item.title,
+      );
+
+    if (
+      url &&
+      seenUrls.has(url)
+    ) {
       continue;
     }
 
-    if (title && seenTitles.has(title)) {
+    if (
+      title &&
+      seenTitles.has(title)
+    ) {
       continue;
     }
 
@@ -1458,7 +1918,9 @@ function deduplicateItems(
     }
 
     if (title) {
-      seenTitles.add(title);
+      seenTitles.add(
+        title,
+      );
     }
 
     result.push(item);
@@ -1476,26 +1938,42 @@ function isAlreadyStored(
     slug: string;
   }>,
 ): boolean {
-  const itemUrl = normalizeUrl(item.link);
-  const itemTitle = normalizeForComparison(item.title);
+  const itemUrl =
+    normalizeUrl(
+      item.link,
+    );
 
-  for (const article of recentArticles) {
+  const itemTitle =
+    normalizeForComparison(
+      item.title,
+    );
+
+  for (
+    const article of
+      recentArticles
+  ) {
     if (
       itemUrl &&
       article.sourceUrl &&
-      normalizeUrl(article.sourceUrl) === itemUrl
+      normalizeUrl(
+        article.sourceUrl,
+      ) === itemUrl
     ) {
       return true;
     }
 
-    const storedTitle = normalizeForComparison(
-      article.title,
-    );
+    const storedTitle =
+      normalizeForComparison(
+        article.title,
+      );
 
     if (
       itemTitle &&
       storedTitle &&
-      titleSimilarity(itemTitle, storedTitle) >= 0.82
+      titleSimilarity(
+        itemTitle,
+        storedTitle,
+      ) >= 0.82
     ) {
       return true;
     }
@@ -1508,19 +1986,29 @@ function recentTitleDuplicate(
   title: string,
   clusterItems: RSSItem[],
 ): boolean {
-  const normalizedTitle = normalizeForComparison(title);
+  const normalizedTitle =
+    normalizeForComparison(
+      title,
+    );
 
   if (!normalizedTitle) {
     return true;
   }
 
-  for (const item of clusterItems) {
-    const sourceTitle = normalizeForComparison(
-      item.title,
-    );
+  for (
+    const item of
+      clusterItems
+  ) {
+    const sourceTitle =
+      normalizeForComparison(
+        item.title,
+      );
 
     if (
-      titleSimilarity(normalizedTitle, sourceTitle) >= 0.95
+      titleSimilarity(
+        normalizedTitle,
+        sourceTitle,
+      ) >= 0.95
     ) {
       return false;
     }
@@ -1532,86 +2020,271 @@ function recentTitleDuplicate(
 function isRelevantPSG(
   item: RSSItem,
 ): boolean {
-  const text = normalizeForComparison(
-    `${item.title} ${item.contentSnippet || ""} ${
-      item.content || ""
-    }`,
-  );
+  const text =
+    normalizeForComparison(
+      `${item.title} ${
+        item.contentSnippet ||
+        ""
+      } ${
+        item.content || ""
+      }`,
+    );
 
   const hasPSG =
     text.includes("psg") ||
-    text.includes("paris saint-germain") ||
-    text.includes("paris saint germain");
+    text.includes(
+      "paris saint-germain",
+    ) ||
+    text.includes(
+      "paris saint germain",
+    );
 
   return hasPSG;
 }
 
+/**
+ * Parse RSS/Atom XML nativement.
+ *
+ * Aucun package externe nécessaire.
+ */
 async function parseRSS(
   feed: {
     name: string;
     url: string;
   },
 ): Promise<RSSItem[]> {
-  const controller = new AbortController();
-
-  const timeout = setTimeout(
-    () => controller.abort(),
-    RSS_TIMEOUT_MS,
-  );
-
-  try {
-    const response = await fetchWithTimeout(
+  const xml =
+    await fetchRSSXml(
       feed.url,
+    );
+
+  const items: RSSItem[] =
+    [];
+
+  const rssItemMatches = [
+    ...xml.matchAll(
+      /<item\b[^>]*>([\s\S]*?)<\/item>/gi,
+    ),
+  ];
+
+  /*
+   * Si le flux est Atom plutôt que RSS,
+   * on utilise <entry>.
+   */
+  const atomEntryMatches =
+    rssItemMatches.length ===
+    0
+      ? [
+          ...xml.matchAll(
+            /<entry\b[^>]*>([\s\S]*?)<\/entry>/gi,
+          ),
+        ]
+      : [];
+
+  const blocks =
+    rssItemMatches.length >
+    0
+      ? rssItemMatches.map(
+          (match) =>
+            match[1],
+        )
+      : atomEntryMatches.map(
+          (match) =>
+            match[1],
+        );
+
+  for (
+    const block of blocks
+      .slice(
+        0,
+        MAX_ITEMS_PER_SOURCE,
+      )
+  ) {
+    const title =
+      extractXMLTag(
+        block,
+        "title",
+      );
+
+    let link =
+      extractXMLTag(
+        block,
+        "link",
+      );
+
+    /*
+     * Atom utilise souvent :
+     * <link href="..." />
+     */
+    if (!link) {
+      const atomLink =
+        block.match(
+          /<link\b[^>]*href=["']([^"']+)["'][^>]*\/?>/i,
+        );
+
+      if (atomLink?.[1]) {
+        link = atomLink[1];
+      }
+    }
+
+    /*
+     * Certains flux utilisent guid
+     * comme URL lorsque link est absent.
+     */
+    if (!link) {
+      link =
+        extractXMLTag(
+          block,
+          "guid",
+        );
+    }
+
+    if (!title || !link) {
+      continue;
+    }
+
+    const description =
+      extractXMLTag(
+        block,
+        "description",
+      );
+
+    const contentEncoded =
+      extractXMLTag(
+        block,
+        "content:encoded",
+      );
+
+    const summary =
+      extractXMLTag(
+        block,
+        "summary",
+      );
+
+    const content =
+      contentEncoded ||
+      description ||
+      summary ||
+      "";
+
+    const pubDate =
+      extractXMLTag(
+        block,
+        "pubDate",
+      ) ||
+      extractXMLTag(
+        block,
+        "published",
+      ) ||
+      extractXMLTag(
+        block,
+        "updated",
+      ) ||
+      undefined;
+
+    const cleanedLink =
+      decodeXmlText(
+        link,
+      ).trim();
+
+    items.push({
+      title:
+        decodeXmlText(
+          title,
+        ).trim(),
+      link: cleanedLink,
+      pubDate: pubDate
+        ? decodeXmlText(
+            pubDate,
+          ).trim()
+        : undefined,
+      content:
+        decodeXmlText(
+          content,
+        ),
+      contentSnippet:
+        cleanText(
+          content,
+        ),
+      source:
+        feed.name,
+    });
+  }
+
+  return items;
+}
+
+async function fetchRSSXml(
+  url: string,
+): Promise<string> {
+  const response =
+    await fetchWithTimeout(
+      url,
       RSS_TIMEOUT_MS,
     );
 
-    if (!response.ok) {
-      throw new Error(
-        `HTTP ${response.status} ${response.statusText}`,
-      );
-    }
-
-    const xml = await response.text();
-
-    const items: RSSItem[] = [];
-
-    const rssItems =
-      await parser.parseString(xml);
-
-    for (const item of rssItems.items.slice(
-      0,
-      MAX_ITEMS_PER_SOURCE,
-    )) {
-      if (!item.title || !item.link) {
-        continue;
-      }
-
-      items.push({
-        title: item.title,
-        link: item.link,
-        pubDate: item.pubDate,
-        content: item.content,
-        contentSnippet: item.contentSnippet,
-        source: feed.name,
-      });
-    }
-
-    return items;
-  } finally {
-    clearTimeout(timeout);
+  if (!response.ok) {
+    throw new Error(
+      `HTTP ${response.status} ${response.statusText}`,
+    );
   }
+
+  return response.text();
 }
 
 function extractXMLTag(
   xml: string,
   tag: string,
 ): string {
-  const regex = new RegExp(
-    `<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`,
-    "i",
-  );
+  const escapedTag =
+    tag.replace(
+      /[.*+?^${}()|[\]\\]/g,
+      "\\$&",
+    );
 
-  return regex.exec(xml)?.[1] || "";
+  const regex =
+    new RegExp(
+      `<${escapedTag}\\b[^>]*>([\\s\\S]*?)<\\/${escapedTag}>`,
+      "i",
+    );
+
+  const match =
+    regex.exec(xml);
+
+  if (!match?.[1]) {
+    return "";
+  }
+
+  return match[1]
+    .replace(
+      /^<!\[CDATA\[/i,
+      "",
+    )
+    .replace(
+      /\]\]>$/i,
+      "",
+    )
+    .trim();
+}
+
+function decodeXmlText(
+  text: string,
+): string {
+  if (!text) {
+    return "";
+  }
+
+  return decodeHtmlEntities(
+    text
+      .replace(
+        /^<!\[CDATA\[/i,
+        "",
+      )
+      .replace(
+        /\]\]>$/i,
+        "",
+      ),
+  );
 }
 
 function extractPageText(
@@ -1619,33 +2292,46 @@ function extractPageText(
 ): string {
   let text = html;
 
-  text = text.replace(
-    /<script[\s\S]*?<\/script>/gi,
-    " ",
+  text =
+    text.replace(
+      /<script[\s\S]*?<\/script>/gi,
+      " ",
+    );
+
+  text =
+    text.replace(
+      /<style[\s\S]*?<\/style>/gi,
+      " ",
+    );
+
+  text =
+    text.replace(
+      /<noscript[\s\S]*?<\/noscript>/gi,
+      " ",
+    );
+
+  text =
+    text.replace(
+      /<svg[\s\S]*?<\/svg>/gi,
+      " ",
+    );
+
+  text = stripHtml(
+    text,
   );
 
-  text = text.replace(
-    /<style[\s\S]*?<\/style>/gi,
-    " ",
-  );
+  text =
+    decodeHtmlEntities(
+      text,
+    );
 
-  text = text.replace(
-    /<noscript[\s\S]*?<\/noscript>/gi,
-    " ",
-  );
-
-  text = text.replace(
-    /<svg[\s\S]*?<\/svg>/gi,
-    " ",
-  );
-
-  text = stripHtml(text);
-
-  text = decodeHtmlEntities(text);
-
-  text = text
-    .replace(/\s+/g, " ")
-    .trim();
+  text =
+    text
+      .replace(
+        /\s+/g,
+        " ",
+      )
+      .trim();
 
   return text;
 }
@@ -1656,24 +2342,40 @@ function clusterPriority(
 ): number {
   const priorityA =
     Math.max(
-      ...a.items.map((item) => sourcePriority(item)),
+      ...a.items.map(
+        (item) =>
+          sourcePriority(
+            item,
+          ),
+      ),
     ) +
     a.items.length * 10;
 
   const priorityB =
     Math.max(
-      ...b.items.map((item) => sourcePriority(item)),
+      ...b.items.map(
+        (item) =>
+          sourcePriority(
+            item,
+          ),
+      ),
     ) +
     b.items.length * 10;
 
-  return priorityB - priorityA;
+  return (
+    priorityB -
+    priorityA
+  );
 }
 
 function sourcePriority(
-  itemOrSource: RSSItem | string,
+  itemOrSource:
+    | RSSItem
+    | string,
 ): number {
   const source =
-    typeof itemOrSource === "string"
+    typeof itemOrSource ===
+    "string"
       ? itemOrSource
       : itemOrSource.source;
 
@@ -1707,51 +2409,53 @@ function sourcePriority(
 function meaningfulTokens(
   text: string,
 ): string[] {
-  const stopWords = new Set([
-    "avec",
-    "pour",
-    "dans",
-    "sur",
-    "une",
-    "des",
-    "les",
-    "aux",
-    "est",
-    "par",
-    "pas",
-    "plus",
-    "apres",
-    "avant",
-    "entre",
-    "face",
-    "contre",
-    "match",
-    "psg",
-    "paris",
-    "saint",
-    "germain",
-    "football",
-    "club",
-    "cette",
-    "cette",
-    "sont",
-    "sera",
-    "etre",
-    "être",
-    "qui",
-    "que",
-    "du",
-    "de",
-    "la",
-    "le",
-    "et",
-    "en",
-    "au",
-    "un",
-    "a",
-  ]);
+  const stopWords =
+    new Set([
+      "avec",
+      "pour",
+      "dans",
+      "sur",
+      "une",
+      "des",
+      "les",
+      "aux",
+      "est",
+      "par",
+      "pas",
+      "plus",
+      "apres",
+      "avant",
+      "entre",
+      "face",
+      "contre",
+      "match",
+      "psg",
+      "paris",
+      "saint",
+      "germain",
+      "football",
+      "club",
+      "cette",
+      "sont",
+      "sera",
+      "etre",
+      "être",
+      "qui",
+      "que",
+      "du",
+      "de",
+      "la",
+      "le",
+      "et",
+      "en",
+      "au",
+      "un",
+      "a",
+    ]);
 
-  return normalizeForComparison(text)
+  return normalizeForComparison(
+    text,
+  )
     .split(/\s+/)
     .filter(
       (token) =>
@@ -1772,22 +2476,31 @@ function titleSimilarity(
     return 1;
   }
 
-  const tokensA = new Set(
-    meaningfulTokens(a),
-  );
+  const tokensA =
+    new Set(
+      meaningfulTokens(a),
+    );
 
-  const tokensB = new Set(
-    meaningfulTokens(b),
-  );
+  const tokensB =
+    new Set(
+      meaningfulTokens(b),
+    );
 
-  if (!tokensA.size || !tokensB.size) {
+  if (
+    !tokensA.size ||
+    !tokensB.size
+  ) {
     return 0;
   }
 
   let intersection = 0;
 
-  for (const token of tokensA) {
-    if (tokensB.has(token)) {
+  for (
+    const token of tokensA
+  ) {
+    if (
+      tokensB.has(token)
+    ) {
       intersection++;
     }
   }
@@ -1811,37 +2524,68 @@ function normalizeForComparison(
   )
     .toLowerCase()
     .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/œ/g, "oe")
-    .replace(/æ/g, "ae")
-    .replace(/[^\p{L}\p{N}\s]/gu, " ")
-    .replace(/\s+/g, " ")
+    .replace(
+      /[\u0300-\u036f]/g,
+      "",
+    )
+    .replace(
+      /œ/g,
+      "oe",
+    )
+    .replace(
+      /æ/g,
+      "ae",
+    )
+    .replace(
+      /[^\p{L}\p{N}\s]/gu,
+      " ",
+    )
+    .replace(
+      /\s+/g,
+      " ",
+    )
     .trim();
 }
 
 function normalizeUrl(
-  url: string | null | undefined,
+  url:
+    | string
+    | null
+    | undefined,
 ): string {
   if (!url) {
     return "";
   }
 
   return cleanUrl(url)
-    .replace(/^https?:\/\//i, "")
-    .replace(/^www\./i, "")
-    .replace(/\/+$/, "")
+    .replace(
+      /^https?:\/\//i,
+      "",
+    )
+    .replace(
+      /^www\./i,
+      "",
+    )
+    .replace(
+      /\/+$/,
+      "",
+    )
     .toLowerCase();
 }
 
 function cleanUrl(
-  url: string | null | undefined,
+  url:
+    | string
+    | null
+    | undefined,
 ): string {
   if (!url) {
     return "";
   }
 
   try {
-    const parsed = new URL(url);
+    const parsed =
+      new URL(url);
 
     const trackingParams = [
       "utm_source",
@@ -1855,8 +2599,13 @@ function cleanUrl(
       "mc_eid",
     ];
 
-    for (const param of trackingParams) {
-      parsed.searchParams.delete(param);
+    for (
+      const param of
+        trackingParams
+    ) {
+      parsed.searchParams.delete(
+        param,
+      );
     }
 
     return parsed.toString();
@@ -1866,7 +2615,10 @@ function cleanUrl(
 }
 
 function cleanText(
-  text: string | null | undefined,
+  text:
+    | string
+    | null
+    | undefined,
 ): string {
   if (!text) {
     return "";
@@ -1875,8 +2627,14 @@ function cleanText(
   return decodeHtmlEntities(
     stripHtml(text),
   )
-    .replace(/\u00a0/g, " ")
-    .replace(/\s+/g, " ")
+    .replace(
+      /\u00a0/g,
+      " ",
+    )
+    .replace(
+      /\s+/g,
+      " ",
+    )
     .trim();
 }
 
@@ -1889,34 +2647,54 @@ function cleanArticleContent(
 
   let cleaned = content;
 
-  cleaned = cleaned.replace(
-    /```(?:html|markdown|text)?/gi,
-    "",
-  );
+  cleaned =
+    cleaned.replace(
+      /```(?:html|markdown|text)?/gi,
+      "",
+    );
 
-  cleaned = cleaned.replace(
-    /```/g,
-    "",
-  );
+  cleaned =
+    cleaned.replace(
+      /```/g,
+      "",
+    );
 
-  cleaned = cleaned.replace(
-    /^\s*(article|contenu)\s*:\s*/i,
-    "",
-  );
+  cleaned =
+    cleaned.replace(
+      /^\s*(article|contenu)\s*:\s*/i,
+      "",
+    );
 
-  cleaned = stripHtml(cleaned);
+  cleaned =
+    stripHtml(
+      cleaned,
+    );
 
-  cleaned = decodeHtmlEntities(cleaned);
+  cleaned =
+    decodeHtmlEntities(
+      cleaned,
+    );
 
-  cleaned = cleaned
-    .replace(/\r\n/g, "\n")
-    .replace(/\r/g, "\n");
+  cleaned =
+    cleaned
+      .replace(
+        /\r\n/g,
+        "\n",
+      )
+      .replace(
+        /\r/g,
+        "\n",
+      );
 
-  cleaned = cleaned
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .join("\n\n");
+  cleaned =
+    cleaned
+      .split("\n")
+      .map(
+        (line) =>
+          line.trim(),
+      )
+      .filter(Boolean)
+      .join("\n\n");
 
   return cleaned.trim();
 }
@@ -1925,34 +2703,75 @@ function stripHtml(
   html: string,
 ): string {
   return html
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<\/p>/gi, "\n\n")
-    .replace(/<\/div>/gi, "\n")
-    .replace(/<\/li>/gi, "\n")
-    .replace(/<[^>]+>/g, " ");
+    .replace(
+      /<br\s*\/?>/gi,
+      "\n",
+    )
+    .replace(
+      /<\/p>/gi,
+      "\n\n",
+    )
+    .replace(
+      /<\/div>/gi,
+      "\n",
+    )
+    .replace(
+      /<\/li>/gi,
+      "\n",
+    )
+    .replace(
+      /<[^>]+>/g,
+      " ",
+    );
 }
 
 function decodeHtmlEntities(
   text: string,
 ): string {
   return text
-    .replace(/&nbsp;/gi, " ")
-    .replace(/&amp;/gi, "&")
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;/gi, "'")
-    .replace(/&apos;/gi, "'")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">")
-    .replace(/&#(\d+);/g, (_, code) =>
-      String.fromCharCode(
-        Number(code),
-      ),
+    .replace(
+      /&nbsp;/gi,
+      " ",
+    )
+    .replace(
+      /&amp;/gi,
+      "&",
+    )
+    .replace(
+      /&quot;/gi,
+      '"',
+    )
+    .replace(
+      /&#39;/gi,
+      "'",
+    )
+    .replace(
+      /&apos;/gi,
+      "'",
+    )
+    .replace(
+      /&lt;/gi,
+      "<",
+    )
+    .replace(
+      /&gt;/gi,
+      ">",
+    )
+    .replace(
+      /&#(\d+);/g,
+      (_, code) =>
+        String.fromCharCode(
+          Number(code),
+        ),
     )
     .replace(
       /&#x([0-9a-f]+);/gi,
       (_, code) =>
         String.fromCharCode(
-          parseInt(code, 16),
+          parseInt(
+            code,
+            16,
+          ),
         ),
     );
 }
@@ -1972,19 +2791,23 @@ function countWords(
 }
 
 async function getArticlesCreatedToday(): Promise<number> {
-  const startOfToday = getStartOfToday();
+  const startOfToday =
+    getStartOfToday();
 
-  return prisma.article.count({
-    where: {
-      createdAt: {
-        gte: startOfToday,
+  return prisma.article.count(
+    {
+      where: {
+        createdAt: {
+          gte: startOfToday,
+        },
       },
     },
-  });
+  );
 }
 
 function getStartOfToday(): Date {
-  const now = new Date();
+  const now =
+    new Date();
 
   return new Date(
     now.getFullYear(),
@@ -1997,14 +2820,63 @@ function getStartOfToday(): Date {
   );
 }
 
+/**
+ * Génération locale du slug.
+ *
+ * Remplace complètement slugify.
+ */
+function createBaseSlug(
+  title: string,
+): string {
+  let slug =
+    cleanText(title)
+      .toLowerCase()
+      .normalize("NFD")
+      .replace(
+        /[\u0300-\u036f]/g,
+        "",
+      )
+      .replace(
+        /œ/g,
+        "oe",
+      )
+      .replace(
+        /æ/g,
+        "ae",
+      )
+      .replace(
+        /&/g,
+        " et ",
+      )
+      .replace(
+        /[^a-z0-9]+/g,
+        "-",
+      )
+      .replace(
+        /^-+|-+$/g,
+        "",
+      )
+      .replace(
+        /-{2,}/g,
+        "-",
+      );
+
+  /*
+   * Évite un slug vide dans les cas
+   * très particuliers.
+   */
+  if (!slug) {
+    slug = "article-psg";
+  }
+
+  return slug;
+}
+
 async function makeUniqueSlug(
   title: string,
 ): Promise<string> {
-  const baseSlug = slugify(title, {
-    lower: true,
-    strict: true,
-    trim: true,
-  });
+  const baseSlug =
+    createBaseSlug(title);
 
   if (!baseSlug) {
     throw new Error(
@@ -2012,18 +2884,23 @@ async function makeUniqueSlug(
     );
   }
 
-  let slug = baseSlug;
+  let slug =
+    baseSlug;
+
   let counter = 1;
 
   while (true) {
-    const existing = await prisma.article.findUnique({
-      where: {
-        slug,
-      },
-      select: {
-        id: true,
-      },
-    });
+    const existing =
+      await prisma.article.findUnique(
+        {
+          where: {
+            slug,
+          },
+          select: {
+            id: true,
+          },
+        },
+      );
 
     if (!existing) {
       return slug;
@@ -2031,15 +2908,21 @@ async function makeUniqueSlug(
 
     counter++;
 
-    slug = `${baseSlug}-${counter}`;
+    slug =
+      `${baseSlug}-${counter}`;
   }
 }
 
 function getErrorMessage(
   error: unknown,
 ): string {
-  if (error instanceof Error) {
-    if (error.name === "AbortError") {
+  if (
+    error instanceof Error
+  ) {
+    if (
+      error.name ===
+      "AbortError"
+    ) {
       return "Timeout";
     }
 
@@ -2053,22 +2936,35 @@ async function fetchWithTimeout(
   url: string,
   timeoutMs: number,
 ): Promise<Response> {
-  const controller = new AbortController();
+  const controller =
+    new AbortController();
 
-  const timeout = setTimeout(
-    () => controller.abort(),
-    timeoutMs,
-  );
+  const timeout =
+    setTimeout(
+      () =>
+        controller.abort(),
+      timeoutMs,
+    );
 
   try {
-    return await fetch(url, {
-      signal: controller.signal,
-      headers: {
-        "User-Agent": "PSG-Direct/1.0",
+    return await fetch(
+      url,
+      {
+        signal:
+          controller.signal,
+        headers: {
+          "User-Agent":
+            "PSG-Direct/1.0",
+          Accept:
+            "application/rss+xml, application/atom+xml, application/xml, text/xml, text/html;q=0.9, */*;q=0.8",
+        },
+        cache:
+          "no-store",
       },
-      cache: "no-store",
-    });
+    );
   } finally {
-    clearTimeout(timeout);
+    clearTimeout(
+      timeout,
+    );
   }
 }
