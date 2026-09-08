@@ -33,7 +33,6 @@ const MAX_CLUSTERS_TO_PROCESS = 1;
 
 const RSS_TIMEOUT_MS = 4000;
 const SOURCE_PAGE_TIMEOUT_MS = 2000;
-
 const MAX_SOURCE_PAGES = 3;
 const MAX_SOURCE_TEXT_LENGTH = 6000;
 
@@ -41,58 +40,41 @@ const MIN_ARTICLE_WORDS = 400;
 const MAX_ARTICLE_WORDS = 900;
 
 type FeedItem = {
-  source: string;
-  priority: number;
   title: string;
   description: string;
-  url: string;
-  publishedAt: string | null;
+  link: string;
+  publishedAt: Date;
+  source: string;
+  priority: number;
 };
 
 type EnrichedSource = {
-  item: FeedItem;
-  pageTitle: string;
-  pageDescription: string;
-  pageText: string;
-  pageFetched: boolean;
-  error?: string;
-};
-
-type ArticleResult = {
   title: string;
-  excerpt: string;
-  content: string;
+  source: string;
+  url: string;
+  publishedAt: string;
+  description: string;
+  pageText: string;
 };
 
 type GeminiResponse = {
-  candidates?: Array<{
-    finishReason?: string;
-    content?: {
-      parts?: Array<{
-        text?: string;
-      }>;
-    };
-  }>;
+  title?: unknown;
+  excerpt?: unknown;
+  content?: unknown;
 };
 
 type GenerationSuccess = {
   ok: true;
-  article: ArticleResult;
+  result: {
+    title: string;
+    excerpt: string;
+    content: string;
+  };
 };
 
 type GenerationFailure = {
   ok: false;
-  outcome: string;
   error: string;
-};
-
-type GenerationResult =
-  | GenerationSuccess
-  | GenerationFailure;
-
-type GeminiModel = {
-  name: string;
-  timeout: number;
 };
 
 type Diagnostic = {
@@ -103,587 +85,319 @@ type Diagnostic = {
   detail?: string;
 };
 
+type StorySignals = {
+  eventType: string;
+  people: string[];
+  opponents: string[];
+  competitions: string[];
+  specificTokens: string[];
+};
+
 export async function GET(req: NextRequest) {
+  const startedAt = Date.now();
+
   try {
-    const secret = req.nextUrl.searchParams.get("secret");
+    const { searchParams } = new URL(req.url);
+    const secret = searchParams.get("secret");
 
-    if (!CRON_SECRET) {
+    if (!CRON_SECRET || secret !== CRON_SECRET) {
       return NextResponse.json(
-        {
-          error:
-            "CRON_SECRET n'est pas configuré sur Vercel",
-        },
-        { status: 500 }
-      );
-    }
-
-    if (secret !== CRON_SECRET) {
-      return NextResponse.json(
-        {
-          error: "non autorisé",
-        },
+        { error: "Unauthorized" },
         { status: 401 }
       );
     }
 
     if (!GEMINI_API_KEY) {
       return NextResponse.json(
-        {
-          error:
-            "GEMINI_API_KEY n'est pas configurée sur Vercel",
-        },
+        { error: "GEMINI_API_KEY manquante" },
         { status: 500 }
       );
     }
 
-    const sources = RSS_FEEDS.map(
-      (feed) => feed.name
-    );
-
-    const sourcesOk: string[] = [];
-    const rssErrors: string[] = [];
-
     const rssResults = await Promise.allSettled(
-      RSS_FEEDS.map(async (feed) => {
-        const controller = new AbortController();
-
-        const timeout = setTimeout(
-          () => controller.abort(),
-          RSS_TIMEOUT_MS
-        );
-
-        try {
-          const response = await fetch(
-            feed.url,
-            {
-              headers: {
-                Accept:
-                  "application/rss+xml, application/xml, text/xml",
-                "User-Agent":
-                  "PSG-Direct/1.0",
-              },
-              cache: "no-store",
-              signal: controller.signal,
-            }
-          );
-
-          if (!response.ok) {
-            throw new Error(
-              `HTTP ${response.status} ${response.statusText}`
-            );
-          }
-
-          const xml = await response.text();
-
-          return {
-            feed,
-            items: parseRSS(xml),
-          };
-        } finally {
-          clearTimeout(timeout);
-        }
-      })
+      RSS_FEEDS.map((feed) => fetchRSS(feed))
     );
 
     const allItems: FeedItem[] = [];
+    const sourcesOk: string[] = [];
+    const rssErrors: string[] = [];
 
     for (const result of rssResults) {
-      if (result.status === "rejected") {
-        rssErrors.push(
-          (
-            result.reason instanceof Error
-              ? result.reason.message
-              : String(result.reason)
-          ).slice(0, 250)
-        );
+      if (result.status === "fulfilled") {
+        const { feedName, items } = result.value;
 
-        continue;
-      }
-
-      const {
-        feed,
-        items,
-      } = result.value;
-
-      if (items.length > 0) {
-        sourcesOk.push(feed.name);
-      }
-
-      const limitedItems = [...items]
-        .sort(
-          (a, b) =>
-            dateValue(b.publishedAt) -
-            dateValue(a.publishedAt)
-        )
-        .slice(
-          0,
-          MAX_ITEMS_PER_SOURCE
-        );
-
-      for (const item of limitedItems) {
-        const title = cleanText(item.title);
-        const description = cleanText(
-          item.description
-        );
-
-        if (
-          !title ||
-          !item.url ||
-          !isRelevantToPSG(
-            title,
-            description
-          )
-        ) {
-          continue;
+        if (items.length > 0) {
+          sourcesOk.push(feedName);
+          allItems.push(...items);
         }
-
-        allItems.push({
-          source: feed.name,
-          priority: feed.priority,
-          title,
-          description,
-          url: item.url,
-          publishedAt:
-            item.publishedAt,
-        });
+      } else {
+        rssErrors.push(
+          result.reason instanceof Error
+            ? result.reason.message
+            : String(result.reason)
+        );
       }
     }
 
-    const uniqueItems =
-      deduplicateByUrl(allItems);
-
-    const clusters =
-      buildClusters(uniqueItems);
-
-    const recentArticles =
-      await prisma.article.findMany({
-        orderBy: {
-          createdAt: "desc",
-        },
-        take: 100,
-        select: {
-          title: true,
-          sourceUrl: true,
-        },
-      });
-
-    const existingSourceUrls =
-      new Set(
-        recentArticles
-          .map(
-            (article) =>
-              article.sourceUrl
-          )
-          .filter(
-            (
-              url
-            ): url is string =>
-              typeof url ===
-                "string" &&
-              url.length > 0
-          )
-          .map(normalizeUrl)
+    const filteredItems = allItems
+      .filter(isRelevantPSGItem)
+      .sort(
+        (a, b) =>
+          b.publishedAt.getTime() - a.publishedAt.getTime()
       );
+
+    const uniqueItems = dedupeFeedItems(filteredItems);
+
+    const clusters = buildClusters(uniqueItems);
+
+    const recentArticles = await prisma.article.findMany({
+      orderBy: {
+        createdAt: "desc",
+      },
+      take: 100,
+      select: {
+        title: true,
+        sourceUrl: true,
+        createdAt: true,
+      },
+    });
+
+    const candidateClusters = clusters.filter((cluster) => {
+      const hasExistingSource = cluster.some((item) =>
+        recentArticles.some(
+          (article) =>
+            article.sourceUrl &&
+            normalizeUrl(article.sourceUrl) === normalizeUrl(item.link)
+        )
+      );
+
+      if (hasExistingSource) {
+        return false;
+      }
+
+      const hasSimilarExistingArticle = cluster.some((item) =>
+        recentArticles.some((article) =>
+          titleSimilarity(item.title, article.title) >= 0.88
+        )
+      );
+
+      return !hasSimilarExistingArticle;
+    });
+
+    const clustersToProcess = candidateClusters
+      .sort((a, b) => {
+        const scoreA = clusterPriorityScore(a);
+        const scoreB = clusterPriorityScore(b);
+
+        if (scoreA !== scoreB) {
+          return scoreB - scoreA;
+        }
+
+        return (
+          b[0].publishedAt.getTime() -
+          a[0].publishedAt.getTime()
+        );
+      })
+      .slice(0, MAX_CLUSTERS_TO_PROCESS);
+
+    const diagnostics: Diagnostic[] = [];
 
     let created = 0;
     let skipped = 0;
     let duplicates = 0;
-    let deferred = 0;
-
-    let geminiCalls = 0;
-    let geminiSuccess = 0;
-    let invalidJson = 0;
-    let tooShort = 0;
-    let slugErrors = 0;
-    let createErrors = 0;
 
     let sourcePagesFetched = 0;
     let sourcePagesFailed = 0;
     let enrichedCharacters = 0;
 
-    const geminiErrors: string[] = [];
     const sourcePageErrors: string[] = [];
 
-    const diagnostics: Diagnostic[] = [];
-
-    const candidateClusters =
-      clusters
-        .slice()
-        .sort(
-          (a, b) =>
-            getLatestDate(b) -
-            getLatestDate(a)
-        )
-        .filter((cluster) => {
-          if (
-            cluster.some((item) =>
-              existingSourceUrls.has(
-                normalizeUrl(item.url)
-              )
-            )
-          ) {
-            skipped++;
-            return false;
-          }
-
-          const representative =
-            [...cluster].sort(
-              (a, b) =>
-                a.priority - b.priority
-            )[0];
-
-          if (
-            recentArticles.some(
-              (article) =>
-                areSimilarTitles(
-                  article.title,
-                  representative.title
-                )
-            )
-          ) {
-            duplicates++;
-            return false;
-          }
-
-          return true;
-        });
-
-    deferred = Math.max(
-      0,
-      candidateClusters.length -
-        Math.min(
-          candidateClusters.length,
-          MAX_CLUSTERS_TO_PROCESS
-        )
-    );
-
-    const clustersToProcess =
-      candidateClusters.slice(
-        0,
-        MAX_CLUSTERS_TO_PROCESS
-      );
-
-    for (
-      let index = 0;
-      index < clustersToProcess.length;
-      index++
-    ) {
-      const cluster =
-        clustersToProcess[index];
-
-      if (
-        created >=
-        MAX_NEW_ARTICLES
-      ) {
-        deferred++;
-        continue;
+    for (let index = 0; index < clustersToProcess.length; index++) {
+      if (created >= MAX_NEW_ARTICLES) {
+        break;
       }
 
-      const orderedCluster =
-        [...cluster].sort(
-          (a, b) =>
-            a.priority - b.priority
-        );
+      const cluster = clustersToProcess[index];
 
-      const representative =
-        orderedCluster[0];
-
-      const diagnosticBase = {
+      const diagnostic: Diagnostic = {
         cluster: index + 1,
-        sources: [
-          ...new Set(
-            cluster.map(
-              (item) =>
-                item.source
-            )
-          ),
-        ],
+        sources: [...new Set(cluster.map((item) => item.source))],
         titles: cluster
-          .map(
-            (item) =>
-              item.title
-          )
-          .slice(0, 5),
+          .slice(0, 5)
+          .map((item) => item.title),
+        outcome: "processing",
       };
 
-      const enriched =
-        await enrichCluster(
+      try {
+        const enrichment = await enrichCluster(cluster);
+
+        sourcePagesFetched += enrichment.pagesFetched;
+        sourcePagesFailed += enrichment.pagesFailed;
+        enrichedCharacters += enrichment.characters;
+
+        sourcePageErrors.push(...enrichment.errors);
+
+        const generation = await generateArticle(
           cluster,
-          sourcePageErrors
+          enrichment.sources
         );
 
-      sourcePagesFetched +=
-        enriched.filter(
-          (source) =>
-            source.pageFetched
-        ).length;
-
-      sourcePagesFailed +=
-        enriched.filter(
-          (source) =>
-            !source.pageFetched
-        ).length;
-
-      enrichedCharacters +=
-        enriched.reduce(
-          (
-            sum,
-            source
-          ) =>
-            sum +
-            source.pageText.length,
-          0
-        );
-
-      geminiCalls++;
-
-      let generatedResult =
-        await generateArticle(
-          enriched
-        );
-
-      if (
-        generatedResult.ok &&
-        countWords(
-          generatedResult
-            .article
-            .content
-        ) < MIN_ARTICLE_WORDS
-      ) {
-        geminiCalls++;
-
-        const expandedResult =
-          await expandArticle(
-            enriched,
-            generatedResult.article
-          );
-
-        if (
-          expandedResult.ok === false
-        ) {
-          geminiErrors.push(
-            expandedResult.error
-          );
-
-          diagnostics.push({
-            ...diagnosticBase,
-            outcome:
-              expandedResult.outcome,
-            detail:
-              expandedResult.error,
-          });
-        } else {
-          generatedResult =
-            expandedResult;
-        }
-      }
-
-      if (
-        generatedResult.ok ===
-        false
-      ) {
-        deferred++;
-
-        geminiErrors.push(
-          generatedResult.error
-        );
-
-        if (
-          generatedResult.outcome.includes(
-            "invalid_json"
-          )
-        ) {
-          invalidJson++;
+        if (!generation.ok) {
+          diagnostic.outcome = "generation_error";
+          diagnostic.detail = generation.error;
+          diagnostics.push(diagnostic);
+          skipped++;
+          continue;
         }
 
-        diagnostics.push({
-          ...diagnosticBase,
-          outcome:
-            generatedResult.outcome,
-          detail:
-            generatedResult.error,
-        });
+        let article = generation.result;
 
-        continue;
-      }
+        let words = countWords(article.content);
 
-      geminiSuccess++;
+        if (words < MIN_ARTICLE_WORDS) {
+          const expanded = await expandArticle(
+            article,
+            cluster,
+            enrichment.sources
+          );
 
-      const generated =
-        generatedResult.article;
+          if (expanded.ok) {
+            article = expanded.result;
+            words = countWords(article.content);
+          }
+        }
 
-      const normalizedContent =
-        normalizeArticleStructure(
-          generated.content
+        if (words < MIN_ARTICLE_WORDS) {
+          diagnostic.outcome = "too_short";
+          diagnostic.detail =
+            `title=${article.title.length}, words=${words}, excerpt=${article.excerpt.length}`;
+
+          diagnostics.push(diagnostic);
+          skipped++;
+          continue;
+        }
+
+        if (words > MAX_ARTICLE_WORDS) {
+          article.content = trimArticleToWordLimit(
+            article.content,
+            MAX_ARTICLE_WORDS
+          );
+        }
+
+        article.content = normalizeArticleStructure(
+          article.content
         );
 
-      const wordCount =
-        countWords(
-          normalizedContent
-        );
+        article.excerpt = normalizeText(article.excerpt);
 
-      if (
-        generated.title.length < 20 ||
-        wordCount < MIN_ARTICLE_WORDS
-      ) {
-        tooShort++;
-        deferred++;
+        const slugBase = slugify(article.title);
+        const slug = await makeUniqueSlug(slugBase);
 
-        diagnostics.push({
-          ...diagnosticBase,
-          outcome:
-            "too_short",
-          detail:
-            `title=${generated.title.length}, words=${wordCount}, excerpt=${generated.excerpt.length}, enriched=${enrichedCharacters}`,
-        });
+        if (!slug) {
+          diagnostic.outcome = "slug_error";
+          diagnostic.detail = "Impossible de générer le slug.";
+          diagnostics.push(diagnostic);
+          skipped++;
+          continue;
+        }
 
-        continue;
-      }
+        const primarySource = [...cluster].sort(
+          (a, b) => b.priority - a.priority
+        )[0];
 
-      const finalContent =
-        normalizedContent;
-
-      const slug =
-        slugify(
-          generated.title
-        );
-
-      if (!slug) {
-        slugErrors++;
-        deferred++;
-
-        diagnostics.push({
-          ...diagnosticBase,
-          outcome:
-            "slug_error",
-          detail:
-            "Impossible de générer un slug",
-        });
-
-        continue;
-      }
-
-      const existingSlug =
-        await prisma.article.findUnique({
+        const existingBySource = await prisma.article.findFirst({
           where: {
-            slug,
+            sourceUrl: primarySource.link,
           },
           select: {
             id: true,
           },
         });
 
-      if (existingSlug) {
-        duplicates++;
-        deferred++;
+        if (existingBySource) {
+          diagnostic.outcome = "duplicate_source";
+          diagnostics.push(diagnostic);
+          duplicates++;
+          continue;
+        }
 
-        diagnostics.push({
-          ...diagnosticBase,
-          outcome:
-            "duplicate_slug",
-          detail:
-            `slug=${slug}`,
-        });
-
-        continue;
-      }
-
-      try {
         await prisma.article.create({
           data: {
-            title:
-              cleanText(
-                generated.title
-              ),
+            title: article.title,
             slug,
-            excerpt:
-              cleanText(
-                generated.excerpt
-              ),
-            content:
-              finalContent,
+            content: article.content,
+            excerpt: article.excerpt,
             club: "PSG",
             status: "DRAFT",
             isAiGenerated: true,
-            sourceUrl:
-              representative.url,
+            sourceUrl: primarySource.link,
           },
         });
 
         created++;
 
-        diagnostics.push({
-          ...diagnosticBase,
-          outcome:
-            "created",
-          detail:
-            `words=${wordCount}, sources=${cluster.length}, pages=${enriched.filter((source) => source.pageFetched).length}, chars=${enriched.reduce((sum, source) => sum + source.pageText.length, 0)}`,
-        });
-      } catch (error) {
-        createErrors++;
-        deferred++;
+        diagnostic.outcome = "created";
+        diagnostic.detail =
+          `words=${countWords(article.content)}, sources=${cluster.length}, pages=${enrichment.pagesFetched}, chars=${enrichment.characters}`;
 
-        const message =
+        diagnostics.push(diagnostic);
+      } catch (error) {
+        diagnostic.outcome = "error";
+        diagnostic.detail =
           error instanceof Error
             ? error.message
             : String(error);
 
-        diagnostics.push({
-          ...diagnosticBase,
-          outcome:
-            "create_error",
-          detail:
-            message.slice(0, 500),
-        });
+        diagnostics.push(diagnostic);
+        skipped++;
       }
     }
 
+    const elapsedMs = Date.now() - startedAt;
+
     return NextResponse.json({
-      checked:
-        RSS_FEEDS.reduce(
-          (total, _, index) => {
-            const result =
-              rssResults[index];
-
-            if (
-              result.status ===
-              "fulfilled"
-            ) {
-              return (
-                total +
-                result.value.items.length
-              );
-            }
-
-            return total;
-          },
-          0
-        ),
-      newItems:
-        uniqueItems.length,
-      clusters:
-        clusters.length,
-      candidateClusters:
-        candidateClusters.length,
-      processedClusters:
-        clustersToProcess.length,
-      deferred,
+      checked: allItems.length,
+      newItems: uniqueItems.length,
+      clusters: clusters.length,
+      candidateClusters: candidateClusters.length,
+      processedClusters: clustersToProcess.length,
+      deferred: Math.max(
+        0,
+        candidateClusters.length - clustersToProcess.length
+      ),
       created,
       skipped,
       duplicates,
       sourcesOk,
-      sources,
+      sources: RSS_FEEDS.map((feed) => feed.name),
       fusion: true,
       optimized: true,
       enrichment: true,
       diagnostics: {
-        geminiCalls,
-        geminiSuccess,
-        geminiErrors,
-        invalidJson,
-        tooShort,
-        slugErrors,
-        createErrors,
+        geminiCalls: diagnostics.filter(
+          (item) =>
+            item.outcome === "created" ||
+            item.outcome === "too_short" ||
+            item.outcome === "generation_error"
+        ).length,
+        geminiSuccess: diagnostics.filter(
+          (item) => item.outcome === "created"
+        ).length,
+        geminiErrors: diagnostics
+          .filter(
+            (item) => item.outcome === "generation_error"
+          )
+          .map((item) => item.detail || "Erreur Gemini"),
+        invalidJson: 0,
+        tooShort: diagnostics.filter(
+          (item) => item.outcome === "too_short"
+        ).length,
+        slugErrors: diagnostics.filter(
+          (item) => item.outcome === "slug_error"
+        ).length,
+        createErrors: diagnostics.filter(
+          (item) => item.outcome === "error"
+        ).length,
         rssErrors,
         sourcePagesFetched,
         sourcePagesFailed,
@@ -691,6 +405,7 @@ export async function GET(req: NextRequest) {
         sourcePageErrors,
         clusters: diagnostics,
       },
+      elapsedMs,
     });
   } catch (error) {
     return NextResponse.json(
@@ -705,123 +420,1084 @@ export async function GET(req: NextRequest) {
   }
 }
 
-async function enrichCluster(
-  cluster: FeedItem[],
-  errors: string[]
-): Promise<EnrichedSource[]> {
-  const ordered =
-    [...cluster]
-      .sort(
-        (a, b) =>
-          a.priority - b.priority
-      )
-      .slice(
-        0,
-        MAX_SOURCE_PAGES
+async function fetchRSS(feed: {
+  name: string;
+  url: string;
+  priority: number;
+}): Promise<{
+  feedName: string;
+  items: FeedItem[];
+}> {
+  const controller = new AbortController();
+
+  const timeout = setTimeout(() => {
+    controller.abort();
+  }, RSS_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(feed.url, {
+      headers: {
+        Accept:
+          "application/rss+xml, application/xml, text/xml, */*",
+        "User-Agent":
+          "PSGDirectBot/1.0 (+https://psg-direct-app-1ktj.vercel.app)",
+      },
+      cache: "no-store",
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      throw new Error(
+        `HTTP ${response.status} ${response.statusText}`
       );
-
-  const results =
-    await Promise.allSettled(
-      ordered.map(
-        async (item) => {
-          const shouldFetch =
-            item.description.length <
-              800 ||
-            cluster.length > 1;
-
-          if (!shouldFetch) {
-            return {
-              item,
-              pageTitle: "",
-              pageDescription: "",
-              pageText: "",
-              pageFetched: false,
-            };
-          }
-
-          return fetchSourcePage(
-            item
-          );
-        }
-      )
-    );
-
-  return results.map(
-    (result, index) => {
-      if (
-        result.status ===
-        "fulfilled"
-      ) {
-        if (
-          result.value.error
-        ) {
-          errors.push(
-            `${ordered[index].source}: ${result.value.error}`.slice(
-              0,
-              500
-            )
-          );
-        }
-
-        return result.value;
-      }
-
-      const message =
-        result.reason instanceof
-        Error
-          ? result.reason.message
-          : String(
-              result.reason
-            );
-
-      errors.push(
-        `${ordered[index].source}: ${message}`.slice(
-          0,
-          500
-        )
-      );
-
-      return {
-        item: ordered[index],
-        pageTitle: "",
-        pageDescription: "",
-        pageText: "",
-        pageFetched: false,
-        error: message,
-      };
     }
+
+    const xml = await response.text();
+
+    const items = parseRSS(xml)
+      .slice(0, MAX_ITEMS_PER_SOURCE)
+      .map((item) => ({
+        ...item,
+        source: feed.name,
+        priority: feed.priority,
+      }));
+
+    return {
+      feedName: feed.name,
+      items,
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function parseRSS(xml: string): Array<{
+  title: string;
+  description: string;
+  link: string;
+  publishedAt: Date;
+}> {
+  const items: Array<{
+    title: string;
+    description: string;
+    link: string;
+    publishedAt: Date;
+  }> = [];
+
+  const itemMatches = xml.match(
+    /<item\b[\s\S]*?<\/item>/gi
+  );
+
+  if (!itemMatches) {
+    return items;
+  }
+
+  for (const itemXml of itemMatches) {
+    const title =
+      extractXMLTag(itemXml, "title") || "";
+
+    const description =
+      extractXMLTag(itemXml, "description") ||
+      extractXMLTag(itemXml, "content:encoded") ||
+      "";
+
+    const link =
+      extractXMLTag(itemXml, "link") ||
+      extractXMLTag(itemXml, "guid") ||
+      "";
+
+    const pubDate =
+      extractXMLTag(itemXml, "pubDate") ||
+      extractXMLTag(itemXml, "dc:date") ||
+      extractXMLTag(itemXml, "published") ||
+      "";
+
+    if (!title || !link) {
+      continue;
+    }
+
+    const parsedDate = new Date(pubDate);
+
+    items.push({
+      title: decodeHtmlEntities(
+        stripHtml(title)
+      ).trim(),
+      description: decodeHtmlEntities(
+        stripHtml(description)
+      ).trim(),
+      link: link.trim(),
+      publishedAt: Number.isNaN(parsedDate.getTime())
+        ? new Date()
+        : parsedDate,
+    });
+  }
+
+  return items;
+}
+
+function extractXMLTag(
+  xml: string,
+  tag: string
+): string {
+  const escapedTag = tag.replace(
+    /[-/\\^$*+?.()|[\]{}]/g,
+    "\\$&"
+  );
+
+  const regex = new RegExp(
+    `<${escapedTag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${escapedTag}>`,
+    "i"
+  );
+
+  const match = xml.match(regex);
+
+  return match?.[1] || "";
+}
+
+function isRelevantPSGItem(item: FeedItem): boolean {
+  const text = normalizeForComparison(
+    `${item.title} ${item.description}`
+  );
+
+  const positiveSignals = [
+    "psg",
+    "paris saint germain",
+    "paris sg",
+    "paris-sg",
+    "paris saint-germain",
+    "paris saintgermain",
+  ];
+
+  return positiveSignals.some((signal) =>
+    text.includes(signal)
   );
 }
 
+function dedupeFeedItems(
+  items: FeedItem[]
+): FeedItem[] {
+  const seenUrls = new Set<string>();
+  const seenTitles = new Set<string>();
+
+  const result: FeedItem[] = [];
+
+  for (const item of items) {
+    const normalizedUrl = normalizeUrl(item.link);
+
+    if (normalizedUrl && seenUrls.has(normalizedUrl)) {
+      continue;
+    }
+
+    const normalizedTitle = normalizeTitle(item.title);
+
+    if (
+      normalizedTitle &&
+      seenTitles.has(normalizedTitle)
+    ) {
+      continue;
+    }
+
+    if (normalizedUrl) {
+      seenUrls.add(normalizedUrl);
+    }
+
+    if (normalizedTitle) {
+      seenTitles.add(normalizedTitle);
+    }
+
+    result.push(item);
+  }
+
+  return result;
+}
+
+/**
+ * Regroupement beaucoup plus strict.
+ *
+ * Un article ne peut être fusionné avec un autre que si
+ * les signaux de l'histoire sont réellement compatibles.
+ *
+ * Exemples :
+ *
+ * PSG + Bratislava + composition
+ * PSG + Bratislava + dernières tendances
+ * => même cluster
+ *
+ * PSG + Luis Enrique + accusations
+ * PSG + Bratislava + composition
+ * => clusters différents
+ *
+ * PSG + Mbappé + mercato
+ * PSG + recrutement d'un défenseur
+ * => clusters différents
+ */
+function buildClusters(
+  items: FeedItem[]
+): FeedItem[][] {
+  const clusters: FeedItem[][] = [];
+
+  for (const item of items) {
+    let bestCluster: FeedItem[] | null = null;
+    let bestScore = 0;
+
+    for (const cluster of clusters) {
+      const score = clusterSimilarity(
+        item,
+        cluster
+      );
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestCluster = cluster;
+      }
+    }
+
+    if (
+      bestCluster &&
+      bestScore >= 0.62
+    ) {
+      bestCluster.push(item);
+    } else {
+      clusters.push([item]);
+    }
+  }
+
+  return clusters;
+}
+
+function clusterSimilarity(
+  item: FeedItem,
+  cluster: FeedItem[]
+): number {
+  let bestScore = 0;
+
+  for (const other of cluster) {
+    const score = storyCompatibility(
+      item,
+      other
+    );
+
+    if (score > bestScore) {
+      bestScore = score;
+    }
+  }
+
+  return bestScore;
+}
+
+function storyCompatibility(
+  a: FeedItem,
+  b: FeedItem
+): number {
+  const titleScore = titleSimilarity(
+    a.title,
+    b.title
+  );
+
+  const signalsA = extractStorySignals(
+    a.title
+  );
+
+  const signalsB = extractStorySignals(
+    b.title
+  );
+
+  /*
+   * Les deux articles parlent d'adversaires précis.
+   * S'ils sont différents, ce ne sont quasiment jamais
+   * la même histoire.
+   */
+  if (
+    signalsA.opponents.length > 0 &&
+    signalsB.opponents.length > 0 &&
+    !hasOverlap(
+      signalsA.opponents,
+      signalsB.opponents
+    )
+  ) {
+    return 0;
+  }
+
+  /*
+   * Les deux articles citent des personnes précises.
+   * Si aucune personne n'est commune, on évite la fusion.
+   *
+   * Exception : titres extrêmement similaires.
+   */
+  if (
+    signalsA.people.length > 0 &&
+    signalsB.people.length > 0 &&
+    !hasOverlap(
+      signalsA.people,
+      signalsB.people
+    ) &&
+    titleScore < 0.84
+  ) {
+    return 0;
+  }
+
+  /*
+   * Même type d'événement.
+   */
+  const sameEventType =
+    signalsA.eventType ===
+    signalsB.eventType;
+
+  /*
+   * Type d'événement différent :
+   * on refuse sauf si les titres sont presque identiques.
+   */
+  if (
+    signalsA.eventType !== "general" &&
+    signalsB.eventType !== "general" &&
+    !sameEventType &&
+    titleScore < 0.84
+  ) {
+    return 0;
+  }
+
+  const opponentOverlap =
+    hasOverlap(
+      signalsA.opponents,
+      signalsB.opponents
+    );
+
+  const peopleOverlap =
+    hasOverlap(
+      signalsA.people,
+      signalsB.people
+    );
+
+  const competitionOverlap =
+    hasOverlap(
+      signalsA.competitions,
+      signalsB.competitions
+    );
+
+  const tokenOverlap =
+    hasOverlap(
+      signalsA.specificTokens,
+      signalsB.specificTokens
+    );
+
+  /*
+   * Même adversaire + même type d'événement :
+   * très fort signal de même histoire.
+   */
+  if (
+    opponentOverlap &&
+    sameEventType &&
+    signalsA.eventType !== "general"
+  ) {
+    return Math.max(
+      0.78,
+      titleScore * 0.45 + 0.55
+    );
+  }
+
+  /*
+   * Même personne + même type d'événement.
+   */
+  if (
+    peopleOverlap &&
+    sameEventType &&
+    signalsA.eventType !== "general"
+  ) {
+    return Math.max(
+      0.74,
+      titleScore * 0.5 + 0.5
+    );
+  }
+
+  /*
+   * Titre très proche.
+   */
+  if (titleScore >= 0.84) {
+    return titleScore;
+  }
+
+  /*
+   * Plusieurs signaux spécifiques doivent être communs.
+   */
+  let score = titleScore * 0.42;
+
+  if (opponentOverlap) {
+    score += 0.24;
+  }
+
+  if (peopleOverlap) {
+    score += 0.18;
+  }
+
+  if (competitionOverlap) {
+    score += 0.04;
+  }
+
+  if (tokenOverlap) {
+    score += 0.16;
+  }
+
+  /*
+   * Uniquement PSG / Paris / Ligue 1 n'est PAS
+   * considéré comme un signal suffisant.
+   */
+  if (
+    !opponentOverlap &&
+    !peopleOverlap &&
+    !tokenOverlap &&
+    titleScore < 0.84
+  ) {
+    return 0;
+  }
+
+  return Math.min(
+    1,
+    score
+  );
+}
+
+function extractStorySignals(
+  title: string
+): StorySignals {
+  const text = normalizeForComparison(title);
+
+  let eventType = "general";
+
+  if (
+    containsAny(text, [
+      "composition",
+      "compo",
+      "onze probable",
+      "onze",
+      "titulaire",
+      "titular",
+      "lineup",
+      "formation",
+      "equipe probable",
+    ])
+  ) {
+    eventType = "lineup";
+  } else if (
+    containsAny(text, [
+      "blessure",
+      "blesse",
+      "forfait",
+      "absent",
+      "indisponible",
+      "retour",
+      "genou",
+      "cheville",
+      "ischio",
+      "medical",
+    ])
+  ) {
+    eventType = "injury";
+  } else if (
+    containsAny(text, [
+      "mercato",
+      "transfert",
+      "transferts",
+      "recrutement",
+      "recrute",
+      "arrivee",
+      "arrive",
+      "depart",
+      "parti",
+      "signe",
+      "signature",
+      "cible",
+      "interesse",
+      "interet",
+      "offre",
+      "negociation",
+      "negocie",
+      "piste",
+    ])
+  ) {
+    eventType = "transfer";
+  } else if (
+    containsAny(text, [
+      "critique",
+      "critiqué",
+      "accuse",
+      "accusation",
+      "scandalise",
+      "scandale",
+      "colere",
+      "colère",
+      "tacle",
+      "attaque",
+      "attaque",
+      "reproche",
+      "reproches",
+      "avis",
+      "declaration",
+      "déclaration",
+      "sort du silence",
+    ])
+  ) {
+    eventType = "quote";
+  } else if (
+    containsAny(text, [
+      "match",
+      "rencontre",
+      "affronte",
+      "affronter",
+      "contre",
+      "victoire",
+      "defaite",
+      "défaite",
+      "nul",
+      "score",
+      "resultat",
+      "résultat",
+    ])
+  ) {
+    eventType = "match";
+  } else if (
+    containsAny(text, [
+      "ballon d'or",
+      "ballon d or",
+      "trophee",
+      "trophée",
+      "prix",
+      "recompense",
+      "récompense",
+      "nommes",
+      "nommés",
+    ])
+  ) {
+    eventType = "award";
+  } else if (
+    containsAny(text, [
+      "prolongation",
+      "contrat",
+      "renouvelle",
+      "renouvellement",
+      "extension",
+    ])
+  ) {
+    eventType = "contract";
+  } else if (
+    containsAny(text, [
+      "calendrier",
+      "programme",
+      "programmation",
+      "horaire",
+      "date",
+    ])
+  ) {
+    eventType = "schedule";
+  }
+
+  const people = extractKnownPeople(text);
+  const opponents = extractOpponents(text);
+  const competitions = extractCompetitions(text);
+
+  const tokens = meaningfulTokens(text);
+
+  const specificTokens = tokens.filter(
+    (token) =>
+      token.length >= 5 &&
+      !GENERIC_STORY_WORDS.has(token)
+  );
+
+  return {
+    eventType,
+    people,
+    opponents,
+    competitions,
+    specificTokens,
+  };
+}
+
+const KNOWN_PEOPLE = [
+  "kylian mbappe",
+  "mbappe",
+  "ousmane dembele",
+  "dembele",
+  "desire doue",
+  "doue",
+  "bradley barcola",
+  "barcola",
+  "achraf hakimi",
+  "hakimi",
+  "vitinha",
+  "marquinhos",
+  "nuno mendes",
+  "khvicha kvaratskhelia",
+  "kvaratskhelia",
+  "joao neves",
+  "joao neves",
+  "fabian ruiz",
+  "fabián ruiz",
+  "willian pacho",
+  "pacho",
+  "goncalo ramos",
+  "ramos",
+  "warren zaire emery",
+  "zaire emery",
+  "lucas hernandez",
+  "hermoso",
+  "luis enrique",
+  "rothen",
+  "jerome rothen",
+];
+
+const KNOWN_OPPONENTS = [
+  "monaco",
+  "as monaco",
+  "marseille",
+  "om",
+  "lyon",
+  "ol",
+  "lens",
+  "lille",
+  "nice",
+  "rennes",
+  "auxerre",
+  "strasbourg",
+  "toulouse",
+  "nantes",
+  "brest",
+  "le havre",
+  "lorient",
+  "angers",
+  "metz",
+  "saint etienne",
+  "montpellier",
+  "reims",
+  "bratislava",
+  "slovan bratislava",
+  "real madrid",
+  "barcelone",
+  "barcelona",
+  "liverpool",
+  "arsenal",
+  "manchester city",
+  "bayern munich",
+  "juventus",
+  "milan",
+  "inter milan",
+];
+
+const GENERIC_STORY_WORDS = new Set([
+  "psg",
+  "paris",
+  "saint",
+  "germain",
+  "football",
+  "foot",
+  "club",
+  "equipe",
+  "équipe",
+  "match",
+  "ligue",
+  "champions",
+  "league",
+  "actualite",
+  "actualité",
+  "news",
+  "sport",
+  "france",
+  "français",
+  "francaise",
+  "française",
+  "aujourd",
+  "hui",
+  "dernier",
+  "derniere",
+  "dernière",
+  "nouveau",
+  "nouvelle",
+  "gros",
+  "grosse",
+  "important",
+  "importante",
+  "joueur",
+  "joueurs",
+]);
+
+function extractKnownPeople(
+  text: string
+): string[] {
+  const found: string[] = [];
+
+  for (const person of KNOWN_PEOPLE) {
+    if (text.includes(person)) {
+      found.push(person);
+    }
+  }
+
+  return [...new Set(found)];
+}
+
+function extractOpponents(
+  text: string
+): string[] {
+  const found: string[] = [];
+
+  for (const opponent of KNOWN_OPPONENTS) {
+    if (text.includes(opponent)) {
+      found.push(opponent);
+    }
+  }
+
+  /*
+   * Normalisation des variantes d'un même adversaire.
+   */
+  const normalized: string[] = [];
+
+  for (const opponent of found) {
+    if (
+      opponent === "as monaco" ||
+      opponent === "monaco"
+    ) {
+      normalized.push("monaco");
+    } else if (
+      opponent === "om" ||
+      opponent === "marseille"
+    ) {
+      normalized.push("marseille");
+    } else if (
+      opponent === "ol" ||
+      opponent === "lyon"
+    ) {
+      normalized.push("lyon");
+    } else if (
+      opponent === "slovan bratislava" ||
+      opponent === "bratislava"
+    ) {
+      normalized.push("bratislava");
+    } else if (
+      opponent === "barcelona" ||
+      opponent === "barcelone"
+    ) {
+      normalized.push("barcelone");
+    } else {
+      normalized.push(opponent);
+    }
+  }
+
+  return [...new Set(normalized)];
+}
+
+function extractCompetitions(
+  text: string
+): string[] {
+  const competitions: string[] = [];
+
+  if (
+    containsAny(text, [
+      "ligue 1",
+      "ligue1",
+    ])
+  ) {
+    competitions.push("ligue1");
+  }
+
+  if (
+    containsAny(text, [
+      "ligue des champions",
+      "champions league",
+      "uefa champions league",
+    ])
+  ) {
+    competitions.push("champions_league");
+  }
+
+  if (
+    containsAny(text, [
+      "europa league",
+      "ligue europa",
+    ])
+  ) {
+    competitions.push("europa_league");
+  }
+
+  if (
+    containsAny(text, [
+      "conference league",
+      "ligue conference",
+    ])
+  ) {
+    competitions.push("conference_league");
+  }
+
+  if (
+    containsAny(text, [
+      "ballon d'or",
+      "ballon d or",
+    ])
+  ) {
+    competitions.push("ballon_dor");
+  }
+
+  return [...new Set(competitions)];
+}
+
+function meaningfulTokens(
+  text: string
+): string[] {
+  return text
+    .replace(/[^a-z0-9àâçéèêëîïôûùüÿœæ -]/gi, " ")
+    .split(/\s+/)
+    .filter(Boolean)
+    .filter(
+      (token) =>
+        token.length >= 4 &&
+        !GENERIC_STORY_WORDS.has(token)
+    );
+}
+
+function hasOverlap(
+  a: string[],
+  b: string[]
+): boolean {
+  return a.some((value) =>
+    b.includes(value)
+  );
+}
+
+function containsAny(
+  text: string,
+  values: string[]
+): boolean {
+  return values.some((value) =>
+    text.includes(value)
+  );
+}
+
+function titleSimilarity(
+  a: string,
+  b: string
+): number {
+  const tokensA = new Set(
+    meaningfulTokens(
+      normalizeForComparison(a)
+    )
+  );
+
+  const tokensB = new Set(
+    meaningfulTokens(
+      normalizeForComparison(b)
+    )
+  );
+
+  if (
+    tokensA.size === 0 ||
+    tokensB.size === 0
+  ) {
+    return 0;
+  }
+
+  let intersection = 0;
+
+  for (const token of tokensA) {
+    if (tokensB.has(token)) {
+      intersection++;
+    }
+  }
+
+  const union =
+    new Set([
+      ...tokensA,
+      ...tokensB,
+    ]).size;
+
+  return union === 0
+    ? 0
+    : intersection / union;
+}
+
+function dateSimilarity(
+  a: Date,
+  b: Date
+): number {
+  const diff =
+    Math.abs(
+      a.getTime() - b.getTime()
+    ) /
+    (1000 * 60 * 60);
+
+  if (diff <= 6) {
+    return 1;
+  }
+
+  if (diff <= 24) {
+    return 0.8;
+  }
+
+  if (diff <= 72) {
+    return 0.5;
+  }
+
+  return 0;
+}
+
+function clusterPriorityScore(
+  cluster: FeedItem[]
+): number {
+  const sourcePriority = Math.max(
+    ...cluster.map(
+      (item) => item.priority
+    )
+  );
+
+  const recency =
+    Math.max(
+      ...cluster.map(
+        (item) =>
+          item.publishedAt.getTime()
+      )
+    );
+
+  const ageHours =
+    Math.max(
+      0,
+      (Date.now() - recency) /
+        (1000 * 60 * 60)
+    );
+
+  const recencyScore = Math.max(
+    0,
+    10 - ageHours / 6
+  );
+
+  const sourceCount =
+    new Set(
+      cluster.map(
+        (item) => item.source
+      )
+    ).size;
+
+  return (
+    sourcePriority * 4 +
+    sourceCount * 3 +
+    recencyScore
+  );
+}
+
+async function enrichCluster(
+  cluster: FeedItem[]
+): Promise<{
+  sources: EnrichedSource[];
+  pagesFetched: number;
+  pagesFailed: number;
+  characters: number;
+  errors: string[];
+}> {
+  const sources: EnrichedSource[] = [];
+
+  let pagesFetched = 0;
+  let pagesFailed = 0;
+  let characters = 0;
+
+  const errors: string[] = [];
+
+  const sortedCluster = [...cluster]
+    .sort(
+      (a, b) =>
+        b.priority - a.priority ||
+        b.publishedAt.getTime() -
+          a.publishedAt.getTime()
+    )
+    .slice(0, MAX_SOURCE_PAGES);
+
+  for (const item of sortedCluster) {
+    let pageText = "";
+
+    /*
+     * Si le RSS contient déjà une description assez riche,
+     * elle est conservée.
+     */
+    if (
+      item.description &&
+      countWords(item.description) >= 80
+    ) {
+      pageText = item.description.slice(
+        0,
+        MAX_SOURCE_TEXT_LENGTH
+      );
+    } else {
+      try {
+        pageText =
+          await fetchSourcePage(
+            item.link
+          );
+
+        if (pageText) {
+          pagesFetched++;
+        } else {
+          pagesFailed++;
+        }
+      } catch (error) {
+        pagesFailed++;
+
+        errors.push(
+          `${item.source}: ${
+            error instanceof Error
+              ? error.message
+              : String(error)
+          }`
+        );
+      }
+    }
+
+    const combinedText =
+      pageText ||
+      item.description ||
+      "";
+
+    characters +=
+      combinedText.length;
+
+    sources.push({
+      title: item.title,
+      source: item.source,
+      url: item.link,
+      publishedAt:
+        item.publishedAt.toISOString(),
+      description: item.description,
+      pageText:
+        combinedText.slice(
+          0,
+          MAX_SOURCE_TEXT_LENGTH
+        ),
+    });
+  }
+
+  return {
+    sources,
+    pagesFetched,
+    pagesFailed,
+    characters,
+    errors,
+  };
+}
+
 async function fetchSourcePage(
-  item: FeedItem
-): Promise<EnrichedSource> {
+  url: string
+): Promise<string> {
   const controller =
     new AbortController();
 
-  const timeout =
-    setTimeout(
-      () =>
-        controller.abort(),
-      SOURCE_PAGE_TIMEOUT_MS
-    );
+  const timeout = setTimeout(() => {
+    controller.abort();
+  }, SOURCE_PAGE_TIMEOUT_MS);
 
   try {
     const response =
-      await fetch(
-        item.url,
-        {
-          headers: {
-            Accept:
-              "text/html,application/xhtml+xml",
-            "User-Agent":
-              "Mozilla/5.0 (compatible; PSG-Direct/1.0)",
-          },
-          cache: "no-store",
-          signal:
-            controller.signal,
-        }
-      );
+      await fetch(url, {
+        headers: {
+          Accept:
+            "text/html,application/xhtml+xml",
+          "User-Agent":
+            "PSGDirectBot/1.0 (+https://psg-direct-app-1ktj.vercel.app)",
+        },
+        cache: "no-store",
+        signal: controller.signal,
+      });
 
     if (!response.ok) {
       throw new Error(
@@ -832,38 +1508,7 @@ async function fetchSourcePage(
     const html =
       await response.text();
 
-    const extracted =
-      extractPageContent(
-        html
-      );
-
-    return {
-      item,
-      pageTitle:
-        extracted.title,
-      pageDescription:
-        extracted.description,
-      pageText:
-        extracted.text.slice(
-          0,
-          MAX_SOURCE_TEXT_LENGTH
-        ),
-      pageFetched:
-        extracted.text.length >
-        100,
-    };
-  } catch (error) {
-    return {
-      item,
-      pageTitle: "",
-      pageDescription: "",
-      pageText: "",
-      pageFetched: false,
-      error:
-        error instanceof Error
-          ? error.message
-          : String(error),
-    };
+    return extractPageContent(html);
   } finally {
     clearTimeout(timeout);
   }
@@ -871,691 +1516,546 @@ async function fetchSourcePage(
 
 function extractPageContent(
   html: string
-): {
-  title: string;
-  description: string;
-  text: string;
-} {
-  let cleaned =
-    html
-      .replace(
-        /<script[\s\S]*?<\/script>/gi,
-        " "
-      )
-      .replace(
-        /<style[\s\S]*?<\/style>/gi,
-        " "
-      )
-      .replace(
-        /<noscript[\s\S]*?<\/noscript>/gi,
-        " "
-      )
-      .replace(
-        /<nav[\s\S]*?<\/nav>/gi,
-        " "
-      )
-      .replace(
-        /<footer[\s\S]*?<\/footer>/gi,
-        " "
-      )
-      .replace(
-        /<header[\s\S]*?<\/header>/gi,
-        " "
-      );
+): string {
+  let cleaned = html;
 
-  const title =
-    extractMeta(
-      html,
-      "og:title"
-    ) ||
-    extractTag(
-      html,
-      "title"
-    );
+  cleaned = cleaned.replace(
+    /<script\b[^>]*>[\s\S]*?<\/script>/gi,
+    " "
+  );
 
-  const description =
-    extractMeta(
-      html,
-      "description"
-    ) ||
-    extractMeta(
-      html,
-      "og:description"
-    );
+  cleaned = cleaned.replace(
+    /<style\b[^>]*>[\s\S]*?<\/style>/gi,
+    " "
+  );
+
+  cleaned = cleaned.replace(
+    /<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi,
+    " "
+  );
+
+  cleaned = cleaned.replace(
+    /<(nav|footer|header|aside|form)\b[^>]*>[\s\S]*?<\/\1>/gi,
+    " "
+  );
+
+  let content = "";
 
   const articleMatch =
     cleaned.match(
       /<article\b[^>]*>([\s\S]*?)<\/article>/i
     );
 
-  const mainMatch =
-    cleaned.match(
-      /<main\b[^>]*>([\s\S]*?)<\/main>/i
-    );
-
-  const source =
-    articleMatch?.[1] ||
-    mainMatch?.[1] ||
-    cleaned;
-
-  const paragraphs =
-    [
-      ...source.matchAll(
-        /<p\b[^>]*>([\s\S]*?)<\/p>/gi
-      ),
-    ]
-      .map(
-        (match) =>
-          stripHtml(
-            match[1]
-          )
-      )
-      .filter(
-        (value) =>
-          value.length > 40
+  if (articleMatch?.[1]) {
+    content = articleMatch[1];
+  } else {
+    const mainMatch =
+      cleaned.match(
+        /<main\b[^>]*>([\s\S]*?)<\/main>/i
       );
 
-  const text =
-    (
-      paragraphs.length > 0
-        ? paragraphs.join(
-            "\n\n"
-          )
-        : stripHtml(source)
-    )
-      .replace(
-        /\s+\n/g,
-        "\n"
-      )
-      .replace(
-        /\n\s+/g,
-        "\n"
-      )
-      .replace(
-        /[ \t]+/g,
-        " "
-      )
-      .trim();
+    if (mainMatch?.[1]) {
+      content = mainMatch[1];
+    } else {
+      const paragraphs =
+        cleaned.match(
+          /<p\b[^>]*>[\s\S]*?<\/p>/gi
+        );
 
-  return {
-    title:
-      cleanText(title),
-    description:
-      cleanText(
-        description
-      ),
-    text,
-  };
-}
-
-function extractMeta(
-  html: string,
-  name: string
-): string {
-  const escaped =
-    name.replace(
-      /[-/\\^$*+?.()|[\]{}]/g,
-      "\\$&"
-    );
-
-  const patterns = [
-    new RegExp(
-      `<meta[^>]+property=["']${escaped}["'][^>]+content=["']([^"']*)["'][^>]*>`,
-      "i"
-    ),
-    new RegExp(
-      `<meta[^>]+name=["']${escaped}["'][^>]+content=["']([^"']*)["'][^>]*>`,
-      "i"
-    ),
-    new RegExp(
-      `<meta[^>]+content=["']([^"']*)["'][^>]+property=["']${escaped}["'][^>]*>`,
-      "i"
-    ),
-    new RegExp(
-      `<meta[^>]+content=["']([^"']*)["'][^>]+name=["']${escaped}["'][^>]*>`,
-      "i"
-    ),
-  ];
-
-  for (const pattern of patterns) {
-    const match =
-      html.match(pattern);
-
-    if (match?.[1]) {
-      return decodeHtmlEntities(
-        match[1]
-      );
+      content =
+        paragraphs?.join(" ") ||
+        cleaned;
     }
   }
 
-  return "";
-}
+  content = content.replace(
+    /<[^>]+>/g,
+    " "
+  );
 
-function extractTag(
-  html: string,
-  tag: string
-): string {
-  const pattern =
-    new RegExp(
-      `<${tag}\\b[^>]*>([\\s\\S]*?)<\\/${tag}>`,
-      "i"
-    );
+  content = decodeHtmlEntities(
+    content
+  );
 
-  const match =
-    html.match(pattern);
+  content =
+    content
+      .replace(/\s+/g, " ")
+      .trim();
 
-  return match?.[1]
-    ? decodeHtmlEntities(
-        stripHtml(
-          match[1]
-        )
-      )
-    : "";
-}
-
-async function generateArticle(
-  sources: EnrichedSource[]
-): Promise<GenerationResult> {
-  const evidence =
-    buildEvidence(
-      sources
-    );
-
-  const prompt = `
-Tu es le journaliste principal de PSG Direct.
-
-Tu dois rédiger un article de presse sportive française ORIGINAL à partir UNIQUEMENT des informations présentes dans les sources fournies.
-
-OBJECTIF :
-
-Produire un véritable article journalistique structuré et agréable à lire.
-
-L'article doit impérativement contenir :
-
-- un titre informatif et précis ;
-- un chapô de 2 à 3 phrases ;
-- plusieurs intertitres pertinents ;
-- des paragraphes courts ;
-- une progression logique de l'information ;
-- une conclusion naturelle.
-
-STRUCTURE OBLIGATOIRE DU CHAMP "content" :
-
-Le champ content doit être rédigé en Markdown simple.
-
-Utilise exactement cette logique :
-
-Premier paragraphe d'introduction.
-
-## Premier intertitre pertinent
-
-Deux ou trois paragraphes développant cette partie.
-
-## Deuxième intertitre pertinent
-
-Deux ou trois paragraphes développant cette partie.
-
-## Troisième intertitre pertinent
-
-Deux ou trois paragraphes développant cette partie.
-
-## Ce qu'il faut retenir
-
-Un dernier paragraphe de conclusion.
-
-IMPORTANT :
-
-- Chaque paragraphe doit être séparé par une ligne vide.
-- Chaque intertitre doit commencer par "## ".
-- Ne mets JAMAIS tout l'article dans un seul bloc.
-- Ne mets PAS "Introduction" comme intertitre.
-- Ne mets PAS "Article" comme intertitre.
-- Les intertitres doivent correspondre réellement au contenu.
-- Utilise entre 3 et 5 intertitres selon la matière disponible.
-- Ne crée pas artificiellement des sections si les informations ne le permettent pas.
-- PSG doit rester au centre de l'article.
-
-FACTUALITÉ :
-
-Tu dois utiliser les informations factuelles disponibles :
-
-- date ;
-- heure ;
-- stade ;
-- compétition ;
-- journée ;
-- adversaire ;
-- diffusion TV ;
-- plateforme ;
-- joueurs ;
-- entraîneur ;
-- composition ;
-- blessure ;
-- suspension ;
-- transfert ;
-- déclaration ;
-- résultat ;
-- contexte ;
-- enjeux ;
-- décision officielle ;
-- conséquences.
-
-Mais uniquement lorsqu'elles sont présentes dans les sources.
-
-INTERDICTION ABSOLUE D'INVENTER :
-
-Si une information n'est pas présente dans les sources, ne l'invente pas.
-
-Ne crée notamment jamais :
-
-- une heure ;
-- une chaîne TV ;
-- un stade ;
-- une date ;
-- une statistique ;
-- une déclaration ;
-- une composition ;
-- une blessure ;
-- un transfert ;
-- un résultat.
-
-Si une information importante manque, écris simplement l'article avec les informations disponibles.
-
-STYLE :
-
-- français naturel ;
-- ton de presse sportive ;
-- phrases variées ;
-- pas de répétitions ;
-- pas de remplissage ;
-- pas de phrases génériques ;
-- pas de formulation robotique ;
-- pas de copier-coller d'une source ;
-- reformulation journalistique originale ;
-- PSG au centre.
-
-LONGUEUR :
-
-Le contenu doit contenir entre ${MIN_ARTICLE_WORDS} et ${MAX_ARTICLE_WORDS} mots lorsque les sources le permettent.
-
-Le contenu doit être substantiel.
-
-RETOUR OBLIGATOIRE :
-
-Retourne uniquement un JSON valide :
-
-{
-  "title": "titre",
-  "excerpt": "chapô court",
-  "content": "article structuré en Markdown"
-}
-
-Aucun texte avant ou après le JSON.
-
-SOURCES :
-
-${evidence}
-`;
-
-  return callGemini(
-    prompt
+  return content.slice(
+    0,
+    MAX_SOURCE_TEXT_LENGTH
   );
 }
 
-async function expandArticle(
-  sources: EnrichedSource[],
-  article: ArticleResult
-): Promise<GenerationResult> {
-  const evidence =
-    buildEvidence(
-      sources
-    );
+async function generateArticle(
+  cluster: FeedItem[],
+  enrichedSources: EnrichedSource[]
+): Promise<
+  GenerationSuccess | GenerationFailure
+> {
+  const sourceBlocks =
+    enrichedSources
+      .map(
+        (source, index) =>
+          `
+SOURCE ${index + 1}
+Média : ${source.source}
+Titre : ${source.title}
+Date : ${source.publishedAt}
+URL : ${source.url}
+
+Résumé RSS :
+${source.description || "(aucun)"}
+
+Contenu récupéré depuis la source :
+${source.pageText || "(aucun)"}
+`
+      )
+      .join("\n\n");
+
+  const clusterTitles =
+    cluster
+      .map(
+        (item) =>
+          `- ${item.source}: ${item.title}`
+      )
+      .join("\n");
 
   const prompt = `
 Tu es le rédacteur en chef de PSG Direct.
 
-L'article fourni ci-dessous est trop court.
-
-Tu dois le réécrire intégralement afin d'obtenir un véritable article de presse sportive française structuré.
+Tu dois écrire UN SEUL article de presse sportive original à partir de plusieurs sources parlant du MÊME sujet.
 
 IMPORTANT :
+Les sources peuvent contenir des informations redondantes.
+Tu dois FUSIONNER les informations qui parlent réellement du même événement.
+Tu ne dois surtout PAS mélanger plusieurs sujets différents.
 
-Conserve tous les faits présents dans l'article.
+TITRES DU GROUPE :
+${clusterTitles}
 
-Tu peux uniquement ajouter des informations présentes dans les sources.
+SOURCES DETAILLEES :
+${sourceBlocks}
 
-N'invente absolument aucune information.
+OBJECTIF :
+Produire un article factuel, précis, naturel et intéressant sur le sujet commun de ces sources.
 
-Le contenu doit impérativement utiliser du Markdown simple.
+REGLES ABSOLUES :
 
-Structure obligatoire :
+1. N'invente aucune information.
+2. N'invente aucune date, heure, stade, chaîne TV, compétition, joueur, entraîneur ou déclaration.
+3. Si une information n'est présente dans aucune source, ne la donne pas comme un fait.
+4. Si une information apparaît dans une seule source fiable, tu peux la mentionner en la présentant avec prudence si nécessaire.
+5. Si plusieurs sources confirment une information, utilise-la naturellement.
+6. Ne fusionne jamais deux événements différents simplement parce qu'ils concernent le PSG.
+7. Ne transforme pas plusieurs actualités différentes en une seule histoire.
+8. L'article doit parler d'UN sujet précis.
+9. Les informations importantes doivent être concrètes.
+10. Évite les phrases génériques comme "Le PSG continue de préparer la suite" lorsqu'une information plus précise est disponible.
 
-Paragraphe de chapô / introduction.
+STRUCTURE OBLIGATOIRE :
 
-## Intertitre pertinent
+- Un titre précis et informatif.
+- Un chapô de 2 ou 3 phrases.
+- Une introduction courte.
+- 3 à 5 intertitres Markdown avec "##".
+- Des paragraphes courts de 2 à 5 phrases.
+- Une conclusion avec "## Ce qu'il faut retenir".
 
-Paragraphes courts.
+FORMAT :
 
-## Intertitre pertinent
+Titre :
+Un titre naturel et précis.
 
-Paragraphes courts.
+Excerpt :
+2 ou 3 phrases résumant l'information principale.
 
-## Intertitre pertinent
+Content :
+Le contenu complet avec des paragraphes séparés par des lignes vides.
 
-Paragraphes courts.
+Utilise Markdown simple.
+
+Exemple de structure :
+
+## Introduction
+
+Premier paragraphe...
+
+## Un événement qui fait réagir
+
+Paragraphe...
+
+## Les informations importantes
+
+Paragraphe...
+
+## Ce que cela change pour le PSG
+
+Paragraphe...
 
 ## Ce qu'il faut retenir
 
-Conclusion.
+Conclusion...
 
-Chaque paragraphe doit être séparé par une ligne vide.
+LONGUEUR :
+Entre ${MIN_ARTICLE_WORDS} et ${MAX_ARTICLE_WORDS} mots.
 
-Ne mets jamais tout le texte dans un seul bloc.
+STYLE :
+- presse sportive française
+- naturel
+- factuel
+- précis
+- sans répétition
+- sans sensationnalisme artificiel
+- pas de liste à puces dans le corps de l'article
+- pas de "selon plusieurs sources" si les sources ne sont pas réellement concordantes
+- pas de remplissage
 
-Utilise entre 3 et 5 intertitres pertinents.
+Réponds UNIQUEMENT avec un JSON valide :
 
-Minimum ${MIN_ARTICLE_WORDS} mots.
+{
+  "title": "...",
+  "excerpt": "...",
+  "content": "..."
+}
+`;
 
-Maximum ${MAX_ARTICLE_WORDS} mots.
+  const result =
+    await callGemini(prompt);
 
-PSG doit rester au centre.
+  if (!result.ok) {
+    return result;
+  }
 
-ARTICLE ACTUEL :
+  const parsed =
+    parseGeminiJson(
+      result.text
+    );
 
-Titre :
-${article.title}
+  if (!parsed) {
+    return {
+      ok: false,
+      error:
+        "Réponse Gemini JSON invalide.",
+    };
+  }
 
-Extrait :
+  const title =
+    typeof parsed.title === "string"
+      ? parsed.title.trim()
+      : "";
+
+  const excerpt =
+    typeof parsed.excerpt === "string"
+      ? parsed.excerpt.trim()
+      : "";
+
+  const content =
+    typeof parsed.content === "string"
+      ? parsed.content.trim()
+      : "";
+
+  if (
+    !title ||
+    !excerpt ||
+    !content
+  ) {
+    return {
+      ok: false,
+      error:
+        "Réponse Gemini incomplète.",
+    };
+  }
+
+  return {
+    ok: true,
+    result: {
+      title,
+      excerpt,
+      content,
+    },
+  };
+}
+
+async function expandArticle(
+  article: {
+    title: string;
+    excerpt: string;
+    content: string;
+  },
+  cluster: FeedItem[],
+  enrichedSources: EnrichedSource[]
+): Promise<
+  GenerationSuccess | GenerationFailure
+> {
+  const sourceFacts =
+    enrichedSources
+      .map(
+        (source) =>
+          `
+${source.source}
+${source.title}
+${source.pageText}
+`
+      )
+      .join("\n");
+
+  const prompt = `
+Tu es rédacteur pour PSG Direct.
+
+L'article ci-dessous est trop court.
+
+ARTICLE :
+Titre : ${article.title}
+
+Résumé :
 ${article.excerpt}
 
 Contenu :
 ${article.content}
 
 SOURCES :
+${sourceFacts}
 
-${evidence}
+Tu dois enrichir cet article SANS INVENTER DE FAITS.
 
-Retourne uniquement :
+Conserve strictement le même sujet.
+N'ajoute aucun autre événement.
+Ajoute uniquement des informations réellement présentes dans les sources.
+
+Tu peux préciser, si les sources le permettent :
+- contexte
+- date
+- heure
+- stade
+- compétition
+- joueurs
+- entraîneur
+- composition
+- déclarations
+- conséquences
+- historique directement lié au sujet
+
+Structure obligatoire :
+
+## Introduction
+
+## Intertitre pertinent
+
+## Intertitre pertinent
+
+## Intertitre pertinent
+
+## Ce qu'il faut retenir
+
+Paragraphes courts et séparés par des lignes vides.
+
+Objectif :
+entre ${MIN_ARTICLE_WORDS} et ${MAX_ARTICLE_WORDS} mots.
+
+Réponds uniquement en JSON :
 
 {
-  "title": "titre",
-  "excerpt": "chapô",
-  "content": "article structuré en Markdown"
+  "title": "...",
+  "excerpt": "...",
+  "content": "..."
 }
 `;
 
-  return callGemini(
-    prompt
-  );
+  const result =
+    await callGemini(prompt);
+
+  if (!result.ok) {
+    return result;
+  }
+
+  const parsed =
+    parseGeminiJson(
+      result.text
+    );
+
+  if (!parsed) {
+    return {
+      ok: false,
+      error:
+        "JSON invalide lors de l'expansion.",
+    };
+  }
+
+  if (
+    typeof parsed.title !== "string" ||
+    typeof parsed.excerpt !== "string" ||
+    typeof parsed.content !== "string"
+  ) {
+    return {
+      ok: false,
+      error:
+        "Expansion Gemini incomplète.",
+    };
+  }
+
+  return {
+    ok: true,
+    result: {
+      title: parsed.title.trim(),
+      excerpt: parsed.excerpt.trim(),
+      content: parsed.content.trim(),
+    },
+  };
 }
 
 async function callGemini(
   prompt: string
-): Promise<GenerationResult> {
-  if (!GEMINI_API_KEY) {
-    return {
-      ok: false,
-      outcome: "missing_api_key",
-      error:
-        "GEMINI_API_KEY manquante",
-    };
-  }
-
-  const models: GeminiModel[] = [
+): Promise<
+  | {
+      ok: true;
+      text: string;
+    }
+  | {
+      ok: false;
+      error: string;
+    }
+> {
+  const models = [
     {
-      name: "gemini-3.5-flash-lite",
+      model: "gemini-3.5-flash-lite",
       timeout: 4500,
     },
     {
-      name: "gemini-3.6-flash",
+      model: "gemini-3.6-flash",
       timeout: 1500,
     },
   ];
 
   let lastError =
-    "Erreur Gemini inconnue";
+    "Gemini indisponible.";
 
-  for (const model of models) {
+  for (const config of models) {
+    const controller =
+      new AbortController();
+
+    const timeout = setTimeout(() => {
+      controller.abort();
+    }, config.timeout);
+
     try {
-      const controller =
-        new AbortController();
-
-      const timeout =
-        setTimeout(
-          () =>
-            controller.abort(),
-          model.timeout
-        );
-
-      try {
-        const response =
-          await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/${model.name}:generateContent?key=${encodeURIComponent(
-              GEMINI_API_KEY
-            )}`,
-            {
-              method: "POST",
-              headers: {
-                "Content-Type":
+      const response =
+        await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${config.model}:generateContent?key=${GEMINI_API_KEY}`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type":
+                "application/json",
+            },
+            body: JSON.stringify({
+              contents: [
+                {
+                  role: "user",
+                  parts: [
+                    {
+                      text: prompt,
+                    },
+                  ],
+                },
+              ],
+              generationConfig: {
+                temperature: 0.35,
+                maxOutputTokens: 2200,
+                responseMimeType:
                   "application/json",
               },
-              body: JSON.stringify({
-                contents: [
-                  {
-                    parts: [
-                      {
-                        text: prompt,
-                      },
-                    ],
-                  },
-                ],
-                generationConfig: {
-                  temperature: 0.35,
-                  maxOutputTokens: 2200,
-                  responseMimeType:
-                    "application/json",
-                  responseSchema: {
-                    type: "OBJECT",
-                    properties: {
-                      title: {
-                        type: "STRING",
-                      },
-                      excerpt: {
-                        type: "STRING",
-                      },
-                      content: {
-                        type: "STRING",
-                      },
-                    },
-                    required: [
-                      "title",
-                      "excerpt",
-                      "content",
-                    ],
-                  },
-                },
-              }),
-              signal:
-                controller.signal,
-            }
-          );
+            }),
+            signal: controller.signal,
+          }
+        );
 
-        if (!response.ok) {
-          const body =
-            await response
-              .text()
-              .catch(
-                () => ""
-              );
-
-          throw new Error(
-            `HTTP ${response.status}: ${body.slice(
-              0,
-              300
-            )}`
-          );
-        }
-
-        const data =
-          (await response.json()) as GeminiResponse;
-
-        const rawText =
-          data.candidates?.[0]
-            ?.content?.parts?.[0]
-            ?.text;
-
-        if (!rawText) {
-          throw new Error(
-            "Réponse Gemini vide"
-          );
-        }
-
-        const parsed =
-          parseGeminiJson(
-            rawText
-          );
-
-        if (!parsed) {
-          return {
-            ok: false,
-            outcome:
-              "invalid_json",
-            error:
-              "Gemini a renvoyé un JSON invalide",
-          };
-        }
-
-        const article =
-          cleanArticle(
-            parsed
-          );
-
-        if (
-          !article.title ||
-          !article.content
-        ) {
-          return {
-            ok: false,
-            outcome:
-              "invalid_article",
-            error:
-              "Article Gemini incomplet",
-          };
-        }
-
-        return {
-          ok: true,
-          article,
-        };
-      } finally {
-        clearTimeout(timeout);
+      if (!response.ok) {
+        lastError =
+          `Gemini ${config.model}: HTTP ${response.status}`;
+        continue;
       }
+
+      const data =
+        await response.json();
+
+      const text =
+        data?.candidates?.[0]?.content?.parts?.[0]?.text;
+
+      if (
+        typeof text !== "string" ||
+        !text.trim()
+      ) {
+        lastError =
+          `Gemini ${config.model}: réponse vide`;
+        continue;
+      }
+
+      return {
+        ok: true,
+        text: text.trim(),
+      };
     } catch (error) {
       lastError =
         error instanceof Error
-          ? error.message
-          : String(error);
+          ? `Gemini ${config.model}: ${error.message}`
+          : `Gemini ${config.model}: ${String(error)}`;
+    } finally {
+      clearTimeout(timeout);
     }
   }
 
   return {
     ok: false,
-    outcome:
-      "gemini_error",
-    error:
-      lastError.slice(
-        0,
-        500
-      ),
+    error: lastError,
   };
-}
-
-function buildEvidence(
-  sources: EnrichedSource[]
-): string {
-  return sources
-    .map(
-      (source, index) => {
-        const item =
-          source.item;
-
-        return `
-SOURCE ${index + 1}
-Nom : ${item.source}
-Titre RSS : ${item.title}
-Date RSS : ${
-          item.publishedAt ||
-          "inconnue"
-        }
-URL : ${item.url}
-Description RSS :
-${item.description || "Aucune"}
-
-Titre de la page :
-${source.pageTitle || "Aucun"}
-
-Description de la page :
-${
-  source.pageDescription ||
-  "Aucune"
-}
-
-Contenu récupéré :
-${
-  source.pageText ||
-  "Aucun contenu supplémentaire récupéré."
-}
-`;
-      }
-    )
-    .join(
-      "\n------------------------------\n"
-    );
 }
 
 function parseGeminiJson(
   text: string
-): {
-  title?: string;
-  excerpt?: string;
-  content?: string;
-} | null {
-  const cleaned =
-    text
-      .trim()
-      .replace(
-        /^```json\s*/i,
-        ""
-      )
-      .replace(
-        /^```\s*/i,
-        ""
-      )
-      .replace(
-        /\s*```$/i,
-        ""
-      )
-      .trim();
+): GeminiResponse | null {
+  let cleaned = text.trim();
+
+  if (
+    cleaned.startsWith("```json")
+  ) {
+    cleaned =
+      cleaned.slice(7);
+  }
+
+  if (
+    cleaned.startsWith("```")
+  ) {
+    cleaned =
+      cleaned.slice(3);
+  }
+
+  if (
+    cleaned.endsWith("```")
+  ) {
+    cleaned =
+      cleaned.slice(
+        0,
+        -3
+      );
+  }
+
+  cleaned = cleaned.trim();
 
   try {
-    return JSON.parse(
-      cleaned
-    );
+    return JSON.parse(cleaned);
   } catch {
-    const first =
-      cleaned.indexOf(
-        "{"
-      );
+    const start =
+      cleaned.indexOf("{");
 
-    const last =
-      cleaned.lastIndexOf(
-        "}"
-      );
+    const end =
+      cleaned.lastIndexOf("}");
 
     if (
-      first === -1 ||
-      last === -1 ||
-      last <= first
+      start === -1 ||
+      end === -1 ||
+      end <= start
     ) {
       return null;
     }
@@ -1563,8 +2063,8 @@ function parseGeminiJson(
     try {
       return JSON.parse(
         cleaned.slice(
-          first,
-          last + 1
+          start,
+          end + 1
         )
       );
     } catch {
@@ -1573,387 +2073,402 @@ function parseGeminiJson(
   }
 }
 
-function cleanArticle(
-  article: {
-    title?: string;
-    excerpt?: string;
-    content?: string;
-  }
-): ArticleResult {
-  return {
-    title:
-      cleanText(
-        article.title ||
-          ""
-      ),
-    excerpt:
-      cleanText(
-        article.excerpt ||
-          ""
-      ),
-    content:
-      normalizeArticleStructure(
-        article.content ||
-          ""
-      ),
-  };
-}
-
 function normalizeArticleStructure(
   content: string
 ): string {
-  let value =
-    content
-      .replace(
-        /\r\n/g,
-        "\n"
-      )
-      .replace(
-        /\r/g,
-        "\n"
-      )
-      .replace(
-        /<br\s*\/?>/gi,
-        "\n"
-      )
-      .replace(
-        /<\/p>/gi,
-        "\n\n"
-      )
-      .replace(
-        /<p[^>]*>/gi,
-        ""
-      )
-      .replace(
-        /<h2[^>]*>/gi,
-        "\n## "
-      )
-      .replace(
-        /<\/h2>/gi,
-        "\n"
-      )
-      .replace(
-        /<strong[^>]*>/gi,
-        ""
-      )
-      .replace(
-        /<\/strong>/gi,
-        ""
-      )
-      .replace(
-        /<[^>]+>/g,
-        " "
+  let text =
+    decodeHtmlEntities(
+      content
+    )
+      .replace(/\r\n/g, "\n")
+      .replace(/\r/g, "\n");
+
+  text = text.replace(
+    /<h1[^>]*>(.*?)<\/h1>/gis,
+    "\n\n"
+  );
+
+  text = text.replace(
+    /<h2[^>]*>(.*?)<\/h2>/gis,
+    "\n\n## $1\n\n"
+  );
+
+  text = text.replace(
+    /<h3[^>]*>(.*?)<\/h3>/gis,
+    "\n\n## $1\n\n"
+  );
+
+  text = text.replace(
+    /<p[^>]*>(.*?)<\/p>/gis,
+    "\n\n$1\n\n"
+  );
+
+  text = text.replace(
+    /<br\s*\/?>/gi,
+    "\n"
+  );
+
+  text = text.replace(
+    /<strong[^>]*>(.*?)<\/strong>/gis,
+    "$1"
+  );
+
+  text = text.replace(
+    /<b[^>]*>(.*?)<\/b>/gis,
+    "$1"
+  );
+
+  text = text.replace(
+    /<em[^>]*>(.*?)<\/em>/gis,
+    "$1"
+  );
+
+  text = stripHtml(text);
+
+  const rawLines =
+    text
+      .split("\n")
+      .map((line) =>
+        line
+          .replace(/\s+/g, " ")
+          .trim()
       );
 
-  value =
-    decodeHtmlEntities(
-      value
-    );
+  const lines: string[] = [];
 
-  value =
-    value
-      .replace(
-        /[ \t]+/g,
-        " "
-      )
-      .replace(
-        /[ \t]*\n[ \t]*/g,
-        "\n"
-      )
+  for (const line of rawLines) {
+    if (!line) {
+      if (
+        lines.length > 0 &&
+        lines[lines.length - 1] !== ""
+      ) {
+        lines.push("");
+      }
+
+      continue;
+    }
+
+    if (
+      /^#{2,3}\s+/.test(line)
+    ) {
+      if (
+        lines.length > 0 &&
+        lines[lines.length - 1] !== ""
+      ) {
+        lines.push("");
+      }
+
+      lines.push(
+        line.replace(
+          /^#{3}\s+/,
+          "## "
+        )
+      );
+
+      lines.push("");
+      continue;
+    }
+
+    lines.push(line);
+  }
+
+  text =
+    lines
+      .join("\n")
       .replace(
         /\n{3,}/g,
         "\n\n"
       )
       .trim();
 
-  const lines =
-    value
-      .split("\n")
-      .map(
-        (line) =>
-          line.trim()
-      )
-      .filter(
-        (line) =>
-          line.length > 0
-      );
-
-  const output: string[] = [];
-
-  for (const line of lines) {
-    if (
-      /^#{1,3}\s+/.test(
-        line
-      )
-    ) {
-      const heading =
-        line
-          .replace(
-            /^#{1,3}\s+/,
-            ""
-          )
-          .trim();
-
-      if (
-        heading.length >= 8
-      ) {
-        output.push(
-          `## ${heading}`
-        );
-      }
-
-      continue;
-    }
-
-    output.push(
-      line
+  text =
+    ensureParagraphBreaks(
+      text
     );
-  }
 
-  return buildParagraphs(
-    output
-  );
+  return text;
 }
 
-function buildParagraphs(
-  lines: string[]
+function ensureParagraphBreaks(
+  text: string
 ): string {
-  const result: string[] = [];
+  const lines =
+    text
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(
+        (line, index, arr) =>
+          line ||
+          (index > 0 &&
+            arr[index - 1] !== "")
+      );
 
-  let paragraph =
-    "";
+  const result: string[] = [];
+  let paragraph: string[] = [];
+
+  const flush = () => {
+    if (paragraph.length > 0) {
+      result.push(
+        paragraph.join(" ")
+      );
+
+      paragraph = [];
+    }
+  };
 
   for (const line of lines) {
-    if (
-      line.startsWith(
-        "## "
-      )
-    ) {
+    if (!line) {
+      flush();
+
       if (
-        paragraph.trim()
+        result.length > 0 &&
+        result[result.length - 1] !== ""
       ) {
-        result.push(
-          paragraph.trim()
-        );
-        paragraph =
-          "";
+        result.push("");
       }
 
-      result.push(
-        line
-      );
-
       continue;
     }
 
     if (
-      !paragraph
+      /^##\s+/.test(line)
     ) {
-      paragraph =
-        line;
+      flush();
+
+      if (
+        result.length > 0 &&
+        result[result.length - 1] !== ""
+      ) {
+        result.push("");
+      }
+
+      result.push(line);
+      result.push("");
       continue;
     }
 
+    paragraph.push(line);
+
+    /*
+     * Si une ligne devient trop longue,
+     * on crée un nouveau paragraphe.
+     */
     if (
-      countWords(
-        paragraph
-      ) < 85 &&
-      !looksLikeNewSentence(
-        line
-      )
+      paragraph.join(" ").split(/\s+/)
+        .length >= 75
     ) {
-      paragraph +=
-        ` ${line}`;
-    } else {
-      result.push(
-        paragraph.trim()
-      );
-      paragraph =
-        line;
+      flush();
+      result.push("");
     }
   }
 
-  if (
-    paragraph.trim()
-  ) {
-    result.push(
-      paragraph.trim()
-    );
-  }
+  flush();
 
   return result
-    .join(
+    .join("\n")
+    .replace(
+      /\n{3,}/g,
       "\n\n"
     )
     .trim();
 }
 
-function looksLikeNewSentence(
-  line: string
-): boolean {
-  return /^[A-ZÀÂÄÇÉÈÊËÎÏÔÖÙÛÜŸ0-9]/.test(
-    line
+function trimArticleToWordLimit(
+  content: string,
+  maxWords: number
+): string {
+  const words =
+    content.split(/\s+/);
+
+  if (
+    words.length <= maxWords
+  ) {
+    return content;
+  }
+
+  return (
+    words
+      .slice(0, maxWords)
+      .join(" ")
+      .replace(/[,:;.!?]+$/, "") +
+    "."
   );
+}
+
+async function makeUniqueSlug(
+  baseSlug: string
+): Promise<string> {
+  const cleanBase =
+    baseSlug
+      .trim()
+      .replace(/^-+|-+$/g, "");
+
+  if (!cleanBase) {
+    return "";
+  }
+
+  let slug = cleanBase;
+  let counter = 2;
+
+  while (true) {
+    const existing =
+      await prisma.article.findUnique({
+        where: {
+          slug,
+        },
+        select: {
+          id: true,
+        },
+      });
+
+    if (!existing) {
+      return slug;
+    }
+
+    slug =
+      `${cleanBase}-${counter}`;
+    counter++;
+
+    if (counter > 100) {
+      return "";
+    }
+  }
+}
+
+function slugify(
+  text: string
+): string {
+  return normalizeForComparison(
+    text
+  )
+    .replace(/['’]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(
+      /^-+|-+$/g,
+      ""
+    );
+}
+
+function normalizeTitle(
+  title: string
+): string {
+  return normalizeForComparison(
+    title
+  )
+    .replace(
+      /\s*[-|:]\s*(rmc sport|foot mercato|culturepsg|sports\.fr|le10sport|dicodusport|sport\.fr).*$/i,
+      ""
+    )
+    .replace(
+      /\bpsg\b/g,
+      "paris"
+    )
+    .trim();
+}
+
+function normalizeForComparison(
+  text: string
+): string {
+  return decodeHtmlEntities(
+    stripHtml(text)
+  )
+    .normalize("NFD")
+    .replace(
+      /[\u0300-\u036f]/g,
+      ""
+    )
+    .toLowerCase()
+    .replace(
+      /['’]/g,
+      " "
+    )
+    .replace(
+      /[^a-z0-9\s-]/g,
+      " "
+    )
+    .replace(
+      /\s+/g,
+      " "
+    )
+    .trim();
+}
+
+function normalizeText(
+  text: string
+): string {
+  return decodeHtmlEntities(
+    stripHtml(text)
+  )
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function normalizeUrl(
+  url: string
+): string {
+  try {
+    const parsed =
+      new URL(url);
+
+    parsed.hash = "";
+
+    parsed.searchParams.delete(
+      "utm_source"
+    );
+
+    parsed.searchParams.delete(
+      "utm_medium"
+    );
+
+    parsed.searchParams.delete(
+      "utm_campaign"
+    );
+
+    parsed.searchParams.delete(
+      "utm_content"
+    );
+
+    parsed.searchParams.delete(
+      "utm_term"
+    );
+
+    return parsed
+      .toString()
+      .replace(/\/$/, "");
+  } catch {
+    return url
+      .trim()
+      .replace(/\/$/, "");
+  }
 }
 
 function countWords(
   text: string
 ): number {
-  return cleanText(
-    text
-      .replace(
-        /^##\s+/gm,
-        ""
-      )
-  )
-    .split(
-      /\s+/
-    )
-    .filter(
-      Boolean
-    ).length;
-}
-
-function parseRSS(
-  xml: string
-): Array<{
-  title: string;
-  description: string;
-  url: string;
-  publishedAt: string | null;
-}> {
-  const items =
-    extractBlocks(
-      xml,
-      "item"
-    );
-
-  return items
-    .map(
-      (item) => {
-        const title =
-          extractTag(
-            item,
-            "title"
-          );
-
-        const description =
-          extractTag(
-            item,
-            "description"
-          ) ||
-          extractTag(
-            item,
-            "content:encoded"
-          );
-
-        const url =
-          extractTag(
-            item,
-            "link"
-          ) ||
-          extractTag(
-            item,
-            "guid"
-          );
-
-        const publishedAt =
-          extractTag(
-            item,
-            "pubDate"
-          ) ||
-          extractTag(
-            item,
-            "published"
-          ) ||
-          extractTag(
-            item,
-            "updated"
-          );
-
-        return {
-          title:
-            cleanText(
-              title
-            ),
-          description:
-            cleanText(
-              description
-            ),
-          url:
-            cleanText(
-              url
-            ),
-          publishedAt:
-            publishedAt
-              ? new Date(
-                  publishedAt
-                ).toISOString()
-              : null,
-        };
-      }
-    )
-    .filter(
-      (item) =>
-        item.title &&
-        item.url
-    );
-}
-
-function extractBlocks(
-  xml: string,
-  tag: string
-): string[] {
-  const pattern =
-    new RegExp(
-      `<${tag}\\b[^>]*>([\\s\\S]*?)<\\/${tag}>`,
-      "gi"
-    );
-
-  return [
-    ...xml.matchAll(
-      pattern
-    ),
-  ].map(
-    (match) =>
-      match[1]
-  );
-}
-
-function cleanText(
-  value: string
-): string {
-  return decodeHtmlEntities(
-    stripHtml(
-      value
-    )
-  )
-    .replace(
-      /\s+/g,
-      " "
-    )
-    .trim();
+  return text
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .length;
 }
 
 function stripHtml(
-  value: string
+  text: string
 ): string {
-  return value
-    .replace(
-      /<[^>]*>/g,
-      " "
-    )
-    .replace(
-      /\s+/g,
-      " "
-    )
-    .trim();
+  return text.replace(
+    /<[^>]*>/g,
+    " "
+  );
 }
 
 function decodeHtmlEntities(
-  value: string
+  text: string
 ): string {
-  return value
+  return text
+    .replace(
+      /&nbsp;/gi,
+      " "
+    )
     .replace(
       /&amp;/gi,
       "&"
@@ -1963,7 +2478,11 @@ function decodeHtmlEntities(
       '"'
     )
     .replace(
-      /&#39;|&apos;/gi,
+      /&#39;/gi,
+      "'"
+    )
+    .replace(
+      /&apos;/gi,
       "'"
     )
     .replace(
@@ -1990,552 +2509,5 @@ function decodeHtmlEntities(
             16
           )
         )
-    );
-}
-
-function dateValue(
-  value: string | null
-): number {
-  if (!value) {
-    return 0;
-  }
-
-  const time =
-    new Date(
-      value
-    ).getTime();
-
-  return Number.isNaN(
-    time
-  )
-    ? 0
-    : time;
-}
-
-function getLatestDate(
-  cluster: FeedItem[]
-): number {
-  return Math.max(
-    ...cluster.map(
-      (item) =>
-        dateValue(
-          item.publishedAt
-        )
-    )
-  );
-}
-
-function normalizeUrl(
-  url: string
-): string {
-  try {
-    const parsed =
-      new URL(
-        url
-      );
-
-    parsed.hash =
-      "";
-
-    const removable =
-      [
-        "utm_source",
-        "utm_medium",
-        "utm_campaign",
-        "utm_term",
-        "utm_content",
-        "gclid",
-        "fbclid",
-      ];
-
-    for (
-      const key of removable
-    ) {
-      parsed.searchParams.delete(
-        key
-      );
-    }
-
-    return parsed
-      .toString()
-      .replace(
-        /\/$/,
-        ""
-      )
-      .toLowerCase();
-  } catch {
-    return url
-      .trim()
-      .toLowerCase();
-  }
-}
-
-function deduplicateByUrl(
-  items: FeedItem[]
-): FeedItem[] {
-  const seen =
-    new Set<string>();
-
-  return items.filter(
-    (item) => {
-      const key =
-        normalizeUrl(
-          item.url
-        );
-
-      if (
-        seen.has(key)
-      ) {
-        return false;
-      }
-
-      seen.add(key);
-      return true;
-    }
-  );
-}
-
-function buildClusters(
-  items: FeedItem[]
-): FeedItem[][] {
-  const clusters:
-    FeedItem[][] = [];
-
-  for (const item of items) {
-    let bestCluster:
-      FeedItem[] | null =
-      null;
-
-    let bestScore =
-      0;
-
-    for (const cluster of clusters) {
-      const score =
-        clusterSimilarity(
-          item,
-          cluster
-        );
-
-      if (
-        score >
-        bestScore
-      ) {
-        bestScore =
-          score;
-        bestCluster =
-          cluster;
-      }
-    }
-
-    if (
-      bestCluster &&
-      bestScore >=
-        0.34
-    ) {
-      bestCluster.push(
-        item
-      );
-    } else {
-      clusters.push([
-        item,
-      ]);
-    }
-  }
-
-  return clusters;
-}
-
-function clusterSimilarity(
-  item: FeedItem,
-  cluster: FeedItem[]
-): number {
-  let best =
-    0;
-
-  for (const other of cluster) {
-    const titleScore =
-      titleSimilarity(
-        item.title,
-        other.title
-      );
-
-    const entityScore =
-      entitySimilarity(
-        item.title,
-        other.title
-      );
-
-    const dateScore =
-      dateSimilarity(
-        item.publishedAt,
-        other.publishedAt
-      );
-
-    const score =
-      titleScore * 0.55 +
-      entityScore * 0.3 +
-      dateScore * 0.15;
-
-    best =
-      Math.max(
-        best,
-        score
-      );
-  }
-
-  return best;
-}
-
-function titleSimilarity(
-  a: string,
-  b: string
-): number {
-  const first =
-    new Set(
-      tokenize(a)
-    );
-
-  const second =
-    new Set(
-      tokenize(b)
-    );
-
-  if (
-    first.size === 0 ||
-    second.size === 0
-  ) {
-    return 0;
-  }
-
-  let intersection =
-    0;
-
-  for (const word of first) {
-    if (
-      second.has(word)
-    ) {
-      intersection++;
-    }
-  }
-
-  return (
-    intersection /
-    Math.max(
-      first.size,
-      second.size
-    )
-  );
-}
-
-function entitySimilarity(
-  a: string,
-  b: string
-): number {
-  const entities =
-    [
-      "psg",
-      "paris",
-      "saint-germain",
-      "monaco",
-      "marseille",
-      "lyon",
-      "lens",
-      "lille",
-      "ballon d'or",
-      "ligue 1",
-      "ligue des champions",
-      "champions league",
-      "dembélé",
-      "doué",
-      "barcola",
-      "hakimi",
-      "vitinha",
-      "mbappé",
-    ];
-
-  const first =
-    entities.filter(
-      (entity) =>
-        a
-          .toLowerCase()
-          .includes(
-            entity
-          )
-    );
-
-  const second =
-    entities.filter(
-      (entity) =>
-        b
-          .toLowerCase()
-          .includes(
-            entity
-          )
-    );
-
-  if (
-    first.length === 0 ||
-    second.length === 0
-  ) {
-    return 0;
-  }
-
-  const common =
-    first.filter(
-      (entity) =>
-        second.includes(
-          entity
-        )
-    ).length;
-
-  return (
-    common /
-    Math.max(
-      first.length,
-      second.length
-    )
-  );
-}
-
-function dateSimilarity(
-  a: string | null,
-  b: string | null
-): number {
-  if (!a || !b) {
-    return 0;
-  }
-
-  const first =
-    new Date(a);
-
-  const second =
-    new Date(b);
-
-  if (
-    Number.isNaN(
-      first.getTime()
-    ) ||
-    Number.isNaN(
-      second.getTime()
-    )
-  ) {
-    return 0;
-  }
-
-  const diff =
-    Math.abs(
-      first.getTime() -
-        second.getTime()
-    );
-
-  const hours =
-    diff /
-    (1000 * 60 * 60);
-
-  if (
-    hours <= 6
-  ) {
-    return 1;
-  }
-
-  if (
-    hours <= 24
-  ) {
-    return 0.7;
-  }
-
-  if (
-    hours <= 72
-  ) {
-    return 0.3;
-  }
-
-  return 0;
-}
-
-function tokenize(
-  value: string
-): string[] {
-  return value
-    .toLowerCase()
-    .normalize(
-      "NFD"
-    )
-    .replace(
-      /[\u0300-\u036f]/g,
-      ""
-    )
-    .replace(
-      /[^a-z0-9]+/g,
-      " "
-    )
-    .split(
-      /\s+/
-    )
-    .filter(
-      (word) =>
-        word.length >= 3 &&
-        !STOP_WORDS.has(
-          word
-        )
-    );
-}
-
-const STOP_WORDS =
-  new Set([
-    "les",
-    "des",
-    "une",
-    "dans",
-    "avec",
-    "pour",
-    "sur",
-    "par",
-    "est",
-    "son",
-    "ses",
-    "mais",
-    "plus",
-    "apres",
-    "avant",
-    "cette",
-    "cela",
-    "etre",
-    "sont",
-    "qui",
-    "que",
-    "du",
-    "de",
-    "le",
-    "la",
-    "un",
-    "et",
-    "ou",
-    "au",
-    "aux",
-    "en",
-    "a",
-    "ce",
-    "se",
-    "ne",
-    "pas",
-    "une",
-  ]);
-
-function areSimilarTitles(
-  a: string,
-  b: string
-): boolean {
-  return (
-    titleSimilarity(
-      a,
-      b
-    ) >=
-    0.62
-  );
-}
-
-function isRelevantToPSG(
-  title: string,
-  description: string
-): boolean {
-  const text =
-    `${title} ${description}`.toLowerCase();
-
-  const directSignals =
-    [
-      "psg",
-      "paris saint-germain",
-      "paris sg",
-      "paris saint germain",
-      "parisien",
-      "parisiens",
-    ];
-
-  if (
-    directSignals.some(
-      (signal) =>
-        text.includes(
-          signal
-        )
-    )
-  ) {
-    return true;
-  }
-
-  const psgPlayers =
-    [
-      "dembélé",
-      "dembele",
-      "doué",
-      "doue",
-      "barcola",
-      "hakimi",
-      "vitinha",
-      "marquinhos",
-      "nuno mendes",
-      "kvaratskhelia",
-      "joao neves",
-      "pacho",
-      "fabián ruiz",
-      "fabian ruiz",
-      "ferran torres",
-    ];
-
-  const psgContexts =
-    [
-      "ligue des champions",
-      "champions league",
-      "ligue 1",
-      "ballon d'or",
-      "ballon dor",
-    ];
-
-  const playerSignal =
-    psgPlayers.some(
-      (player) =>
-        text.includes(
-          player
-        )
-    );
-
-  const contextSignal =
-    psgContexts.some(
-      (context) =>
-        text.includes(
-          context
-        )
-    );
-
-  return (
-    playerSignal &&
-    contextSignal
-  );
-}
-
-function slugify(
-  value: string
-): string {
-  return value
-    .toString()
-    .normalize(
-      "NFD"
-    )
-    .replace(
-      /[\u0300-\u036f]/g,
-      ""
-    )
-    .toLowerCase()
-    .replace(
-      /[^a-z0-9]+/g,
-      "-"
-    )
-    .replace(
-      /^-+|-+$/g,
-      ""
-    )
-    .slice(
-      0,
-      180
     );
 }
