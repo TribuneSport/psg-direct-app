@@ -34,6 +34,7 @@ const SOURCE_TIMEOUT_MS = 3000;
 const GEMINI_TIMEOUT_MS = 8000;
 
 const MIN_ARTICLE_WORDS = 400;
+const TARGET_ARTICLE_WORDS = 600;
 const MAX_ARTICLE_WORDS = 900;
 
 const LOW_INFORMATION_WORDS = 110;
@@ -111,11 +112,12 @@ export async function GET(req: NextRequest) {
   let sourcePagesFetched = 0;
   let sourcePagesFailed = 0;
   let enrichedCharacters = 0;
+  let geminiCalls = 0;
 
   try {
     /*
      * =========================================================
-     * 1. RSS
+     * 1. RÉCUPÉRATION RSS
      * =========================================================
      */
 
@@ -183,7 +185,7 @@ export async function GET(req: NextRequest) {
 
     /*
      * =========================================================
-     * 3. DEDUPLICATION RSS
+     * 3. DÉDUPLICATION RSS
      * =========================================================
      */
 
@@ -227,7 +229,7 @@ export async function GET(req: NextRequest) {
 
     /*
      * =========================================================
-     * 5. CLUSTERS
+     * 5. CONSTRUCTION DES CLUSTERS
      * =========================================================
      */
 
@@ -315,7 +317,7 @@ export async function GET(req: NextRequest) {
 
     /*
      * =========================================================
-     * 7. TRAITEMENT
+     * 7. TRAITEMENT DES CLUSTERS
      * =========================================================
      */
 
@@ -337,6 +339,9 @@ export async function GET(req: NextRequest) {
       diagnostics.push(
         result.diagnostic
       );
+
+      geminiCalls +=
+        result.geminiCalls;
 
       sourcePagesFetched +=
         result.enrichment
@@ -454,18 +459,7 @@ export async function GET(req: NextRequest) {
       unlimitedDailyCap: true,
 
       diagnostics: {
-        geminiCalls:
-          diagnostics.filter(
-            (item) =>
-              [
-                "created",
-                "too_short",
-                "invalid_json",
-                "generation_error",
-              ].includes(
-                item.outcome
-              )
-          ).length,
+        geminiCalls,
 
         geminiSuccess:
           diagnostics.filter(
@@ -498,6 +492,13 @@ export async function GET(req: NextRequest) {
             (item) =>
               item.outcome ===
               "too_short"
+          ).length,
+
+        tooShortAfterRetry:
+          diagnostics.filter(
+            (item) =>
+              item.outcome ===
+              "too_short_after_retry"
           ).length,
 
         slugErrors:
@@ -571,6 +572,7 @@ async function processCluster(
   sourceUrl: string | null;
   diagnostic: Diagnostic;
   enrichment: EnrichmentResult;
+  geminiCalls: number;
 }> {
   const sources = [
     ...new Set(
@@ -604,7 +606,9 @@ async function processCluster(
       );
 
   /*
-   * Enrichissement des pages originales.
+   * =========================================================
+   * ENRICHISSEMENT
+   * =========================================================
    */
 
   const enrichment =
@@ -613,16 +617,21 @@ async function processCluster(
     );
 
   /*
-   * Génération Gemini.
+   * =========================================================
+   * PREMIÈRE GÉNÉRATION GEMINI
+   * =========================================================
    */
 
-  const generation =
+  let geminiCalls = 1;
+
+  const firstGeneration =
     await generateArticle(
       enrichment.sources
     );
 
   if (
-    generation.ok === false
+    firstGeneration.ok ===
+    false
   ) {
     return {
       created: false,
@@ -638,25 +647,83 @@ async function processCluster(
         titles,
 
         outcome:
-          generation.reason,
+          firstGeneration.reason,
 
         detail:
-          generation.error,
+          firstGeneration.error,
       },
 
       enrichment,
+
+      geminiCalls,
     };
   }
 
-  const article =
+  let article =
     normalizeArticle(
-      generation.article
+      firstGeneration.article
     );
 
-  const words =
+  let words =
     countWords(
       article.content
     );
+
+  /*
+   * =========================================================
+   * RETRY AUTOMATIQUE SI ARTICLE TROP COURT
+   * =========================================================
+   */
+
+  if (
+    words <
+    MIN_ARTICLE_WORDS
+  ) {
+    geminiCalls++;
+
+    const retry =
+      await generateArticle(
+        enrichment.sources,
+        true
+      );
+
+    if (
+      retry.ok ===
+      true
+    ) {
+      const retryArticle =
+        normalizeArticle(
+          retry.article
+        );
+
+      const retryWords =
+        countWords(
+          retryArticle.content
+        );
+
+      /*
+       * On conserve uniquement
+       * la meilleure version.
+       */
+
+      if (
+        retryWords >
+        words
+      ) {
+        article =
+          retryArticle;
+
+        words =
+          retryWords;
+      }
+    }
+  }
+
+  /*
+   * =========================================================
+   * ARTICLE TOUJOURS TROP COURT
+   * =========================================================
+   */
 
   if (
     words <
@@ -676,18 +743,22 @@ async function processCluster(
         titles,
 
         outcome:
-          "too_short",
+          "too_short_after_retry",
 
         detail:
           `title=${article.title.length}, words=${words}, excerpt=${article.excerpt.length}`,
       },
 
       enrichment,
+
+      geminiCalls,
     };
   }
 
   /*
-   * Protection contre les doublons après génération.
+   * =========================================================
+   * PROTECTION DOUBLON APRÈS GÉNÉRATION
+   * =========================================================
    */
 
   const duplicate =
@@ -724,8 +795,16 @@ async function processCluster(
       },
 
       enrichment,
+
+      geminiCalls,
     };
   }
+
+  /*
+   * =========================================================
+   * SLUG
+   * =========================================================
+   */
 
   let slug: string;
 
@@ -758,12 +837,20 @@ async function processCluster(
       },
 
       enrichment,
+
+      geminiCalls,
     };
   }
 
   const sourceUrl =
     sorted[0]?.link ||
     null;
+
+  /*
+   * =========================================================
+   * CRÉATION ARTICLE
+   * =========================================================
+   */
 
   try {
     await prisma.article.create(
@@ -818,6 +905,8 @@ async function processCluster(
       },
 
       enrichment,
+
+      geminiCalls,
     };
   } catch (error) {
     return {
@@ -843,13 +932,15 @@ async function processCluster(
       },
 
       enrichment,
+
+      geminiCalls,
     };
   }
 }
 
 /*
  * =========================================================
- * ENRICHISSEMENT
+ * ENRICHISSEMENT DES SOURCES
  * =========================================================
  */
 
@@ -1041,7 +1132,8 @@ function shouldFetchSourcePage(
  */
 
 async function generateArticle(
-  sources: ArticleInput[]
+  sources: ArticleInput[],
+  retry = false
 ): Promise<
   | {
       ok: true;
@@ -1076,20 +1168,49 @@ async function generateArticle(
         "\n\n==============================\n\n"
       );
 
+  const retryInstruction =
+    retry
+      ? `
+ATTENTION : une première version était trop courte.
+
+Tu dois maintenant produire une version nettement plus développée.
+
+Objectif : environ 600 à 800 mots.
+
+Développe uniquement les informations réellement présentes dans les sources :
+- contexte
+- date
+- heure
+- adversaire
+- compétition
+- stade
+- diffusion
+- compositions
+- absents
+- blessures
+- déclarations
+- arbitre
+- enjeux
+- informations récentes
+
+Ne répète pas artificiellement les mêmes phrases.
+
+N'invente absolument rien pour atteindre la longueur demandée.
+`
+      : "";
+
   const prompt = `
 Tu es le rédacteur en chef de PSG Direct.
 
-Ta mission est de transformer les sources ci-dessous en UN SEUL article original de presse sportive sur le Paris Saint-Germain.
+Ta mission est de transformer plusieurs sources d'actualité en UN SEUL article original de presse sportive sur le Paris Saint-Germain.
+
+${retryInstruction}
 
 OBJECTIF :
 
-Produire un article factuel, précis, utile au lecteur et beaucoup plus riche que les simples titres RSS.
+Fusionner les informations provenant de plusieurs médias lorsqu'ils parlent du même événement.
 
-IMPORTANT :
-
-Plusieurs sources peuvent parler exactement du même événement.
-
-Tu dois FUSIONNER ces sources.
+Les doublons ne doivent PAS produire plusieurs articles.
 
 Exemple :
 
@@ -1102,55 +1223,53 @@ Le match est diffusé sur Canal+.
 Source C :
 Le match se joue au Parc des Princes.
 
-Tu dois produire UN article contenant les trois informations.
-
-Tu ne dois surtout pas produire trois articles différents.
+L'article final doit réunir ces informations dans un seul article.
 
 RÈGLES ABSOLUES :
 
-1. Utilise uniquement les informations contenues dans les sources.
+1. Utilise uniquement les informations présentes dans les sources.
 
-2. N'invente absolument aucune information.
+2. N'invente aucune information.
 
-3. Si une information n'est pas présente dans les sources, ne la crée pas.
+3. Ne complète jamais une information avec tes connaissances personnelles.
 
-4. Ne complète jamais avec tes connaissances personnelles.
+4. Ne devine jamais une date.
 
 5. Ne devine jamais une heure.
 
-6. Ne devine jamais une date.
+6. Ne devine jamais un stade.
 
-7. Ne devine jamais un stade.
+7. Ne devine jamais une chaîne TV.
 
-8. Ne devine jamais une chaîne TV.
+8. Ne devine jamais une plateforme de streaming.
 
-9. Ne devine jamais une plateforme de streaming.
+9. Ne devine jamais une composition.
 
-10. Ne devine jamais une composition.
+10. Ne devine jamais une absence.
 
-11. Ne devine jamais une absence.
+11. Ne devine jamais une blessure.
 
-12. Ne devine jamais une blessure.
+12. Ne devine jamais un résultat.
 
-13. Ne devine jamais un résultat.
+13. Ne devine jamais une déclaration.
 
-14. Ne devine jamais une déclaration.
+14. Ne devine jamais un classement.
 
-15. Ne devine jamais un classement.
+15. Ne mélange jamais deux événements différents.
 
-16. Ne mélange jamais deux événements différents.
+16. Ne mélange jamais deux matchs différents.
 
-17. Ne mélange jamais deux matchs différents.
+17. Ne mélange jamais deux adversaires différents.
 
 18. Ne mélange jamais deux joueurs différents.
 
 19. Ne mélange jamais deux transferts différents.
 
-20. Si deux sources parlent du même sujet, fusionne leurs informations.
+20. Si une source mentionne plusieurs événements, utilise uniquement les informations concernant le sujet principal du cluster.
 
 21. Une information présente dans plusieurs sources est particulièrement fiable.
 
-22. Une information provenant d'une seule source peut être utilisée si elle est clairement présentée dans cette source.
+22. Une information provenant d'une seule source peut être utilisée si elle est clairement présentée.
 
 23. Si une information est incertaine, présente-la comme telle.
 
@@ -1160,17 +1279,17 @@ RÈGLES ABSOLUES :
 
 26. Ne copie jamais les phrases originales.
 
-27. Réécris entièrement l'information avec ton propre style journalistique.
+27. Réécris entièrement les informations.
 
 28. Le français doit être naturel.
 
-29. Évite les phrases génériques.
+29. Chaque paragraphe doit apporter une information utile.
 
-30. Chaque paragraphe doit apporter une information utile.
+30. Évite les phrases génériques.
 
-INFORMATIONS À RECHERCHER DANS LES SOURCES :
+INFORMATIONS À RECHERCHER :
 
-- date du match
+- date
 - heure
 - adversaire
 - compétition
@@ -1195,51 +1314,37 @@ INFORMATIONS À RECHERCHER DANS LES SOURCES :
 - entraînement
 - actualité du groupe
 
-IMPORTANT POUR LES INFORMATIONS MANQUANTES :
+IMPORTANT :
 
-Si les sources indiquent :
+Si l'information n'est pas dans les sources, ne l'invente pas.
 
-"Le match aura lieu samedi"
+Exemple :
 
-mais ne donnent aucune heure :
+Si les sources disent seulement :
 
-écris simplement que le match est prévu samedi.
+"Le PSG joue samedi"
 
-N'invente pas l'heure.
+écris que le PSG joue samedi.
 
-Si les sources indiquent :
+N'ajoute pas d'heure.
 
-"Le match sera diffusé à la télévision"
-
-mais ne donnent pas la chaîne :
+Si les sources ne donnent pas de chaîne TV :
 
 ne donne aucune chaîne.
-
-Si les sources donnent une information précise :
-
-conserve cette précision.
-
-OBJECTIF DE LONGUEUR :
-
-Essaie de produire entre 500 et 800 mots lorsque les informations disponibles le permettent.
-
-Cependant :
-
-Il est préférable de produire 350 mots factuels plutôt que 600 mots inventés.
 
 STRUCTURE :
 
 Titre :
 
-Un titre précis, informatif et journalistique.
+Titre précis, journalistique et informatif.
 
 Chapô :
 
-2 ou 3 phrases résumant les informations principales.
+2 ou 3 phrases avec les informations principales.
 
 Corps :
 
-## Un premier intertitre informatif
+## Premier intertitre informatif
 
 Paragraphes courts.
 
@@ -1257,19 +1362,17 @@ Paragraphes courts.
 
 Conclusion :
 
-Une courte conclusion utile.
+Courte conclusion utile.
 
-ÉVITE ABSOLUMENT les titres vagues comme :
+LONGUEUR :
 
-"PSG - Monaco : les détails à suivre"
+${retry ? "Environ 600 à 800 mots." : "Environ 500 à 800 mots."}
 
-"Le PSG prépare son prochain match"
+Ne remplis jamais artificiellement l'article.
 
-"Une nouvelle importante pour le PSG"
+Il vaut mieux un article plus court mais totalement factuel qu'un article long contenant des informations inventées.
 
-Le titre doit dire précisément ce qui est nouveau.
-
-FORMAT DE SORTIE :
+FORMAT :
 
 Retourne UNIQUEMENT un objet JSON valide.
 
@@ -1279,7 +1382,7 @@ AUCUN texte après le JSON.
 
 AUCUNE balise Markdown autour du JSON.
 
-Format exact :
+Format :
 
 {
   "title": "Titre de l'article",
@@ -1287,13 +1390,7 @@ Format exact :
   "content": "Contenu complet en Markdown"
 }
 
-Le contenu peut contenir :
-
-## Intertitre
-
-Paragraphes.
-
-Conserve les retours à la ligne.
+Le contenu peut contenir des retours à la ligne.
 
 SOURCES :
 
@@ -1444,7 +1541,7 @@ async function callGemini(
                       0.2,
 
                     maxOutputTokens:
-                      3000,
+                      3500,
 
                     responseMimeType:
                       "application/json",
@@ -1532,7 +1629,7 @@ async function callGemini(
 
 /*
  * =========================================================
- * PARSING JSON ROBUSTE
+ * PARSING JSON GEMINI
  * =========================================================
  */
 
@@ -1548,10 +1645,6 @@ function parseGeminiJson(
 
   let cleaned =
     text.trim();
-
-  /*
-   * Suppression des balises Markdown.
-   */
 
   cleaned =
     cleaned.replace(
@@ -1603,21 +1696,14 @@ function parseGeminiJson(
     }
   } catch {
     /*
-     * On continue avec
-     * l'extraction du JSON.
+     * Continue.
      */
   }
 
   /*
-   * Gemini peut parfois répondre :
-   *
-   * Voici le JSON :
-   * {
-   *   ...
-   * }
-   *
-   * On récupère alors le premier
-   * objet JSON équilibré.
+   * Recherche d'un objet JSON
+   * dans une éventuelle réponse
+   * contenant du texte autour.
    */
 
   const jsonCandidate =
@@ -1657,9 +1743,9 @@ function parseGeminiJson(
     };
   } catch {
     /*
-     * Dernier niveau :
-     * tentative de nettoyage
-     * des caractères problématiques.
+     * Dernière tentative :
+     * suppression des caractères
+     * de contrôle.
      */
 
     try {
@@ -1699,7 +1785,7 @@ function parseGeminiJson(
 
 /*
  * =========================================================
- * VALIDATION OBJET GEMINI
+ * VALIDATION GEMINI
  * =========================================================
  */
 
@@ -1708,7 +1794,7 @@ function isValidGeminiArticle(
 ): value is GeminiArticle {
   if (
     typeof value !==
-    "object" ||
+      "object" ||
     value === null
   ) {
     return false;
@@ -1771,6 +1857,7 @@ function extractFirstJsonObject(
       ) {
         escaped =
           false;
+
         continue;
       }
 
@@ -1780,6 +1867,7 @@ function extractFirstJsonObject(
       ) {
         escaped =
           true;
+
         continue;
       }
 
@@ -1800,6 +1888,7 @@ function extractFirstJsonObject(
     ) {
       inString =
         true;
+
       continue;
     }
 
@@ -1808,6 +1897,7 @@ function extractFirstJsonObject(
       "{"
     ) {
       depth++;
+
       continue;
     }
 
@@ -1908,7 +1998,7 @@ function normalizeArticle(
 
 /*
  * =========================================================
- * STRUCTURE
+ * STRUCTURE ARTICLE
  * =========================================================
  */
 
@@ -1981,7 +2071,7 @@ function addBasicStructure(
 
 /*
  * =========================================================
- * LIMITATION
+ * LIMITATION MOTS
  * =========================================================
  */
 
@@ -2073,15 +2163,24 @@ function buildSimpleClusters(
   return clusters;
 }
 
+/*
+ * =========================================================
+ * SIMILARITÉ CLUSTER
+ * =========================================================
+ */
+
 function similarityToCluster(
   item: FeedItem,
   cluster: FeedItem[]
 ): number {
+  const itemTitle =
+    normalizeForComparison(
+      item.title
+    );
+
   const itemOpponent =
     extractOpponent(
-      normalizeForComparison(
-        item.title
-      )
+      itemTitle
     );
 
   const clusterOpponents =
@@ -2107,39 +2206,71 @@ function similarityToCluster(
       ),
     ];
 
+  /*
+   * =======================================================
+   * RÈGLE IMPORTANTE :
+   * DEUX ADVERSAIRES DIFFÉRENTS =
+   * JAMAIS LE MÊME CLUSTER
+   * =======================================================
+   */
+
   if (
     itemOpponent &&
     clusterOpponents.length >
-      0 &&
-    !clusterOpponents.includes(
-      itemOpponent
-    )
-  ) {
-    return 0;
-  }
-
-  if (
-    !itemOpponent &&
-    clusterOpponents.length >
       0
   ) {
-    const bestTitleScore =
-      Math.max(
-        ...cluster.map(
-          (other) =>
-            titleSimilarity(
-              item.title,
-              other.title
-            )
-        )
+    const differentOpponent =
+      clusterOpponents.some(
+        (opponent) =>
+          opponent !==
+          itemOpponent
       );
 
     if (
-      bestTitleScore <
-      0.88
+      differentOpponent
     ) {
       return 0;
     }
+  }
+
+  /*
+   * =======================================================
+   * DÉTECTION DE PLUSIEURS ADVERSAIRES
+   * DANS UN MÊME TITRE
+   * =======================================================
+   */
+
+  const titleOpponents =
+    extractAllOpponents(
+      itemTitle
+    );
+
+  if (
+    titleOpponents.length >
+    1
+  ) {
+    /*
+     * Un titre comme :
+     *
+     * PSG-Monaco (1-2) &
+     * PSG-Bratislava
+     *
+     * ne doit pas servir à
+     * fusionner deux événements.
+     */
+
+    if (
+      itemOpponent &&
+      clusterOpponents.length >
+        0 &&
+      !clusterOpponents.includes(
+        itemOpponent
+      )
+    ) {
+      return 0;
+    }
+
+    return 0;
   }
 
   let best = 0;
@@ -2160,6 +2291,12 @@ function similarityToCluster(
   return best;
 }
 
+/*
+ * =========================================================
+ * SIMILARITÉ HISTOIRE
+ * =========================================================
+ */
+
 function simpleStorySimilarity(
   a: FeedItem,
   b: FeedItem
@@ -2174,15 +2311,42 @@ function simpleStorySimilarity(
       b.title
     );
 
-  const opponentA =
-    extractOpponent(
+  const opponentsA =
+    extractAllOpponents(
       titleA
     );
 
-  const opponentB =
-    extractOpponent(
+  const opponentsB =
+    extractAllOpponents(
       titleB
     );
+
+  /*
+   * Plusieurs adversaires dans un titre :
+   * on évite les fusions hasardeuses.
+   */
+
+  if (
+    opponentsA.length >
+      1 ||
+    opponentsB.length >
+      1
+  ) {
+    return 0;
+  }
+
+  const opponentA =
+    opponentsA[0] ||
+    null;
+
+  const opponentB =
+    opponentsB[0] ||
+    null;
+
+  /*
+   * Deux adversaires différents =
+   * événements différents.
+   */
 
   if (
     opponentA &&
@@ -2287,13 +2451,13 @@ function simpleStorySimilarity(
 
 /*
  * =========================================================
- * ADVERSAIRES
+ * TOUS LES ADVERSAIRES
  * =========================================================
  */
 
-function extractOpponent(
+function extractAllOpponents(
   title: string
-): string | null {
+): string[] {
   const opponents = [
     "slovan bratislava",
     "bratislava",
@@ -2340,13 +2504,55 @@ function extractOpponent(
     "aston villa",
   ];
 
-  return (
-    opponents.find(
+  const found =
+    opponents.filter(
       (opponent) =>
         title.includes(
           opponent
         )
+    );
+
+  /*
+   * Bratislava et Slovan désignent
+   * le même adversaire.
+   */
+
+  if (
+    found.includes(
+      "slovan bratislava"
     ) ||
+    found.includes(
+      "bratislava"
+    ) ||
+    found.includes(
+      "slovan"
+    )
+  ) {
+    return [
+      "slovan bratislava",
+    ];
+  }
+
+  return [
+    ...new Set(
+      found
+    ),
+  ];
+}
+
+/*
+ * =========================================================
+ * ADVERSAIRE PRINCIPAL
+ * =========================================================
+ */
+
+function extractOpponent(
+  title: string
+): string | null {
+  return (
+    extractAllOpponents(
+      title
+    )[0] ||
     null
   );
 }
@@ -2468,7 +2674,7 @@ function deduplicateItems(
 
 /*
  * =========================================================
- * DÉJÀ STOCKÉ
+ * ARTICLE DÉJÀ STOCKÉ
  * =========================================================
  */
 
@@ -2667,7 +2873,7 @@ function extractXMLTag(
 
 /*
  * =========================================================
- * EXTRACTION PAGE
+ * EXTRACTION PAGE WEB
  * =========================================================
  */
 
@@ -2926,7 +3132,7 @@ function meaningfulTokens(
 
 /*
  * =========================================================
- * SIMILARITÉ TITRES
+ * SIMILARITÉ TITRE
  * =========================================================
  */
 
@@ -2989,7 +3195,7 @@ function titleSimilarity(
 
 /*
  * =========================================================
- * NORMALISATION COMPARAISON
+ * NORMALISATION
  * =========================================================
  */
 
@@ -3238,7 +3444,7 @@ function countWords(
 
 /*
  * =========================================================
- * JOUR
+ * DÉBUT JOURNÉE
  * =========================================================
  */
 
@@ -3315,7 +3521,7 @@ function slugify(
 
 /*
  * =========================================================
- * FETCH TIMEOUT
+ * FETCH AVEC TIMEOUT
  * =========================================================
  */
 
