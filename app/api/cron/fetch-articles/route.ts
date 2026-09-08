@@ -359,8 +359,7 @@ export async function GET(req: NextRequest) {
             const orderedCluster =
               [...cluster].sort(
                 (a, b) =>
-                  a.priority -
-                  b.priority
+                  a.priority - b.priority
               );
 
             const representative =
@@ -485,8 +484,13 @@ export async function GET(req: NextRequest) {
           generatedResult =
             expandedResult;
         } else {
+          /*
+           * expandedResult est explicitement
+           * identifié comme une erreur grâce
+           * au test ok === false.
+           */
           geminiErrors.push(
-            expandedResult.ok === false
+            expandedResult.error
           );
         }
       }
@@ -796,7 +800,7 @@ Une information provenant d'une seule source doit rester attribuée à cette sou
 
 Le contenu doit contenir AU MINIMUM 400 MOTS.
 
-Le contenu doit comporter plusieurs paragraphes.
+Le contenu doit comporter au minimum 6 paragraphes distincts.
 
 Chaque paragraphe doit apporter une information concrète ou développer un fait réellement présent dans les sources.
 
@@ -935,9 +939,9 @@ Ne complète pas avec tes connaissances générales.
 
 Ne répète pas artificiellement une phrase pour atteindre 400 mots.
 
-Chaque paragraphe doit apporter une information ou une explication concrète.
+Le résultat final doit comporter au minimum 400 mots et au minimum 6 paragraphes distincts.
 
-Le résultat final doit comporter au minimum 400 mots.
+Chaque paragraphe doit apporter une information ou une explication concrète.
 
 ARTICLE ACTUEL :
 
@@ -1037,6 +1041,8 @@ async function callGemini(
 
               generationConfig: {
                 temperature: 0.2,
+
+                maxOutputTokens: 1800,
 
                 responseMimeType:
                   "application/json",
