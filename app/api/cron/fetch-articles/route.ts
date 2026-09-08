@@ -306,14 +306,8 @@ export async function GET(req: NextRequest) {
             enrichment.sources
           );
 
-        /*
-         * IMPORTANT :
-         * Utilisation explicite de === false
-         * pour que TypeScript reconnaisse
-         * correctement GenerationFailure.
-         */
         if (
-          generation.ok === false
+          "error" in generation
         ) {
           diagnostic.outcome =
             "generation_error";
@@ -349,7 +343,7 @@ export async function GET(req: NextRequest) {
             );
 
           if (
-            expanded.ok === true
+            "result" in expanded
           ) {
             article =
               expanded.result;
@@ -2287,7 +2281,7 @@ Réponds UNIQUEMENT avec un JSON valide :
     );
 
   if (
-    result.ok === false
+    "error" in result
   ) {
     return result;
   }
@@ -2438,7 +2432,7 @@ Réponds uniquement en JSON :
     );
 
   if (
-    result.ok === false
+    "error" in result
   ) {
     return result;
   }
@@ -2731,25 +2725,25 @@ function normalizeArticleStructure(
 
   text =
     text.replace(
-      /<h1[^>]*>(.*?)<\/h1>/gis,
+      /<h1[^>]*>([\s\S]*?)<\/h1>/gi,
       "\n\n"
     );
 
   text =
     text.replace(
-      /<h2[^>]*>(.*?)<\/h2>/gis,
+      /<h2[^>]*>([\s\S]*?)<\/h2>/gi,
       "\n\n## $1\n\n"
     );
 
   text =
     text.replace(
-      /<h3[^>]*>(.*?)<\/h3>/gis,
+      /<h3[^>]*>([\s\S]*?)<\/h3>/gi,
       "\n\n## $1\n\n"
     );
 
   text =
     text.replace(
-      /<p[^>]*>(.*?)<\/p>/gis,
+      /<p[^>]*>([\s\S]*?)<\/p>/gi,
       "\n\n$1\n\n"
     );
 
@@ -2761,19 +2755,19 @@ function normalizeArticleStructure(
 
   text =
     text.replace(
-      /<strong[^>]*>(.*?)<\/strong>/gis,
+      /<strong[^>]*>([\s\S]*?)<\/strong>/gi,
       "$1"
     );
 
   text =
     text.replace(
-      /<b[^>]*>(.*?)<\/b>/gis,
+      /<b[^>]*>([\s\S]*?)<\/b>/gi,
       "$1"
     );
 
   text =
     text.replace(
-      /<em[^>]*>(.*?)<\/em>/gis,
+      /<em[^>]*>([\s\S]*?)<\/em>/gi,
       "$1"
     );
 
