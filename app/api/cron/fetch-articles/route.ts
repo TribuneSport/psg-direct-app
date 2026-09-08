@@ -25,33 +25,19 @@ const RSS_FEEDS = [
 
 const MAX_ITEMS_PER_SOURCE = 25;
 
-/*
- * Objectif quotidien :
- * 20 articles minimum lorsqu'il existe suffisamment
- * de sujets réellement différents.
- *
- * Il n'y a volontairement PAS de plafond quotidien.
- * Les grosses journées PSG peuvent donc dépasser 20 articles.
- */
 const DAILY_TARGET = 20;
-
-/*
- * Nombre maximum d'articles générés par une seule
- * exécution du cron.
- *
- * Cela évite de lancer trop d'appels Gemini dans
- * une seule fonction Vercel.
- */
 const MAX_NEW_ARTICLES_PER_RUN = 5;
-
 const MAX_SOURCES_PER_ARTICLE = 5;
 
 const RSS_TIMEOUT_MS = 4000;
-const SOURCE_TIMEOUT_MS = 1800;
+const SOURCE_TIMEOUT_MS = 3000;
 const GEMINI_TIMEOUT_MS = 5000;
 
 const MIN_ARTICLE_WORDS = 400;
 const MAX_ARTICLE_WORDS = 900;
+
+const LOW_INFORMATION_WORDS = 110;
+const MAX_SOURCE_PAGE_CHARS = 6500;
 
 type FeedItem = {
   title: string;
@@ -82,6 +68,14 @@ type Diagnostic = {
   detail: string;
 };
 
+type EnrichmentResult = {
+  sources: ArticleInput[];
+  pagesFetched: number;
+  pagesFailed: number;
+  enrichedCharacters: number;
+  pageErrors: string[];
+};
+
 export async function GET(req: NextRequest) {
   const startedAt = Date.now();
 
@@ -92,7 +86,9 @@ export async function GET(req: NextRequest) {
       {
         error: "Unauthorized",
       },
-      { status: 401 }
+      {
+        status: 401,
+      }
     );
   }
 
@@ -101,17 +97,25 @@ export async function GET(req: NextRequest) {
       {
         error: "GEMINI_API_KEY is missing",
       },
-      { status: 500 }
+      {
+        status: 500,
+      }
     );
   }
 
   const diagnostics: Diagnostic[] = [];
+
   const rssErrors: string[] = [];
+  const sourcePageErrors: string[] = [];
+
+  let sourcePagesFetched = 0;
+  let sourcePagesFailed = 0;
+  let enrichedCharacters = 0;
 
   try {
     /*
      * ---------------------------------------------------------
-     * 1. RÉCUPÉRATION DES RSS
+     * 1. RÉCUPÉRATION RSS
      * ---------------------------------------------------------
      */
 
@@ -125,16 +129,18 @@ export async function GET(req: NextRequest) {
               headers: {
                 Accept:
                   "application/rss+xml, application/xml, text/xml, */*",
-                "User-Agent": "PSG-Direct/1.0",
+                "User-Agent":
+                  "PSG-Direct/1.0",
               },
             }
           );
 
-          const items = parseRSS(xml, feed.name);
-
           return {
             feed: feed.name,
-            items,
+            items: parseRSS(
+              xml,
+              feed.name
+            ),
             error: null as string | null,
           };
         } catch (error) {
@@ -155,26 +161,35 @@ export async function GET(req: NextRequest) {
       }
     }
 
-    /*
-     * ---------------------------------------------------------
-     * 2. FUSION DES SOURCES
-     * ---------------------------------------------------------
-     */
-
     const allItems = feeds.flatMap(
       (result) => result.items
     );
 
-    const relevantItems = allItems.filter(
-      isRelevantPSG
-    );
+    /*
+     * ---------------------------------------------------------
+     * 2. FILTRAGE PSG
+     * ---------------------------------------------------------
+     */
 
-    const uniqueItems =
-      deduplicateItems(relevantItems);
+    const relevantItems =
+      allItems.filter(
+        isRelevantPSG
+      );
 
     /*
      * ---------------------------------------------------------
-     * 3. ARTICLES DÉJÀ PRÉSENTS
+     * 3. DÉDUPLICATION RSS
+     * ---------------------------------------------------------
+     */
+
+    const uniqueItems =
+      deduplicateItems(
+        relevantItems
+      );
+
+    /*
+     * ---------------------------------------------------------
+     * 4. ARTICLES DÉJÀ PRÉSENTS
      * ---------------------------------------------------------
      */
 
@@ -191,45 +206,42 @@ export async function GET(req: NextRequest) {
         },
       });
 
-    const newItems = uniqueItems.filter(
-      (item) =>
-        !isAlreadyStored(
-          item,
-          recentArticles
-        )
-    );
-
-    /*
-     * ---------------------------------------------------------
-     * 4. CLUSTERISATION
-     * ---------------------------------------------------------
-     *
-     * Un même sujet provenant de plusieurs médias
-     * devient UN seul article.
-     */
-
-    const clusters =
-      buildSimpleClusters(newItems);
-
-    const candidateClusters = clusters
-      .filter(
-        (cluster) => cluster.length > 0
-      )
-      .sort(
-        (a, b) =>
-          clusterPriority(b) -
-          clusterPriority(a)
+    const newItems =
+      uniqueItems.filter(
+        (item) =>
+          !isAlreadyStored(
+            item,
+            recentArticles
+          )
       );
 
     /*
      * ---------------------------------------------------------
-     * 5. COMPTEUR QUOTIDIEN
+     * 5. REGROUPEMENT DES SUJETS
      * ---------------------------------------------------------
-     *
-     * On compte les articles IA PSG créés depuis
-     * le début de la journée.
-     *
-     * Ce compteur est un objectif et non un plafond.
+     */
+
+    const clusters =
+      buildSimpleClusters(
+        newItems
+      );
+
+    const candidateClusters =
+      clusters
+        .filter(
+          (cluster) =>
+            cluster.length > 0
+        )
+        .sort(
+          (a, b) =>
+            clusterPriority(b) -
+            clusterPriority(a)
+        );
+
+    /*
+     * ---------------------------------------------------------
+     * 6. OBJECTIF QUOTIDIEN
+     * ---------------------------------------------------------
      */
 
     const startOfToday =
@@ -246,31 +258,12 @@ export async function GET(req: NextRequest) {
         },
       });
 
-    /*
-     * Combien manque-t-il pour atteindre l'objectif
-     * de 20 articles aujourd'hui ?
-     */
     const remainingDailyTarget =
       Math.max(
         0,
         DAILY_TARGET -
           articlesCreatedToday
       );
-
-    /*
-     * ---------------------------------------------------------
-     * 6. NOMBRE DE CLUSTERS À TRAITER
-     * ---------------------------------------------------------
-     *
-     * On génère au maximum 5 articles par passage.
-     *
-     * Si nous sommes sous l'objectif de 20,
-     * on essaie de rattraper le retard.
-     *
-     * Si nous sommes déjà à 20 ou plus,
-     * on continue quand même s'il existe de nouveaux
-     * sujets pertinents.
-     */
 
     const requestedCount =
       remainingDailyTarget > 0
@@ -290,28 +283,28 @@ export async function GET(req: NextRequest) {
         requestedCount
       );
 
-    let created = 0;
-    let skipped = 0;
-
     /*
-     * Cette liste est enrichie au fur et à mesure
-     * qu'un article est créé afin d'éviter qu'un second
-     * cluster de la même exécution génère un titre
-     * quasiment identique.
+     * On garde une copie en mémoire afin
+     * d'éviter de créer deux fois le même
+     * article pendant le même run.
      */
 
     const articlesForDuplicateCheck =
       [...recentArticles];
 
+    let created = 0;
+    let skipped = 0;
+
     /*
      * ---------------------------------------------------------
-     * 7. GÉNÉRATION DES ARTICLES
+     * 7. TRAITEMENT DES CLUSTERS
      * ---------------------------------------------------------
      */
 
     for (
       let index = 0;
-      index < selectedClusters.length;
+      index <
+      selectedClusters.length;
       index++
     ) {
       const result =
@@ -325,20 +318,37 @@ export async function GET(req: NextRequest) {
         result.diagnostic
       );
 
+      sourcePagesFetched +=
+        result.enrichment
+          .pagesFetched;
+
+      sourcePagesFailed +=
+        result.enrichment
+          .pagesFailed;
+
+      enrichedCharacters +=
+        result.enrichment
+          .enrichedCharacters;
+
+      sourcePageErrors.push(
+        ...result.enrichment
+          .pageErrors
+      );
+
       if (result.created) {
         created++;
 
-        /*
-         * On ajoute immédiatement le titre généré
-         * à la mémoire locale.
-         */
-        articlesForDuplicateCheck.push({
-          title:
-            result.articleTitle || "",
-          slug: "",
-          sourceUrl:
-            result.sourceUrl || null,
-        });
+        articlesForDuplicateCheck.push(
+          {
+            title:
+              result.articleTitle ||
+              "",
+            slug: "",
+            sourceUrl:
+              result.sourceUrl ||
+              null,
+          }
+        );
       } else {
         skipped++;
       }
@@ -346,7 +356,7 @@ export async function GET(req: NextRequest) {
 
     /*
      * ---------------------------------------------------------
-     * 8. NOUVEAU TOTAL DU JOUR
+     * 8. RÉSULTAT
      * ---------------------------------------------------------
      */
 
@@ -355,51 +365,76 @@ export async function GET(req: NextRequest) {
       created;
 
     return NextResponse.json({
-      checked: allItems.length,
-      newItems: newItems.length,
-      clusters: clusters.length,
+      checked:
+        allItems.length,
+
+      newItems:
+        newItems.length,
+
+      clusters:
+        clusters.length,
+
       candidateClusters:
         candidateClusters.length,
+
       processedClusters:
         selectedClusters.length,
-      deferred: Math.max(
-        0,
-        candidateClusters.length -
-          selectedClusters.length
-      ),
+
+      deferred:
+        Math.max(
+          0,
+          candidateClusters.length -
+            selectedClusters.length
+        ),
+
       created,
+
       skipped,
+
       articlesCreatedToday:
         totalCreatedToday,
+
       dailyTarget:
         DAILY_TARGET,
+
       remainingDailyTarget:
         Math.max(
           0,
           DAILY_TARGET -
             totalCreatedToday
         ),
+
       dailyTargetReached:
         totalCreatedToday >=
         DAILY_TARGET,
-      sourcesOk: feeds
-        .filter(
-          (feed) => !feed.error
-        )
-        .map(
-          (feed) => feed.feed
+
+      sourcesOk:
+        feeds
+          .filter(
+            (feed) =>
+              !feed.error
+          )
+          .map(
+            (feed) =>
+              feed.feed
+          ),
+
+      sources:
+        RSS_FEEDS.map(
+          (feed) =>
+            feed.name
         ),
-      sources: RSS_FEEDS.map(
-        (feed) => feed.name
-      ),
+
       duplicates:
         uniqueItems.length -
         newItems.length,
+
       fusion: true,
       optimized: true,
       enrichment: true,
       simplified: true,
       unlimitedDailyCap: true,
+
       diagnostics: {
         geminiCalls:
           diagnostics.filter(
@@ -411,12 +446,14 @@ export async function GET(req: NextRequest) {
               item.outcome ===
                 "generation_error"
           ).length,
+
         geminiSuccess:
           diagnostics.filter(
             (item) =>
               item.outcome ===
               "created"
           ).length,
+
         geminiErrors:
           diagnostics
             .filter(
@@ -425,54 +462,78 @@ export async function GET(req: NextRequest) {
                 "generation_error"
             )
             .map(
-              (item) => item.detail
+              (item) =>
+                item.detail
             ),
+
         invalidJson:
           diagnostics.filter(
             (item) =>
               item.outcome ===
               "invalid_json"
           ).length,
+
         tooShort:
           diagnostics.filter(
             (item) =>
               item.outcome ===
               "too_short"
           ).length,
+
         slugErrors:
           diagnostics.filter(
             (item) =>
               item.outcome ===
               "slug_error"
           ).length,
+
         createErrors:
           diagnostics.filter(
             (item) =>
               item.outcome ===
               "create_error"
           ).length,
+
         rssErrors,
-        sourcePagesFetched: 0,
-        sourcePagesFailed: 0,
-        enrichedCharacters: 0,
-        sourcePageErrors: [],
-        clusters: diagnostics,
+
+        sourcePagesFetched,
+
+        sourcePagesFailed,
+
+        enrichedCharacters,
+
+        sourcePageErrors,
+
+        clusters:
+          diagnostics,
       },
+
       elapsedMs:
-        Date.now() - startedAt,
+        Date.now() -
+        startedAt,
     });
   } catch (error) {
     return NextResponse.json(
       {
         error:
           getErrorMessage(error),
+
         elapsedMs:
-          Date.now() - startedAt,
+          Date.now() -
+          startedAt,
       },
-      { status: 500 }
+      {
+        status: 500,
+      }
     );
   }
 }
+
+/*
+ * =========================================================
+ * TRAITEMENT D'UN CLUSTER
+ * =========================================================
+ */
 
 async function processCluster(
   cluster: FeedItem[],
@@ -487,52 +548,91 @@ async function processCluster(
   articleTitle: string | null;
   sourceUrl: string | null;
   diagnostic: Diagnostic;
+  enrichment: EnrichmentResult;
 }> {
   const sources = [
     ...new Set(
       cluster.map(
-        (item) => item.source
+        (item) =>
+          item.source
       )
     ),
   ];
 
-  const titles = cluster.map(
-    (item) => item.title
-  );
-
-  const sorted = [...cluster]
-    .sort(
-      (a, b) =>
-        sourcePriority(b.source) -
-        sourcePriority(a.source)
-    )
-    .slice(
-      0,
-      MAX_SOURCES_PER_ARTICLE
+  const titles =
+    cluster.map(
+      (item) =>
+        item.title
     );
 
-  const enriched =
-    await enrichSources(sorted);
+  /*
+   * Priorité aux médias les plus intéressants.
+   */
+
+  const sorted =
+    [...cluster]
+      .sort(
+        (a, b) =>
+          sourcePriority(
+            b.source
+          ) -
+          sourcePriority(
+            a.source
+          )
+      )
+      .slice(
+        0,
+        MAX_SOURCES_PER_ARTICLE
+      );
+
+  /*
+   * ENRICHISSEMENT AVANT GEMINI
+   */
+
+  const enrichment =
+    await enrichSources(
+      sorted
+    );
+
+  /*
+   * GÉNÉRATION
+   */
 
   const generation =
     await generateArticle(
-      enriched
+      enrichment.sources
     );
 
-  if (generation.ok === false) {
+  if (
+    generation.ok === false
+  ) {
     return {
       created: false,
       articleTitle: null,
       sourceUrl: null,
+
       diagnostic: {
-        cluster: clusterNumber,
+        cluster:
+          clusterNumber,
+
         sources,
+
         titles,
-        outcome: generation.reason,
-        detail: generation.error,
+
+        outcome:
+          generation.reason,
+
+        detail:
+          generation.error,
       },
+
+      enrichment,
     };
   }
+
+  /*
+   * NORMALISATION
+   */
 
   const article =
     normalizeArticle(
@@ -544,6 +644,11 @@ async function processCluster(
       article.content
     );
 
+  /*
+   * PROTECTION CONTRE LES ARTICLES
+   * TROP COURTS
+   */
+
   if (
     words <
     MIN_ARTICLE_WORDS
@@ -552,16 +657,29 @@ async function processCluster(
       created: false,
       articleTitle: null,
       sourceUrl: null,
+
       diagnostic: {
-        cluster: clusterNumber,
+        cluster:
+          clusterNumber,
+
         sources,
+
         titles,
-        outcome: "too_short",
+
+        outcome:
+          "too_short",
+
         detail:
           `title=${article.title.length}, words=${words}, excerpt=${article.excerpt.length}`,
       },
+
+      enrichment,
     };
   }
+
+  /*
+   * DOUBLE VÉRIFICATION DES DOUBLONS
+   */
 
   const duplicate =
     recentArticles.some(
@@ -578,16 +696,29 @@ async function processCluster(
       created: false,
       articleTitle: null,
       sourceUrl: null,
+
       diagnostic: {
-        cluster: clusterNumber,
+        cluster:
+          clusterNumber,
+
         sources,
+
         titles,
+
         outcome:
           "duplicate_after_generation",
-        detail: article.title,
+
+        detail:
+          article.title,
       },
+
+      enrichment,
     };
   }
+
+  /*
+   * SLUG
+   */
 
   let slug: string;
 
@@ -601,68 +732,128 @@ async function processCluster(
       created: false,
       articleTitle: null,
       sourceUrl: null,
+
       diagnostic: {
-        cluster: clusterNumber,
+        cluster:
+          clusterNumber,
+
         sources,
+
         titles,
-        outcome: "slug_error",
+
+        outcome:
+          "slug_error",
+
         detail:
           getErrorMessage(error),
       },
+
+      enrichment,
     };
   }
 
   const sourceUrl =
-    sorted[0]?.link || null;
+    sorted[0]?.link ||
+    null;
+
+  /*
+   * CRÉATION EN BROUILLON
+   */
 
   try {
     await prisma.article.create({
       data: {
-        title: article.title,
+        title:
+          article.title,
+
         slug,
-        excerpt: article.excerpt,
-        content: article.content,
-        club: "PSG",
-        status: "DRAFT",
-        isAiGenerated: true,
+
+        excerpt:
+          article.excerpt,
+
+        content:
+          article.content,
+
+        club:
+          "PSG",
+
+        status:
+          "DRAFT",
+
+        isAiGenerated:
+          true,
+
         sourceUrl,
       },
     });
 
     return {
       created: true,
-      articleTitle: article.title,
+
+      articleTitle:
+        article.title,
+
       sourceUrl,
+
       diagnostic: {
-        cluster: clusterNumber,
+        cluster:
+          clusterNumber,
+
         sources,
+
         titles,
-        outcome: "created",
+
+        outcome:
+          "created",
+
         detail:
-          `words=${words}, sources=${sorted.length}`,
+          `words=${words}, sources=${enrichment.sources.length}, pages=${enrichment.pagesFetched}`,
       },
+
+      enrichment,
     };
   } catch (error) {
     return {
       created: false,
       articleTitle: null,
       sourceUrl: null,
+
       diagnostic: {
-        cluster: clusterNumber,
+        cluster:
+          clusterNumber,
+
         sources,
+
         titles,
-        outcome: "create_error",
+
+        outcome:
+          "create_error",
+
         detail:
           getErrorMessage(error),
       },
+
+      enrichment,
     };
   }
 }
 
+/*
+ * =========================================================
+ * ENRICHISSEMENT DES SOURCES
+ * =========================================================
+ */
+
 async function enrichSources(
   items: FeedItem[]
-): Promise<ArticleInput[]> {
-  const results =
+): Promise<EnrichmentResult> {
+  let pagesFetched = 0;
+  let pagesFailed = 0;
+  let enrichedCharacters = 0;
+
+  const pageErrors: string[] = [];
+
+  const sources =
     await Promise.all(
       items.map(
         async (item) => {
@@ -671,59 +862,207 @@ async function enrichSources(
               item.description
             );
 
-          if (
-            countWords(
-              description
-            ) < 80
-          ) {
-            try {
-              const page =
-                await fetchWithTimeout(
-                  item.link,
-                  SOURCE_TIMEOUT_MS,
-                  {
-                    headers: {
-                      Accept:
-                        "text/html,application/xhtml+xml",
-                      "User-Agent":
-                        "Mozilla/5.0 PSG-Direct/1.0",
-                    },
-                  }
+          /*
+           * On tente maintenant beaucoup plus souvent
+           * de récupérer la page originale.
+           */
+
+          const needsPage =
+            shouldFetchSourcePage(
+              item,
+              description,
+              items
+            );
+
+          if (!needsPage) {
+            return {
+              title:
+                item.title,
+
+              description,
+
+              source:
+                item.source,
+
+              link:
+                item.link,
+            };
+          }
+
+          try {
+            const page =
+              await fetchWithTimeout(
+                item.link,
+                SOURCE_TIMEOUT_MS,
+                {
+                  headers: {
+                    Accept:
+                      "text/html,application/xhtml+xml",
+
+                    "User-Agent":
+                      "Mozilla/5.0 (compatible; PSG-Direct/1.0; +https://psg-direct-app.vercel.app)",
+                  },
+                }
+              );
+
+            const extracted =
+              extractPageText(
+                page
+              );
+
+            pagesFetched++;
+
+            /*
+             * On ne remplace la description
+             * que si la page contient réellement
+             * davantage d'informations.
+             */
+
+            if (
+              extracted.length >
+              description.length +
+                80
+            ) {
+              const before =
+                description.length;
+
+              description =
+                extracted.slice(
+                  0,
+                  MAX_SOURCE_PAGE_CHARS
                 );
 
-              const extracted =
-                extractPageText(
-                  page
+              enrichedCharacters +=
+                Math.max(
+                  0,
+                  description.length -
+                    before
                 );
-
-              if (
-                extracted.length >
-                description.length
-              ) {
-                description =
-                  extracted.slice(
-                    0,
-                    5000
-                  );
-              }
-            } catch {
-              // La page source est facultative.
-              // Le RSS reste utilisable.
             }
+          } catch (error) {
+            pagesFailed++;
+
+            const message =
+              getErrorMessage(
+                error
+              );
+
+            pageErrors.push(
+              `${item.source}: ${message}`
+            );
           }
 
           return {
-            title: item.title,
+            title:
+              item.title,
+
             description,
-            source: item.source,
-            link: item.link,
+
+            source:
+              item.source,
+
+            link:
+              item.link,
           };
         }
       )
     );
 
-  return results;
+  return {
+    sources,
+
+    pagesFetched,
+
+    pagesFailed,
+
+    enrichedCharacters,
+
+    pageErrors,
+  };
 }
+
+/*
+ * =========================================================
+ * DÉCISION D'ENRICHISSEMENT
+ * =========================================================
+ */
+
+function shouldFetchSourcePage(
+  item: FeedItem,
+  description: string,
+  cluster: FeedItem[]
+): boolean {
+  const words =
+    countWords(
+      description
+    );
+
+  const title =
+    normalizeForComparison(
+      item.title
+    );
+
+  /*
+   * Les sujets nécessitant souvent
+   * des informations précises.
+   */
+
+  const concreteIntent =
+    /\b(heure|quelle chaine|quelle chaîne|chaine tv|chaîne tv|composition|compo|absent|absence|blesse|blessé|blessure|forfait|transfert|mercato|contrat|prolongation|arbitre|stade|diffusion|direct|ballon d'or)\b/i.test(
+      title
+    );
+
+  /*
+   * Plusieurs médias parlent du même sujet :
+   * on cherche alors à fusionner les informations.
+   */
+
+  const repeatedSubject =
+    cluster.length > 1;
+
+  /*
+   * RMC / CulturePSG sont prioritaires.
+   */
+
+  const highPriority =
+    sourcePriority(
+      item.source
+    ) >= 4;
+
+  /*
+   * Description courte.
+   */
+
+  const lowInformation =
+    words <
+    LOW_INFORMATION_WORDS;
+
+  /*
+   * Certaines descriptions RSS
+   * sont en réalité uniquement des teasers.
+   */
+
+  const suspiciousDescription =
+    description.length <
+      500 ||
+    /\b(lire la suite|cliquez|retrouvez|plus d'informations|article complet|en savoir plus)\b/i.test(
+      description
+    );
+
+  return (
+    lowInformation ||
+    repeatedSubject ||
+    concreteIntent ||
+    highPriority ||
+    suspiciousDescription
+  );
+}
+
+/*
+ * =========================================================
+ * GEMINI
+ * =========================================================
+ */
 
 async function generateArticle(
   sources: ArticleInput[]
@@ -741,16 +1080,25 @@ async function generateArticle(
   const sourceText =
     sources
       .map(
-        (source, index) =>
+        (
+          source,
+          index
+        ) =>
           [
             `SOURCE ${index + 1}`,
+
             `Média : ${source.source}`,
+
             `Titre : ${source.title}`,
+
             `Informations : ${source.description}`,
+
             `Lien : ${source.link}`,
           ].join("\n")
       )
-      .join("\n\n");
+      .join(
+        "\n\n"
+      );
 
   const prompt = `
 Tu es le rédacteur en chef de PSG Direct.
@@ -765,22 +1113,25 @@ RÈGLES ABSOLUES :
 - N'invente aucune heure.
 - N'invente aucun stade.
 - N'invente aucune chaîne TV.
+- N'invente aucune plateforme de diffusion.
 - N'invente aucun joueur.
 - N'invente aucun transfert.
 - N'invente aucun résultat.
 - N'invente aucune déclaration.
+- N'invente aucun classement.
 - Si une information n'est pas présente dans les sources, ne l'affirme pas.
-- Les sources peuvent parler du même événement avec des informations différentes : fusionne uniquement les informations qui concernent exactement le même sujet.
+- Fusionne les sources uniquement lorsqu'elles concernent exactement le même sujet.
 - Ne mélange jamais deux matchs différents.
 - Ne mélange jamais deux transferts différents.
-- Ne mélange jamais deux joueurs différents sauf si les sources les relient clairement.
+- Ne mélange jamais deux joueurs différents.
 - Ne mentionne pas l'intelligence artificielle.
 - Ne copie pas les phrases originales.
 - Rédige dans un français naturel et journalistique.
 - Donne la priorité aux informations factuelles et vérifiables.
-- Lorsqu'une même information apparaît dans plusieurs sources, considère-la comme particulièrement fiable.
-- Lorsqu'une information n'apparaît que dans une seule source, tu peux l'utiliser si elle est clairement attribuée à cette source.
+- Une information présente dans plusieurs sources est particulièrement solide.
+- Une information présente dans une seule source peut être utilisée si elle est clairement attribuable à cette source.
 - Ne transforme jamais une hypothèse en certitude.
+- Si les sources ne donnent pas une information, ne la complète pas avec tes connaissances générales.
 
 INFORMATIONS FACTUELLES À PRIVILÉGIER :
 
@@ -798,31 +1149,50 @@ INFORMATIONS FACTUELLES À PRIVILÉGIER :
 - suspendus
 - arbitre
 - conférence de presse
-- déclarations présentes dans les sources
+- déclarations
 - contexte sportif
-- classement lorsqu'il est présent dans les sources
-- forme récente lorsqu'elle est présente dans les sources
-- mercato et transferts uniquement lorsqu'ils sont réellement présents dans les sources
+- classement
+- forme récente
+- mercato
+- transferts
+- contrats
+- prolongations
+
+IMPORTANT :
+
+Si plusieurs sources parlent du même événement, fusionne leurs informations afin de produire un article plus complet.
+
+Exemple :
+
+SOURCE 1 :
+Le match aura lieu à 21h.
+
+SOURCE 2 :
+Le match sera diffusé sur Canal+.
+
+SOURCE 3 :
+Le match aura lieu au Parc des Princes.
+
+L'article final doit donc contenir ces trois informations.
+
+Mais si une information n'est présente dans aucune source, ne l'invente jamais.
 
 STRUCTURE OBLIGATOIRE :
 
-- Un titre précis.
+- Un titre précis et informatif.
 - Un chapô de 2 à 3 phrases.
-- Une introduction.
+- Une introduction factuelle.
 - 3 à 5 intertitres Markdown commençant par ##.
 - Des paragraphes courts.
 - Une conclusion.
 
-IMPORTANT POUR LES INTERTITRES :
+Le titre doit être précis et correspondre exactement au sujet.
 
-Les intertitres doivent être spécifiques au sujet traité.
+Évite les titres vagues comme :
 
-N'utilise PAS des titres génériques comme :
-"Les dernières informations"
-"Ce qu'il faut retenir"
-"Un contexte à suivre"
+"PSG - Monaco : les détails à suivre"
 
-Utilise plutôt des intertitres correspondant réellement aux informations disponibles.
+Privilégie un titre informatif lorsque les données disponibles le permettent.
 
 LONGUEUR :
 
@@ -840,7 +1210,7 @@ FORMAT JSON STRICT :
 
 Le champ content doit être du Markdown.
 
-Le champ content doit conserver de vrais retours à la ligne entre les paragraphes.
+Conserve de vrais retours à la ligne entre les paragraphes.
 
 SOURCES :
 
@@ -848,14 +1218,19 @@ ${sourceText}
 `;
 
   const response =
-    await callGemini(prompt);
+    await callGemini(
+      prompt
+    );
 
-  if (response.ok === false) {
+  if (
+    response.ok === false
+  ) {
     return {
       ok: false,
       reason:
         "generation_error",
-      error: response.error,
+      error:
+        response.error,
     };
   }
 
@@ -867,7 +1242,8 @@ ${sourceText}
   if (!parsed) {
     return {
       ok: false,
-      reason: "invalid_json",
+      reason:
+        "invalid_json",
       error:
         "Gemini response is not valid JSON",
     };
@@ -880,7 +1256,8 @@ ${sourceText}
   ) {
     return {
       ok: false,
-      reason: "invalid_json",
+      reason:
+        "invalid_json",
       error:
         "Missing title, excerpt or content",
     };
@@ -888,15 +1265,18 @@ ${sourceText}
 
   return {
     ok: true,
+
     article: {
       title:
         cleanText(
           parsed.title
         ),
+
       excerpt:
         cleanText(
           parsed.excerpt
         ),
+
       content:
         cleanArticleContent(
           parsed.content
@@ -904,6 +1284,12 @@ ${sourceText}
     },
   };
 }
+
+/*
+ * =========================================================
+ * APPEL GEMINI
+ * =========================================================
+ */
 
 async function callGemini(
   prompt: string
@@ -924,57 +1310,78 @@ async function callGemini(
 
   const errors: string[] = [];
 
-  for (const model of models) {
+  for (
+    const model of models
+  ) {
     try {
       const controller =
         new AbortController();
 
       const timeout =
-        setTimeout(() => {
-          controller.abort();
-        }, GEMINI_TIMEOUT_MS);
+        setTimeout(
+          () =>
+            controller.abort(),
+          GEMINI_TIMEOUT_MS
+        );
 
       try {
         const response =
           await fetch(
             `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`,
             {
-              method: "POST",
+              method:
+                "POST",
+
               headers: {
                 "Content-Type":
                   "application/json",
               },
-              body: JSON.stringify({
-                contents: [
-                  {
-                    parts: [
-                      {
-                        text: prompt,
-                      },
-                    ],
+
+              body:
+                JSON.stringify({
+                  contents: [
+                    {
+                      parts: [
+                        {
+                          text: prompt,
+                        },
+                      ],
+                    },
+                  ],
+
+                  generationConfig: {
+                    temperature:
+                      0.2,
+
+                    maxOutputTokens:
+                      2200,
+
+                    responseMimeType:
+                      "application/json",
                   },
-                ],
-                generationConfig: {
-                  temperature: 0.2,
-                  maxOutputTokens: 2200,
-                  responseMimeType:
-                    "application/json",
-                },
-              }),
+                }),
+
               signal:
                 controller.signal,
-              cache: "no-store",
+
+              cache:
+                "no-store",
             }
           );
 
-        if (!response.ok) {
+        if (
+          !response.ok
+        ) {
           const body =
             await response.text();
 
           errors.push(
             `Gemini ${model}: HTTP ${response.status}${
               body
-                ? ` - ${body.slice(0, 250)}`
+                ? ` - ${body.slice(
+                    0,
+                    250
+                  )}`
                 : ""
             }`
           );
@@ -986,7 +1393,8 @@ async function callGemini(
           await response.json();
 
         const text =
-          json?.candidates?.[0]
+          json
+            ?.candidates?.[0]
             ?.content?.parts?.[0]
             ?.text;
 
@@ -1007,7 +1415,9 @@ async function callGemini(
           text,
         };
       } finally {
-        clearTimeout(timeout);
+        clearTimeout(
+          timeout
+        );
       }
     } catch (error) {
       errors.push(
@@ -1020,11 +1430,20 @@ async function callGemini(
 
   return {
     ok: false,
+
     error:
-      errors.join(" | ") ||
+      errors.join(
+        " | "
+      ) ||
       "Gemini request failed",
   };
 }
+
+/*
+ * =========================================================
+ * JSON GEMINI
+ * =========================================================
+ */
 
 function parseGeminiJson(
   text: string
@@ -1055,7 +1474,9 @@ function parseGeminiJson(
       cleaned.trim();
 
     const parsed =
-      JSON.parse(cleaned);
+      JSON.parse(
+        cleaned
+      );
 
     if (
       typeof parsed?.title !==
@@ -1069,14 +1490,25 @@ function parseGeminiJson(
     }
 
     return {
-      title: parsed.title,
-      excerpt: parsed.excerpt,
-      content: parsed.content,
+      title:
+        parsed.title,
+
+      excerpt:
+        parsed.excerpt,
+
+      content:
+        parsed.content,
     };
   } catch {
     return null;
   }
 }
+
+/*
+ * =========================================================
+ * NORMALISATION ARTICLE
+ * =========================================================
+ */
 
 function normalizeArticle(
   article: GeminiArticle
@@ -1098,7 +1530,9 @@ function normalizeArticle(
   }
 
   const words =
-    countWords(content);
+    countWords(
+      content
+    );
 
   if (
     words >
@@ -1116,21 +1550,31 @@ function normalizeArticle(
       cleanText(
         article.title
       ),
+
     excerpt:
       cleanText(
         article.excerpt
       ),
+
     content:
       content.trim(),
   };
 }
+
+/*
+ * =========================================================
+ * STRUCTURE DE SECOURS
+ * =========================================================
+ */
 
 function addBasicStructure(
   content: string
 ): string {
   const paragraphs =
     content
-      .split(/\n\s*\n/)
+      .split(
+        /\n\s*\n/
+      )
       .map(
         (paragraph) =>
           paragraph.trim()
@@ -1138,24 +1582,26 @@ function addBasicStructure(
       .filter(Boolean);
 
   if (
-    paragraphs.length < 4
+    paragraphs.length <
+    4
   ) {
     return content;
   }
 
   const result: string[] =
-    [];
-
-  result.push(
-    paragraphs[0]
-  );
+    [
+      paragraphs[0],
+    ];
 
   const remaining =
-    paragraphs.slice(1);
+    paragraphs.slice(
+      1
+    );
 
   for (
     let index = 0;
-    index < remaining.length;
+    index <
+    remaining.length;
     index++
   ) {
     if (
@@ -1188,13 +1634,21 @@ function addBasicStructure(
   );
 }
 
+/*
+ * =========================================================
+ * LIMITATION MOTS
+ * =========================================================
+ */
+
 function trimToWords(
   text: string,
   maxWords: number
 ): string {
   const words =
     text
-      .split(/\s+/)
+      .split(
+        /\s+/
+      )
       .filter(Boolean);
 
   if (
@@ -1204,13 +1658,21 @@ function trimToWords(
     return text;
   }
 
-  return (
-    words
-      .slice(0, maxWords)
-      .join(" ") +
-    "..."
-  );
+  return `${words
+    .slice(
+      0,
+      maxWords
+    )
+    .join(
+      " "
+    )}...`;
 }
+
+/*
+ * =========================================================
+ * CLUSTERS
+ * =========================================================
+ */
 
 function buildSimpleClusters(
   items: FeedItem[]
@@ -1218,7 +1680,9 @@ function buildSimpleClusters(
   const clusters:
     FeedItem[][] = [];
 
-  for (const item of items) {
+  for (
+    const item of items
+  ) {
     let bestCluster:
       FeedItem[] | null =
       null;
@@ -1235,7 +1699,8 @@ function buildSimpleClusters(
         );
 
       if (
-        score > bestScore
+        score >
+        bestScore
       ) {
         bestScore =
           score;
@@ -1247,15 +1712,16 @@ function buildSimpleClusters(
 
     if (
       bestCluster &&
-      bestScore >= 0.72
+      bestScore >=
+        0.72
     ) {
       bestCluster.push(
         item
       );
     } else {
-      clusters.push([
-        item,
-      ]);
+      clusters.push(
+        [item]
+      );
     }
   }
 
@@ -1277,25 +1743,29 @@ function similarityToCluster(
     [
       ...new Set(
         cluster
-          .map((entry) =>
-            extractOpponent(
-              normalizeForComparison(
-                entry.title
+          .map(
+            (entry) =>
+              extractOpponent(
+                normalizeForComparison(
+                  entry.title
+                )
               )
-            )
           )
           .filter(
             (
               opponent
             ): opponent is string =>
-              Boolean(opponent)
+              Boolean(
+                opponent
+              )
           )
       ),
     ];
 
   if (
     itemOpponent &&
-    clusterOpponents.length > 0 &&
+    clusterOpponents.length >
+      0 &&
     !clusterOpponents.includes(
       itemOpponent
     )
@@ -1332,17 +1802,14 @@ function similarityToCluster(
   for (
     const other of cluster
   ) {
-    const score =
-      simpleStorySimilarity(
-        item,
-        other
+    best =
+      Math.max(
+        best,
+        simpleStorySimilarity(
+          item,
+          other
+        )
       );
-
-    if (
-      score > best
-    ) {
-      best = score;
-    }
   }
 
   return best;
@@ -1415,8 +1882,10 @@ function simpleStorySimilarity(
     );
 
   if (
-    tokensA.length === 0 ||
-    tokensB.length === 0
+    tokensA.length ===
+      0 ||
+    tokensB.length ===
+      0
   ) {
     return 0;
   }
@@ -1471,6 +1940,12 @@ function simpleStorySimilarity(
     : 0;
 }
 
+/*
+ * =========================================================
+ * ADVERSAIRES
+ * =========================================================
+ */
+
 function extractOpponent(
   title: string
 ): string | null {
@@ -1500,7 +1975,6 @@ function extractOpponent(
     "saint-etienne",
     "saint etienne",
     "bordeaux",
-    "nîmes",
     "nimes",
     "real madrid",
     "barcelone",
@@ -1521,20 +1995,22 @@ function extractOpponent(
     "aston villa",
   ];
 
-  for (
-    const opponent of opponents
-  ) {
-    if (
-      title.includes(
-        opponent
-      )
-    ) {
-      return opponent;
-    }
-  }
-
-  return null;
+  return (
+    opponents.find(
+      (opponent) =>
+        title.includes(
+          opponent
+        )
+    ) ||
+    null
+  );
 }
+
+/*
+ * =========================================================
+ * TYPE D'ÉVÉNEMENT
+ * =========================================================
+ */
 
 function extractEvent(
   title: string
@@ -1544,7 +2020,6 @@ function extractEvent(
     "compo",
     "compositions",
     "equipe type",
-    "équipe type",
     "formation",
     "match",
     "blessure",
@@ -1575,18 +2050,22 @@ function extractEvent(
     "conférence de presse",
   ];
 
-  for (
-    const event of events
-  ) {
-    if (
-      title.includes(event)
-    ) {
-      return event;
-    }
-  }
-
-  return null;
+  return (
+    events.find(
+      (event) =>
+        title.includes(
+          event
+        )
+    ) ||
+    null
+  );
 }
+
+/*
+ * =========================================================
+ * DÉDUPLICATION RSS
+ * =========================================================
+ */
 
 function deduplicateItems(
   items: FeedItem[]
@@ -1635,11 +2114,19 @@ function deduplicateItems(
       titles.add(title);
     }
 
-    result.push(item);
+    result.push(
+      item
+    );
   }
 
   return result;
 }
+
+/*
+ * =========================================================
+ * ARTICLE DÉJÀ STOCKÉ
+ * =========================================================
+ */
 
 function isAlreadyStored(
   item: FeedItem,
@@ -1661,7 +2148,8 @@ function isAlreadyStored(
         normalizeUrl(
           article.sourceUrl ||
             ""
-        ) === itemUrl
+        ) ===
+        itemUrl
     )
   ) {
     return true;
@@ -1676,6 +2164,12 @@ function isAlreadyStored(
   );
 }
 
+/*
+ * =========================================================
+ * FILTRE PSG
+ * =========================================================
+ */
+
 function isRelevantPSG(
   item: FeedItem
 ): boolean {
@@ -1685,7 +2179,9 @@ function isRelevantPSG(
     );
 
   return (
-    text.includes("psg") ||
+    text.includes(
+      "psg"
+    ) ||
     text.includes(
       "paris saint-germain"
     ) ||
@@ -1697,6 +2193,12 @@ function isRelevantPSG(
     )
   );
 }
+
+/*
+ * =========================================================
+ * RSS PARSER
+ * =========================================================
+ */
 
 function parseRSS(
   xml: string,
@@ -1710,7 +2212,9 @@ function parseRSS(
       /<item[\s\S]*?<\/item>/gi
     );
 
-  if (!itemMatches) {
+  if (
+    !itemMatches
+  ) {
     return items;
   }
 
@@ -1770,20 +2274,34 @@ function parseRSS(
 
     items.push({
       title:
-        cleanText(title),
+        cleanText(
+          title
+        ),
+
       description:
         cleanText(
           description
         ),
+
       link:
-        cleanUrl(link),
+        cleanUrl(
+          link
+        ),
+
       pubDate,
+
       source,
     });
   }
 
   return items;
 }
+
+/*
+ * =========================================================
+ * EXTRACTION XML
+ * =========================================================
+ */
 
 function extractXMLTag(
   xml: string,
@@ -1795,18 +2313,29 @@ function extractXMLTag(
       "i"
     );
 
-  const match =
-    xml.match(regex);
-
   return (
-    match?.[1] || ""
+    xml.match(
+      regex
+    )?.[1] ||
+    ""
   );
 }
+
+/*
+ * =========================================================
+ * EXTRACTION PAGE WEB
+ * =========================================================
+ */
 
 function extractPageText(
   html: string
 ): string {
-  let text = html;
+  let text =
+    html;
+
+  /*
+   * Suppression des éléments inutiles.
+   */
 
   text =
     text.replace(
@@ -1817,6 +2346,12 @@ function extractPageText(
   text =
     text.replace(
       /<style[\s\S]*?<\/style>/gi,
+      " "
+    );
+
+  text =
+    text.replace(
+      /<noscript[\s\S]*?<\/noscript>/gi,
       " "
     );
 
@@ -1838,15 +2373,31 @@ function extractPageText(
       " "
     );
 
+  text =
+    text.replace(
+      /<aside[\s\S]*?<\/aside>/gi,
+      " "
+    );
+
+  /*
+   * Priorité au contenu <article>.
+   */
+
   const articleMatch =
     text.match(
       /<article[^>]*>([\s\S]*?)<\/article>/i
     );
 
-  if (articleMatch) {
+  if (
+    articleMatch
+  ) {
     text =
       articleMatch[1];
   }
+
+  /*
+   * Conservation des paragraphes.
+   */
 
   text =
     text.replace(
@@ -1867,14 +2418,34 @@ function extractPageText(
     );
 
   text =
-    stripHtml(text);
+    text.replace(
+      /<li[^>]*>/gi,
+      "\n- "
+    );
+
+  text =
+    text.replace(
+      /<\/li>/gi,
+      "\n"
+    );
 
   return cleanArticleContent(
     decodeHtmlEntities(
-      text
+      stripHtml(
+        text
+      )
     )
-  ).slice(0, 5000);
+  ).slice(
+    0,
+    MAX_SOURCE_PAGE_CHARS
+  );
 }
+
+/*
+ * =========================================================
+ * PRIORITÉ CLUSTER
+ * =========================================================
+ */
 
 function clusterPriority(
   cluster: FeedItem[]
@@ -1918,17 +2489,26 @@ function clusterPriority(
 
   score +=
     Math.min(
-      cluster.length * 5,
+      cluster.length *
+        5,
       20
     );
 
   return score;
 }
 
+/*
+ * =========================================================
+ * PRIORITÉ SOURCE
+ * =========================================================
+ */
+
 function sourcePriority(
   source: string
 ): number {
-  switch (source) {
+  switch (
+    source
+  ) {
     case "RMC Sport":
       return 4;
 
@@ -1945,6 +2525,12 @@ function sourcePriority(
       return 1;
   }
 }
+
+/*
+ * =========================================================
+ * TOKENS
+ * =========================================================
+ */
 
 function meaningfulTokens(
   text: string
@@ -1984,7 +2570,9 @@ function meaningfulTokens(
     ]);
 
   return text
-    .split(/\s+/)
+    .split(
+      /\s+/
+    )
     .map(
       (token) =>
         token
@@ -2003,6 +2591,12 @@ function meaningfulTokens(
         )
     );
 }
+
+/*
+ * =========================================================
+ * SIMILARITÉ TITRES
+ * =========================================================
+ */
 
 function titleSimilarity(
   a: string,
@@ -2027,8 +2621,10 @@ function titleSimilarity(
     );
 
   if (
-    tokensA.size === 0 ||
-    tokensB.size === 0
+    tokensA.size ===
+      0 ||
+    tokensB.size ===
+      0
   ) {
     return 0;
   }
@@ -2059,13 +2655,21 @@ function titleSimilarity(
   );
 }
 
+/*
+ * =========================================================
+ * NORMALISATION COMPARAISON
+ * =========================================================
+ */
+
 function normalizeForComparison(
   text: string
 ): string {
   return decodeHtmlEntities(
     text
   )
-    .normalize("NFD")
+    .normalize(
+      "NFD"
+    )
     .replace(
       /[\u0300-\u036f]/g,
       ""
@@ -2082,34 +2686,37 @@ function normalizeForComparison(
     .trim();
 }
 
+/*
+ * =========================================================
+ * NORMALISATION URL
+ * =========================================================
+ */
+
 function normalizeUrl(
   url: string
 ): string {
   try {
     const parsed =
-      new URL(url);
+      new URL(
+        url
+      );
 
-    parsed.hash = "";
+    parsed.hash =
+      "";
 
-    parsed.searchParams.delete(
-      "utm_source"
-    );
-
-    parsed.searchParams.delete(
-      "utm_medium"
-    );
-
-    parsed.searchParams.delete(
-      "utm_campaign"
-    );
-
-    parsed.searchParams.delete(
-      "utm_content"
-    );
-
-    parsed.searchParams.delete(
-      "utm_term"
-    );
+    for (
+      const parameter of [
+        "utm_source",
+        "utm_medium",
+        "utm_campaign",
+        "utm_content",
+        "utm_term",
+      ]
+    ) {
+      parsed.searchParams.delete(
+        parameter
+      );
+    }
 
     return parsed
       .toString()
@@ -2126,6 +2733,12 @@ function normalizeUrl(
       );
   }
 }
+
+/*
+ * =========================================================
+ * URL PROPRE
+ * =========================================================
+ */
 
 function cleanUrl(
   url: string
@@ -2144,11 +2757,19 @@ function cleanUrl(
     .trim();
 }
 
+/*
+ * =========================================================
+ * TEXTE PROPRE
+ * =========================================================
+ */
+
 function cleanText(
   text: string
 ): string {
   return decodeHtmlEntities(
-    stripHtml(text)
+    stripHtml(
+      text
+    )
   )
     .replace(
       /\s+/g,
@@ -2158,12 +2779,11 @@ function cleanText(
 }
 
 /*
- * Nettoyage du contenu d'article.
- *
- * Contrairement à cleanText(), cette fonction conserve
- * les retours à la ligne afin que les paragraphes Markdown
- * restent correctement séparés dans l'article.
+ * =========================================================
+ * CONTENU ARTICLE PROPRE
+ * =========================================================
  */
+
 function cleanArticleContent(
   text: string
 ): string {
@@ -2195,6 +2815,12 @@ function cleanArticleContent(
     .trim();
 }
 
+/*
+ * =========================================================
+ * SUPPRESSION HTML
+ * =========================================================
+ */
+
 function stripHtml(
   text: string
 ): string {
@@ -2203,6 +2829,12 @@ function stripHtml(
     " "
   );
 }
+
+/*
+ * =========================================================
+ * ENTITÉS HTML
+ * =========================================================
+ */
 
 function decodeHtmlEntities(
   text: string
@@ -2238,14 +2870,22 @@ function decodeHtmlEntities(
     )
     .replace(
       /&#(\d+);/g,
-      (_, code) =>
+      (
+        _,
+        code
+      ) =>
         String.fromCharCode(
-          Number(code)
+          Number(
+            code
+          )
         )
     )
     .replace(
       /&#x([0-9a-f]+);/gi,
-      (_, code) =>
+      (
+        _,
+        code
+      ) =>
         String.fromCharCode(
           parseInt(
             code,
@@ -2255,15 +2895,39 @@ function decodeHtmlEntities(
     );
 }
 
+/*
+ * =========================================================
+ * COMPTEUR MOTS
+ * =========================================================
+ */
+
 function countWords(
   text: string
 ): number {
-  return text
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean)
+  const trimmed =
+    text.trim();
+
+  if (
+    !trimmed
+  ) {
+    return 0;
+  }
+
+  return trimmed
+    .split(
+      /\s+/
+    )
+    .filter(
+      Boolean
+    )
     .length;
 }
+
+/*
+ * =========================================================
+ * DÉBUT JOURNÉE
+ * =========================================================
+ */
 
 function getStartOfToday(): Date {
   const now =
@@ -2276,11 +2940,19 @@ function getStartOfToday(): Date {
   );
 }
 
+/*
+ * =========================================================
+ * SLUG UNIQUE
+ * =========================================================
+ */
+
 async function makeUniqueSlug(
   title: string
 ): Promise<string> {
   const base =
-    slugify(title);
+    slugify(
+      title
+    );
 
   let slug =
     base ||
@@ -2292,13 +2964,16 @@ async function makeUniqueSlug(
         where: {
           slug,
         },
+
         select: {
           id: true,
         },
       }
     );
 
-  if (!existing) {
+  if (
+    !existing
+  ) {
     return slug;
   }
 
@@ -2307,6 +2982,12 @@ async function makeUniqueSlug(
 
   return slug;
 }
+
+/*
+ * =========================================================
+ * SLUGIFY
+ * =========================================================
+ */
 
 function slugify(
   text: string
@@ -2322,8 +3003,17 @@ function slugify(
       /^-+|-+$/g,
       ""
     )
-    .slice(0, 90);
+    .slice(
+      0,
+      90
+    );
 }
+
+/*
+ * =========================================================
+ * FETCH AVEC TIMEOUT
+ * =========================================================
+ */
 
 async function fetchWithTimeout(
   url: string,
@@ -2334,9 +3024,11 @@ async function fetchWithTimeout(
     new AbortController();
 
   const timeout =
-    setTimeout(() => {
-      controller.abort();
-    }, timeoutMs);
+    setTimeout(
+      () =>
+        controller.abort(),
+      timeoutMs
+    );
 
   try {
     const response =
@@ -2344,13 +3036,18 @@ async function fetchWithTimeout(
         url,
         {
           ...options,
+
           signal:
             controller.signal,
-          cache: "no-store",
+
+          cache:
+            "no-store",
         }
       );
 
-    if (!response.ok) {
+    if (
+      !response.ok
+    ) {
       throw new Error(
         `HTTP ${response.status} ${response.statusText}`
       );
@@ -2358,9 +3055,17 @@ async function fetchWithTimeout(
 
     return await response.text();
   } finally {
-    clearTimeout(timeout);
+    clearTimeout(
+      timeout
+    );
   }
 }
+
+/*
+ * =========================================================
+ * MESSAGE ERREUR
+ * =========================================================
+ */
 
 function getErrorMessage(
   error: unknown
@@ -2371,5 +3076,7 @@ function getErrorMessage(
     return error.message;
   }
 
-  return String(error);
+  return String(
+    error
+  );
 }
