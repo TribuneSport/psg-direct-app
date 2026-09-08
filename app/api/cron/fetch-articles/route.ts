@@ -117,9 +117,10 @@ export async function GET(req: NextRequest) {
       );
     }
 
-    const sources = RSS_FEEDS.map(
-      (feed) => feed.name
-    );
+    const sources =
+      RSS_FEEDS.map(
+        (feed) => feed.name
+      );
 
     const sourcesOk: string[] = [];
     const rssErrors: string[] = [];
@@ -178,11 +179,16 @@ export async function GET(req: NextRequest) {
     const allItems: FeedItem[] = [];
 
     for (const result of rssResults) {
-      if (result.status === "rejected") {
+      if (
+        result.status ===
+        "rejected"
+      ) {
         const error =
           result.reason instanceof Error
             ? result.reason.message
-            : String(result.reason);
+            : String(
+                result.reason
+              );
 
         rssErrors.push(
           error.slice(0, 250)
@@ -304,15 +310,7 @@ export async function GET(req: NextRequest) {
     let skipped = 0;
     let duplicates = 0;
 
-    let deferred =
-      Math.max(
-        0,
-        clusters.length -
-          Math.min(
-            clusters.length,
-            MAX_CLUSTERS_TO_PROCESS
-          )
-      );
+    let deferred = 0;
 
     let geminiCalls = 0;
     let geminiSuccess = 0;
@@ -327,7 +325,13 @@ export async function GET(req: NextRequest) {
     const diagnostics: Diagnostic[] =
       [];
 
-    const clustersToProcess =
+    /*
+     * IMPORTANT :
+     * On élimine d'abord les clusters déjà connus.
+     * Cela évite que le cluster le plus récent bloque
+     * indéfiniment les nouveaux sujets.
+     */
+    const candidateClusters =
       clusters
         .slice()
         .sort(
@@ -335,10 +339,71 @@ export async function GET(req: NextRequest) {
             getLatestDate(b) -
             getLatestDate(a)
         )
-        .slice(
-          0,
-          MAX_CLUSTERS_TO_PROCESS
+        .filter(
+          (cluster) => {
+            const hasExistingUrl =
+              cluster.some(
+                (item) =>
+                  existingSourceUrls.has(
+                    normalizeUrl(
+                      item.url
+                    )
+                  )
+              );
+
+            if (
+              hasExistingUrl
+            ) {
+              skipped++;
+
+              return false;
+            }
+
+            const orderedCluster =
+              [...cluster].sort(
+                (a, b) =>
+                  a.priority -
+                  b.priority
+              );
+
+            const representative =
+              orderedCluster[0];
+
+            const duplicateTitle =
+              recentArticles.some(
+                (article) =>
+                  areSimilarTitles(
+                    article.title,
+                    representative.title
+                  )
+              );
+
+            if (
+              duplicateTitle
+            ) {
+              duplicates++;
+
+              return false;
+            }
+
+            return true;
+          }
         );
+
+    deferred = Math.max(
+      0,
+      candidateClusters.length -
+        Math.min(
+          candidateClusters.length,
+          MAX_CLUSTERS_TO_PROCESS
+        )
+    );
+
+    const clustersToProcess =
+      candidateClusters.slice(
+        0,
+        MAX_CLUSTERS_TO_PROCESS
+      );
 
     for (
       let index = 0;
@@ -388,49 +453,6 @@ export async function GET(req: NextRequest) {
             )
             .slice(0, 5),
       };
-
-      const hasExistingUrl =
-        cluster.some(
-          (item) =>
-            existingSourceUrls.has(
-              normalizeUrl(
-                item.url
-              )
-            )
-        );
-
-      if (hasExistingUrl) {
-        skipped++;
-
-        diagnostics.push({
-          ...diagnosticBase,
-          outcome:
-            "existing_source_url",
-        });
-
-        continue;
-      }
-
-      const duplicateTitle =
-        recentArticles.some(
-          (article) =>
-            areSimilarTitles(
-              article.title,
-              representative.title
-            )
-        );
-
-      if (duplicateTitle) {
-        duplicates++;
-
-        diagnostics.push({
-          ...diagnosticBase,
-          outcome:
-            "duplicate_title",
-        });
-
-        continue;
-      }
 
       geminiCalls++;
 
@@ -594,6 +616,9 @@ export async function GET(req: NextRequest) {
       clusters:
         clusters.length,
 
+      candidateClusters:
+        candidateClusters.length,
+
       processedClusters:
         clustersToProcess.length,
 
@@ -739,6 +764,22 @@ si elles n'apportent aucune information concrète.
 
 Le PSG doit rester au centre de l'article.
 
+Le titre doit être informatif et spécifique.
+
+L'extrait doit résumer les faits principaux.
+
+Le contenu doit développer les informations disponibles.
+
+IMPORTANT :
+
+Si les sources donnent une heure, une date, un stade ou une diffusion,
+ces informations doivent apparaître dans l'article.
+
+Si plusieurs sources donnent des informations complémentaires,
+combine-les dans le même article.
+
+Ne transforme jamais une absence d'information en affirmation.
+
 Style :
 - français
 - naturel
@@ -748,13 +789,8 @@ Style :
 - lisible
 - professionnel
 
-Le titre doit être informatif et spécifique.
-
-L'extrait doit résumer les faits principaux.
-
-Le contenu doit développer les informations disponibles.
-
-Lorsque les sources contiennent suffisamment de matière, vise environ 400 à 700 mots.
+Lorsque les sources contiennent suffisamment de matière,
+vise environ 400 à 700 mots.
 
 Retourne uniquement ce JSON :
 
@@ -1329,7 +1365,6 @@ function isRelevantToPSG(
     "marquinhos",
 
     "donnarumma",
-    "donnarumma",
 
     "kvaratskhelia",
 
@@ -1337,8 +1372,6 @@ function isRelevantToPSG(
 
     "désiré doué",
     "desire doue",
-    "doué",
-    "doue",
 
     "joão neves",
     "joao neves",
