@@ -80,9 +80,24 @@ type EnrichmentResult = {
 export async function GET(req: NextRequest) {
   const startedAt = Date.now();
 
-  const secret = new URL(req.url).searchParams.get("secret");
+  /*
+   * =========================================================
+   * AUTHENTIFICATION VERCEL CRON
+   * =========================================================
+   *
+   * Vercel envoie CRON_SECRET dans :
+   *
+   * Authorization: Bearer <CRON_SECRET>
+   *
+   * On utilise donc l'en-tête Authorization.
+   */
 
-  if (!CRON_SECRET || secret !== CRON_SECRET) {
+  const authHeader = req.headers.get("authorization");
+
+  if (
+    !CRON_SECRET ||
+    authHeader !== `Bearer ${CRON_SECRET}`
+  ) {
     return NextResponse.json(
       {
         error: "Unauthorized",
@@ -2093,8 +2108,7 @@ function extractFirstJsonObject(
 
   for (
     let index = start;
-    index <
-    text.length;
+    index < text.length;
     index++
   ) {
     const character =
