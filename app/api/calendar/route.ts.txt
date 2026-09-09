@@ -71,65 +71,87 @@ export async function GET() {
 
             return {
               id: match.id,
+
               date: match.utcDate,
+
               status: match.status,
 
               competition: {
                 id: match.competition?.id ?? null,
-                name: match.competition?.name ?? "Compétition",
-                code: match.competition?.code ?? null,
-                emblem: match.competition?.emblem ?? null,
+                name:
+                  match.competition?.name ??
+                  "CompÃ©tition",
+                code:
+                  match.competition?.code ?? null,
+                emblem:
+                  match.competition?.emblem ?? null,
               },
 
               homeTeam: {
                 id: homeTeam.id ?? null,
-                name: homeTeam.name ?? "Paris Saint-Germain",
+                name:
+                  homeTeam.name ??
+                  "Paris Saint-Germain",
                 shortName:
                   homeTeam.shortName ??
                   homeTeam.name ??
                   "Paris Saint-Germain",
                 tla: homeTeam.tla ?? null,
-                crest: homeTeam.crest ?? null,
+                crest:
+                  homeTeam.crest ?? null,
               },
 
               awayTeam: {
                 id: awayTeam.id ?? null,
-                name: awayTeam.name ?? "Adversaire",
+                name:
+                  awayTeam.name ??
+                  "Adversaire",
                 shortName:
                   awayTeam.shortName ??
                   awayTeam.name ??
                   "Adversaire",
                 tla: awayTeam.tla ?? null,
-                crest: awayTeam.crest ?? null,
+                crest:
+                  awayTeam.crest ?? null,
               },
 
               opponent: {
                 id: opponent.id ?? null,
-                name: opponent.name ?? "Adversaire",
+                name:
+                  opponent.name ??
+                  "Adversaire",
                 shortName:
                   opponent.shortName ??
                   opponent.name ??
                   "Adversaire",
                 tla: opponent.tla ?? null,
-                crest: opponent.crest ?? null,
+                crest:
+                  opponent.crest ?? null,
               },
 
               isPsgHome,
 
               score: {
                 home:
-                  typeof match.score?.fullTime?.home === "number"
+                  typeof match.score?.fullTime?.home ===
+                  "number"
                     ? match.score.fullTime.home
                     : null,
+
                 away:
-                  typeof match.score?.fullTime?.away === "number"
+                  typeof match.score?.fullTime?.away ===
+                  "number"
                     ? match.score.fullTime.away
                     : null,
               },
 
               venue: match.venue ?? null,
-              matchday: match.matchday ?? null,
-              stage: match.stage ?? null,
+
+              matchday:
+                match.matchday ?? null,
+
+              stage:
+                match.stage ?? null,
             };
           })
           .sort(
@@ -145,26 +167,37 @@ export async function GET() {
           id: PSG_ID,
           name: "Paris Saint-Germain",
         },
+
         count: matches.length,
+
         matches,
-        lastUpdated: new Date().toISOString(),
+
+        lastUpdated:
+          new Date().toISOString(),
       },
       {
         status: 200,
+
         headers: {
           "Cache-Control":
             "no-store, no-cache, must-revalidate, proxy-revalidate",
+
           Pragma: "no-cache",
+
           Expires: "0",
         },
       }
     );
   } catch (error) {
-    console.error("Erreur /api/calendar:", error);
+    console.error(
+      "Erreur /api/calendar:",
+      error
+    );
 
     return NextResponse.json(
       {
-        error: "Erreur interne du calendrier",
+        error:
+          "Erreur interne du calendrier",
         matches: [],
       },
       { status: 500 }
