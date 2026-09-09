@@ -82,14 +82,12 @@ export async function GET(req: NextRequest) {
 
   /*
    * =========================================================
-   * AUTHENTIFICATION VERCEL CRON
+   * AUTHENTIFICATION
    * =========================================================
    *
-   * Vercel envoie CRON_SECRET dans :
+   * L'authentification utilise :
    *
    * Authorization: Bearer <CRON_SECRET>
-   *
-   * On utilise donc l'en-tête Authorization.
    */
 
   const authHeader = req.headers.get("authorization");
@@ -686,7 +684,7 @@ async function processCluster(
 
   /*
    * =========================================================
-   * RETRY / ENRICHISSEMENT DE LA PREMIÈRE VERSION
+   * RETRY / ENRICHISSEMENT
    * =========================================================
    */
 
@@ -717,11 +715,6 @@ async function processCluster(
           retryArticle.content
         );
 
-      /*
-       * On conserve toujours
-       * la version la plus longue.
-       */
-
       if (
         retryWords >
         words
@@ -737,12 +730,8 @@ async function processCluster(
 
   /*
    * =========================================================
-   * SECOND RETRY SI NÉCESSAIRE
+   * SECOND RETRY
    * =========================================================
-   *
-   * Si Gemini n'a toujours pas fourni
-   * assez de matière, on lui demande
-   * une seconde extension ciblée.
    */
 
   if (
@@ -788,7 +777,7 @@ async function processCluster(
 
   /*
    * =========================================================
-   * ARTICLE TOUJOURS TROP COURT
+   * ARTICLE TROP COURT
    * =========================================================
    */
 
@@ -824,7 +813,7 @@ async function processCluster(
 
   /*
    * =========================================================
-   * PROTECTION DOUBLON APRÈS GÉNÉRATION
+   * PROTECTION DOUBLON
    * =========================================================
    */
 
@@ -1933,11 +1922,6 @@ function parseGeminiJson(
   cleaned =
     cleaned.trim();
 
-  /*
-   * Premier essai :
-   * JSON complet.
-   */
-
   try {
     const parsed =
       JSON.parse(
@@ -1965,12 +1949,6 @@ function parseGeminiJson(
      * Continue.
      */
   }
-
-  /*
-   * Recherche d'un objet JSON
-   * dans une éventuelle réponse
-   * contenant du texte autour.
-   */
 
   const jsonCandidate =
     extractFirstJsonObject(
@@ -2008,12 +1986,6 @@ function parseGeminiJson(
         parsed.content,
     };
   } catch {
-    /*
-     * Dernière tentative :
-     * suppression des caractères
-     * de contrôle.
-     */
-
     try {
       const repaired =
         repairJsonString(
@@ -2388,21 +2360,6 @@ function buildSimpleClusters(
         item.title
       );
 
-    /*
-     * =======================================================
-     * IMPORTANT :
-     * Un titre qui contient plusieurs adversaires
-     * est considéré comme ambigu.
-     *
-     * Exemple :
-     *
-     * PSG-Monaco & PSG-Bratislava
-     *
-     * Il ne doit pas pouvoir polluer
-     * le cluster Monaco ou Bratislava.
-     * =======================================================
-     */
-
     const opponents =
       extractAllOpponents(
         normalizedTitle
@@ -2414,12 +2371,6 @@ function buildSimpleClusters(
     ) {
       continue;
     }
-
-    /*
-     * =======================================================
-     * Recherche du meilleur cluster.
-     * =======================================================
-     */
 
     let bestCluster:
       FeedItem[] | null =
@@ -2486,11 +2437,6 @@ function similarityToCluster(
       itemTitle
     );
 
-  /*
-   * Un titre ambigu ne peut jamais
-   * être fusionné.
-   */
-
   if (
     itemOpponents.length >
     1
@@ -2525,13 +2471,6 @@ function similarityToCluster(
           )
       ),
     ];
-
-  /*
-   * =======================================================
-   * DEUX ADVERSAIRES DIFFÉRENTS =
-   * JAMAIS LE MÊME CLUSTER
-   * =======================================================
-   */
 
   if (
     itemOpponent &&
@@ -2600,11 +2539,6 @@ function simpleStorySimilarity(
       titleB
     );
 
-  /*
-   * Titres ambigus :
-   * aucune fusion automatique.
-   */
-
   if (
     opponentsA.length >
       1 ||
@@ -2621,11 +2555,6 @@ function simpleStorySimilarity(
   const opponentB =
     opponentsB[0] ||
     null;
-
-  /*
-   * Deux adversaires différents =
-   * événements différents.
-   */
 
   if (
     opponentA &&
@@ -2790,11 +2719,6 @@ function extractAllOpponents(
           opponent
         )
     );
-
-  /*
-   * Bratislava et Slovan désignent
-   * le même adversaire.
-   */
 
   if (
     found.includes(
