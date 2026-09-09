@@ -1,8 +1,1 @@
-{
-  "crons": [
-    {
-      "path": "/api/cron/fetch-articles",
-      "schedule": "*/15 * * * *"
-    }
-  ]
-}
+{}
