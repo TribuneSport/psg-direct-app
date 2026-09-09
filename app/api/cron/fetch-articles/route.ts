@@ -44,12 +44,6 @@ const MAX_ARTICLE_WORDS = 900;
 const LOW_INFORMATION_WORDS = 110;
 const MAX_SOURCE_PAGE_CHARS = 6500;
 
-/*
- * Important :
- * Le seuil utilisé précédemment était trop strict.
- * Pour des titres courts, un score Jaccard élevé empêche
- * de regrouper des articles pourtant consacrés au même sujet.
- */
 const CLUSTER_SIMILARITY_THRESHOLD = 0.48;
 
 /* =========================================================
@@ -97,6 +91,25 @@ type GeminiCallResult = {
   article: GeminiArticle | null;
   error: string | null;
   quotaExceeded: boolean;
+};
+
+type ProcessClusterResult = {
+  created: boolean;
+  articleTitle?: string;
+  sourceUrl?: string | null;
+
+  geminiCalls: number;
+  geminiSuccess: number;
+  geminiErrors: string[];
+
+  invalidJson: number;
+  tooShort: number;
+  tooShortAfterRetry: number;
+  slugErrors: number;
+  createErrors: number;
+
+  enrichment: EnrichmentResult;
+  diagnostic: Diagnostic;
 };
 
 /* =========================================================
@@ -149,7 +162,6 @@ export async function GET(req: NextRequest) {
     );
 
     const allItems: FeedItem[] = [];
-
     const rssErrors: string[] = [];
 
     for (const result of rssResults) {
@@ -174,10 +186,6 @@ export async function GET(req: NextRequest) {
 
     const uniqueItems = deduplicateFeedItems(psgItems);
 
-    /*
-     * On limite la quantité analysée pour garder un temps
-     * d'exécution compatible avec cron-job.org.
-     */
     const recentItems = uniqueItems
       .sort(
         (a, b) =>
@@ -222,10 +230,6 @@ export async function GET(req: NextRequest) {
     const clusters =
       buildSimpleClusters(newItems);
 
-    /* -----------------------------------------------------
-       CANDIDATS
-    ----------------------------------------------------- */
-
     const candidateClusters =
       clusters.filter(
         (cluster) => cluster.length > 0
@@ -253,20 +257,19 @@ export async function GET(req: NextRequest) {
         },
       });
 
-    const remainingDailyTarget = Math.max(
-      DAILY_TARGET -
-        articlesCreatedToday,
-      0
-    );
+    const remainingDailyTarget =
+      Math.max(
+        DAILY_TARGET -
+          articlesCreatedToday,
+        0
+      );
 
-    const allowedByDailyTarget =
-      remainingDailyTarget;
-
-    const numberToProcess = Math.min(
-      MAX_NEW_ARTICLES_PER_RUN,
-      allowedByDailyTarget,
-      candidateClusters.length
-    );
+    const numberToProcess =
+      Math.min(
+        MAX_NEW_ARTICLES_PER_RUN,
+        remainingDailyTarget,
+        candidateClusters.length
+      );
 
     const selectedClusters =
       candidateClusters
@@ -282,12 +285,9 @@ export async function GET(req: NextRequest) {
 
     /* -----------------------------------------------------
        TRAITEMENT PARALLELE
-       
-       Important pour rester sous les 30 secondes
-       de cron-job.org.
     ----------------------------------------------------- */
 
-    const results =
+    const results: ProcessClusterResult[] =
       await Promise.all(
         selectedClusters.map(
           (cluster, index) =>
@@ -305,19 +305,23 @@ export async function GET(req: NextRequest) {
 
     let created = 0;
     let skipped = 0;
+
     let geminiCalls = 0;
     let geminiSuccess = 0;
+
     let invalidJson = 0;
     let tooShort = 0;
     let tooShortAfterRetry = 0;
     let slugErrors = 0;
     let createErrors = 0;
+
     let sourcePagesFetched = 0;
     let sourcePagesFailed = 0;
     let enrichedCharacters = 0;
 
     const geminiErrors: string[] = [];
     const sourcePageErrors: string[] = [];
+
     const diagnostics: Diagnostic[] = [];
 
     for (const result of results) {
@@ -376,9 +380,11 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({
       checked: recentItems.length,
 
-      newItems: newItems.length,
+      newItems:
+        newItems.length,
 
-      clusters: clusters.length,
+      clusters:
+        clusters.length,
 
       candidateClusters:
         candidateClusters.length,
@@ -401,7 +407,8 @@ export async function GET(req: NextRequest) {
         articlesCreatedToday +
         created,
 
-      dailyTarget: DAILY_TARGET,
+      dailyTarget:
+        DAILY_TARGET,
 
       remainingDailyTarget:
         Math.max(
@@ -424,7 +431,8 @@ export async function GET(req: NextRequest) {
 
       sources:
         RSS_FEEDS.map(
-          (feed) => feed.name
+          (feed) =>
+            feed.name
         ),
 
       duplicates:
@@ -445,17 +453,23 @@ export async function GET(req: NextRequest) {
         geminiCalls,
         geminiSuccess,
         geminiErrors,
+
         invalidJson,
         tooShort,
         tooShortAfterRetry,
         slugErrors,
         createErrors,
+
         rssErrors,
+
         sourcePagesFetched,
         sourcePagesFailed,
         enrichedCharacters,
+
         sourcePageErrors,
-        clusters: diagnostics,
+
+        clusters:
+          diagnostics,
       },
 
       elapsedMs,
@@ -506,24 +520,32 @@ async function fetchRssFeed(
       );
 
     const response =
-      await fetch(url, {
-        signal:
-          controller.signal,
-        headers: {
-          "User-Agent":
-            "PSG-Direct/1.0",
-          Accept:
-            "application/rss+xml, application/xml, text/xml",
-        },
-        cache: "no-store",
-      });
+      await fetch(
+        url,
+        {
+          signal:
+            controller.signal,
+
+          headers: {
+            "User-Agent":
+              "PSG-Direct/1.0",
+
+            Accept:
+              "application/rss+xml, application/xml, text/xml",
+          },
+
+          cache:
+            "no-store",
+        }
+      );
 
     clearTimeout(timeout);
 
     if (!response.ok) {
       return {
         items: [],
-        error: `${source}: HTTP ${response.status} ${response.statusText}`,
+        error:
+          `${source}: HTTP ${response.status} ${response.statusText}`,
       };
     }
 
@@ -542,16 +564,19 @@ async function fetchRssFeed(
           0,
           MAX_ITEMS_PER_SOURCE
         ),
+
       error: null,
     };
   } catch (error) {
     return {
       items: [],
-      error: `${source}: ${
-        error instanceof Error
-          ? error.message
-          : "Unknown RSS error"
-      }`,
+
+      error:
+        `${source}: ${
+          error instanceof Error
+            ? error.message
+            : "Unknown RSS error"
+        }`,
     };
   }
 }
@@ -571,7 +596,9 @@ function parseRssXml(
       /<item\b[\s\S]*?<\/item>/gi
     ) || [];
 
-  for (const itemXml of itemMatches) {
+  for (
+    const itemXml of itemMatches
+  ) {
     const title =
       cleanHtml(
         extractXmlValue(
@@ -600,7 +627,10 @@ function parseRssXml(
         "pubDate"
       ).trim();
 
-    if (!title || !link) {
+    if (
+      !title ||
+      !link
+    ) {
       continue;
     }
 
@@ -629,7 +659,9 @@ function extractXmlValue(
   const match =
     xml.match(regex);
 
-  return match?.[1] || "";
+  return (
+    match?.[1] || ""
+  );
 }
 
 /* =========================================================
@@ -650,18 +682,18 @@ function isRelevantToPSG(
     "paris saint-germain",
     "paris sg",
     "paris-sg",
-    "paris saint germain",
+
     "donnarumma",
     "hakimi",
     "marquinhos",
     "nuno mendes",
     "vitinha",
     "joao neves",
-    "joao neves",
     "dembele",
     "dembélé",
     "kvaratskhelia",
     "barcola",
+    "doue",
     "doué",
     "desire doue",
     "desiré doué",
@@ -671,7 +703,9 @@ function isRelevantToPSG(
   return positiveTerms.some(
     (term) =>
       text.includes(
-        normalizeText(term)
+        normalizeText(
+          term
+        )
       )
   );
 }
@@ -689,7 +723,9 @@ function deduplicateFeedItems(
       FeedItem
     >();
 
-  for (const item of items) {
+  for (
+    const item of items
+  ) {
     const key =
       normalizeTitle(
         item.title
@@ -707,13 +743,10 @@ function deduplicateFeedItems(
         key,
         item
       );
+
       continue;
     }
 
-    /*
-     * On conserve la source ayant
-     * la meilleure priorité.
-     */
     if (
       getSourcePriority(
         item.source
@@ -761,8 +794,10 @@ function isAlreadyImported(
       if (
         normalizedUrl &&
         normalizeUrl(
-          article.sourceUrl || ""
-        ) === normalizedUrl
+          article.sourceUrl ||
+            ""
+        ) ===
+          normalizedUrl
       ) {
         return true;
       }
@@ -790,9 +825,6 @@ function buildSimpleClusters(
   const clusters: FeedItem[][] =
     [];
 
-  /*
-   * On trie d'abord par date.
-   */
   const sorted =
     [...items].sort(
       (a, b) =>
@@ -804,14 +836,18 @@ function buildSimpleClusters(
         )
     );
 
-  for (const item of sorted) {
+  for (
+    const item of sorted
+  ) {
     let bestCluster:
       | FeedItem[]
       | null = null;
 
     let bestScore = 0;
 
-    for (const cluster of clusters) {
+    for (
+      const cluster of clusters
+    ) {
       const score =
         scoreItemAgainstCluster(
           item,
@@ -848,18 +884,10 @@ function buildSimpleClusters(
   return clusters;
 }
 
-/*
- * Cette fonction est volontairement plus intelligente
- * qu'un simple Jaccard sur les titres.
- *
- * Elle prend en compte :
- * - adversaire
- * - compétition
- * - joueurs
- * - mots importants
- * - proximité des titres
- * - termes génériques du même événement
- */
+/* =========================================================
+   CLUSTER SCORE
+========================================================= */
+
 function scoreItemAgainstCluster(
   item: FeedItem,
   cluster: FeedItem[]
@@ -867,10 +895,6 @@ function scoreItemAgainstCluster(
   const reference =
     cluster[0];
 
-  /*
-   * Deux adversaires différents =
-   * deux sujets différents.
-   */
   const itemOpponents =
     extractAllOpponents(
       item.title
@@ -880,14 +904,22 @@ function scoreItemAgainstCluster(
     extractAllOpponents(
       cluster
         .map(
-          (x) => x.title
+          (x) =>
+            x.title
         )
         .join(" ")
     );
 
+  /*
+   * Si les deux articles identifient
+   * explicitement des adversaires différents,
+   * ils ne doivent pas être fusionnés.
+   */
   if (
-    itemOpponents.length > 0 &&
-    clusterOpponents.length > 0
+    itemOpponents.length >
+      0 &&
+    clusterOpponents.length >
+      0
   ) {
     const differentOpponent =
       itemOpponents.some(
@@ -914,7 +946,8 @@ function scoreItemAgainstCluster(
     topicSimilarity(
       item.title,
       cluster.map(
-        (x) => x.title
+        (x) =>
+          x.title
       )
     );
 
@@ -924,11 +957,6 @@ function scoreItemAgainstCluster(
       reference.title
     );
 
-  /*
-   * Les événements communs ont
-   * davantage de poids que les mots
-   * génériques.
-   */
   return Math.max(
     titleScore,
     topicScore,
@@ -971,7 +999,9 @@ function titleSimilarity(
       ...tokensB,
     ]).size;
 
-  if (union === 0) {
+  if (
+    union === 0
+  ) {
     return 0;
   }
 
@@ -979,11 +1009,6 @@ function titleSimilarity(
     intersection /
     union;
 
-  /*
-   * Pour les titres courts,
-   * un simple mot-clé commun peut
-   * être très significatif.
-   */
   const containment =
     intersection /
     Math.min(
@@ -1018,51 +1043,50 @@ function topicSimilarity(
 
   let best = 0;
 
-  for (const other of titles) {
+  for (
+    const other of titles
+  ) {
     const otherTokens =
       meaningfulTokens(
         other
       );
 
-    let score = 0;
+    let common = 0;
 
-    for (const token of tokens) {
+    for (
+      const token of tokens
+    ) {
       if (
         otherTokens.includes(
           token
         )
       ) {
-        score++;
+        common++;
       }
     }
 
     const ratio =
-      score /
+      common /
       Math.max(
         tokens.length,
         otherTokens.length
       );
 
     const containment =
-      score /
+      common /
       Math.min(
         tokens.length,
         otherTokens.length
       );
 
-    best = Math.max(
-      best,
-      ratio,
-      containment * 0.68
-    );
+    best =
+      Math.max(
+        best,
+        ratio,
+        containment * 0.68
+      );
   }
 
-  /*
-   * Détection d'événements :
-   * composition + groupe + match +
-   * diffusion + présentation peuvent
-   * concerner le même événement.
-   */
   const normalized =
     normalizeText(
       title
@@ -1177,6 +1201,7 @@ function extractAllOpponents(
   const knownOpponents = [
     "bratislava",
     "slovan bratislava",
+
     "auxerre",
     "marseille",
     "om",
@@ -1195,20 +1220,24 @@ function extractAllOpponents(
     "lorient",
     "saint etienne",
     "saint-etienne",
+
     "manchester city",
     "manchester united",
     "arsenal",
     "liverpool",
     "chelsea",
+
     "real madrid",
     "barcelone",
     "barcelona",
+
     "bayern",
     "inter milan",
     "inter",
     "juventus",
     "milan",
     "atalanta",
+
     "dortmund",
     "borussia dortmund",
   ];
@@ -1224,10 +1253,6 @@ function extractAllOpponents(
         )
       )
     ) {
-      /*
-       * Normalisation spéciale
-       * Slovan / Bratislava.
-       */
       if (
         opponent ===
           "slovan bratislava" ||
@@ -1274,6 +1299,7 @@ function extractEntities(
   const entities = [
     "psg",
     "paris saint germain",
+
     "donnarumma",
     "hakimi",
     "marquinhos",
@@ -1283,13 +1309,15 @@ function extractEntities(
     "dembélé",
     "barcola",
     "kvaratskhelia",
-    "doué",
     "doue",
+    "doué",
     "luis enrique",
     "mbappe",
     "mbappé",
+
     "bratislava",
     "slovan bratislava",
+
     "champions league",
     "ligue des champions",
     "youth league",
@@ -1326,7 +1354,7 @@ async function processCluster(
     sourceUrl: string | null;
   }>,
   clusterNumber: number
-) {
+): Promise<ProcessClusterResult> {
   const sortedSources =
     [...cluster]
       .sort(
@@ -1356,15 +1384,17 @@ async function processCluster(
 
   let geminiCalls = 0;
   let geminiSuccess = 0;
+
   let invalidJson = 0;
   let tooShort = 0;
   let tooShortAfterRetry = 0;
   let slugErrors = 0;
   let createErrors = 0;
 
-  /*
-   * Première génération
-   */
+  /* -----------------------------------------------------
+     PREMIÈRE GÉNÉRATION
+  ----------------------------------------------------- */
+
   const first =
     await callGemini(
       enrichedSources
@@ -1381,38 +1411,46 @@ async function processCluster(
   }
 
   /*
-   * Quota atteint :
-   * inutile de faire plusieurs appels
-   * supplémentaires dans la même requête.
+   * Si Gemini indique que le quota est atteint,
+   * on arrête immédiatement ce cluster.
    */
   if (
     first.quotaExceeded
   ) {
     return {
       created: false,
+
       geminiCalls,
       geminiSuccess,
+      geminiErrors,
+
       invalidJson,
       tooShort,
       tooShortAfterRetry,
       slugErrors,
       createErrors,
+
       enrichment,
+
       diagnostic: {
         cluster:
           clusterNumber,
+
         sources:
           sortedSources.map(
             (x) =>
               x.source
           ),
+
         titles:
           sortedSources.map(
             (x) =>
               x.title
           ),
+
         outcome:
           "gemini_quota_exceeded",
+
         detail:
           first.error ||
           "Gemini quota exceeded",
@@ -1423,37 +1461,47 @@ async function processCluster(
   let article =
     first.article;
 
-  /*
-   * JSON invalide / génération ratée.
-   */
+  /* -----------------------------------------------------
+     GENERATION INVALIDE
+  ----------------------------------------------------- */
+
   if (!article) {
     invalidJson++;
 
     return {
       created: false,
+
       geminiCalls,
       geminiSuccess,
+      geminiErrors,
+
       invalidJson,
       tooShort,
       tooShortAfterRetry,
       slugErrors,
       createErrors,
+
       enrichment,
+
       diagnostic: {
         cluster:
           clusterNumber,
+
         sources:
           sortedSources.map(
             (x) =>
               x.source
           ),
+
         titles:
           sortedSources.map(
             (x) =>
               x.title
           ),
+
         outcome:
           "gemini_error",
+
         detail:
           first.error ||
           "Gemini returned no article",
@@ -1461,9 +1509,10 @@ async function processCluster(
     };
   }
 
-  /*
-   * Vérification longueur.
-   */
+  /* -----------------------------------------------------
+     CONTRÔLE LONGUEUR
+  ----------------------------------------------------- */
+
   let wordCount =
     countWords(
       article.content
@@ -1491,34 +1540,46 @@ async function processCluster(
       );
     }
 
+    /*
+     * Nouveau quota atteint pendant le retry.
+     */
     if (
       retry.quotaExceeded
     ) {
       return {
         created: false,
+
         geminiCalls,
         geminiSuccess,
+        geminiErrors,
+
         invalidJson,
         tooShort,
         tooShortAfterRetry,
         slugErrors,
         createErrors,
+
         enrichment,
+
         diagnostic: {
           cluster:
             clusterNumber,
+
           sources:
             sortedSources.map(
               (x) =>
                 x.source
             ),
+
           titles:
             sortedSources.map(
               (x) =>
                 x.title
             ),
+
           outcome:
             "gemini_quota_exceeded",
+
           detail:
             retry.error ||
             "Gemini quota exceeded",
@@ -1539,9 +1600,10 @@ async function processCluster(
     }
   }
 
-  /*
-   * Deuxième contrôle de longueur.
-   */
+  /* -----------------------------------------------------
+     ARTICLE TOUJOURS TROP COURT
+  ----------------------------------------------------- */
+
   if (
     wordCount <
     MIN_ARTICLE_WORDS
@@ -1550,29 +1612,38 @@ async function processCluster(
 
     return {
       created: false,
+
       geminiCalls,
       geminiSuccess,
+      geminiErrors,
+
       invalidJson,
       tooShort,
       tooShortAfterRetry,
       slugErrors,
       createErrors,
+
       enrichment,
+
       diagnostic: {
         cluster:
           clusterNumber,
+
         sources:
           sortedSources.map(
             (x) =>
               x.source
           ),
+
         titles:
           sortedSources.map(
             (x) =>
               x.title
           ),
+
         outcome:
           "article_too_short",
+
         detail:
           `${wordCount} words after retry`,
       },
@@ -1581,9 +1652,10 @@ async function processCluster(
 
   geminiSuccess++;
 
-  /*
-   * Vérification doublon.
-   */
+  /* -----------------------------------------------------
+     DOUBLON DATABASE
+  ----------------------------------------------------- */
+
   const duplicate =
     await prisma.article.findFirst(
       {
@@ -1593,16 +1665,21 @@ async function processCluster(
               title: {
                 equals:
                   article.title,
-                mode: "insensitive",
+
+                mode:
+                  "insensitive",
               },
             },
+
             {
               sourceUrl:
                 sortedSources[0]
-                  ?.link || "",
+                  ?.link ||
+                "",
             },
           ],
         },
+
         select: {
           id: true,
         },
@@ -1612,29 +1689,38 @@ async function processCluster(
   if (duplicate) {
     return {
       created: false,
+
       geminiCalls,
       geminiSuccess,
+      geminiErrors,
+
       invalidJson,
       tooShort,
       tooShortAfterRetry,
       slugErrors,
       createErrors,
+
       enrichment,
+
       diagnostic: {
         cluster:
           clusterNumber,
+
         sources:
           sortedSources.map(
             (x) =>
               x.source
           ),
+
         titles:
           sortedSources.map(
             (x) =>
               x.title
           ),
+
         outcome:
           "duplicate",
+
         detail:
           "Article already exists",
       },
@@ -1655,29 +1741,38 @@ async function processCluster(
 
     return {
       created: false,
+
       geminiCalls,
       geminiSuccess,
+      geminiErrors,
+
       invalidJson,
       tooShort,
       tooShortAfterRetry,
       slugErrors,
       createErrors,
+
       enrichment,
+
       diagnostic: {
         cluster:
           clusterNumber,
+
         sources:
           sortedSources.map(
             (x) =>
               x.source
           ),
+
         titles:
           sortedSources.map(
             (x) =>
               x.title
           ),
+
         outcome:
           "slug_error",
+
         detail:
           "Unable to generate slug",
       },
@@ -1690,7 +1785,7 @@ async function processCluster(
     );
 
   /* -----------------------------------------------------
-     CREATE
+     CREATE DATABASE
   ----------------------------------------------------- */
 
   try {
@@ -1698,15 +1793,24 @@ async function processCluster(
       data: {
         title:
           article.title,
+
         slug,
+
         excerpt:
           article.excerpt,
+
         content:
           article.content,
-        club: "PSG",
-        status: "DRAFT",
+
+        club:
+          "PSG",
+
+        status:
+          "DRAFT",
+
         isAiGenerated:
           true,
+
         sourceUrl:
           sortedSources[0]
             ?.link ||
@@ -1718,29 +1822,38 @@ async function processCluster(
 
     return {
       created: false,
+
       geminiCalls,
       geminiSuccess,
+      geminiErrors,
+
       invalidJson,
       tooShort,
       tooShortAfterRetry,
       slugErrors,
       createErrors,
+
       enrichment,
+
       diagnostic: {
         cluster:
           clusterNumber,
+
         sources:
           sortedSources.map(
             (x) =>
               x.source
           ),
+
         titles:
           sortedSources.map(
             (x) =>
               x.title
           ),
+
         outcome:
           "create_error",
+
         detail:
           error instanceof Error
             ? error.message
@@ -1749,36 +1862,52 @@ async function processCluster(
     };
   }
 
+  /* -----------------------------------------------------
+     SUCCÈS
+  ----------------------------------------------------- */
+
   return {
     created: true,
+
     articleTitle:
       article.title,
+
     sourceUrl:
       sortedSources[0]
-        ?.link || null,
+        ?.link ||
+      null,
+
     geminiCalls,
     geminiSuccess,
+    geminiErrors,
+
     invalidJson,
     tooShort,
     tooShortAfterRetry,
     slugErrors,
     createErrors,
+
     enrichment,
+
     diagnostic: {
       cluster:
         clusterNumber,
+
       sources:
         sortedSources.map(
           (x) =>
             x.source
         ),
+
       titles:
         sortedSources.map(
           (x) =>
             x.title
         ),
+
       outcome:
         "created",
+
       detail:
         `${wordCount} words`,
     },
@@ -1827,10 +1956,12 @@ async function enrichSources(
                 {
                   signal:
                     controller.signal,
+
                   headers: {
                     "User-Agent":
                       "Mozilla/5.0 PSG-Direct/1.0",
                   },
+
                   cache:
                     "no-store",
                 }
@@ -1847,7 +1978,9 @@ async function enrichSources(
                 source,
                 content: "",
                 fetched: false,
-                error: `${source.source}: HTTP ${response.status}`,
+
+                error:
+                  `${source.source}: HTTP ${response.status}`,
               };
             }
 
@@ -1864,9 +1997,13 @@ async function enrichSources(
 
             return {
               source,
-              content: text,
+
+              content:
+                text,
+
               fetched:
                 text.length > 0,
+
               error:
                 text.length > 0
                   ? null
@@ -1875,13 +2012,18 @@ async function enrichSources(
           } catch (error) {
             return {
               source,
+
               content: "",
-              fetched: false,
-              error: `${source.source}: ${
-                error instanceof Error
-                  ? error.message
-                  : "page fetch error"
-              }`,
+
+              fetched:
+                false,
+
+              error:
+                `${source.source}: ${
+                  error instanceof Error
+                    ? error.message
+                    : "page fetch error"
+                }`,
             };
           }
         }
@@ -1892,6 +2034,7 @@ async function enrichSources(
     results.map(
       (result) => ({
         ...result.source,
+
         description:
           result.content
             ? `${result.source.description}\n\nSOURCE PAGE:\n${result.content}`
@@ -1902,16 +2045,19 @@ async function enrichSources(
   return {
     sources:
       enrichedSources,
+
     pagesFetched:
       results.filter(
         (x) =>
           x.fetched
       ).length,
+
     pagesFailed:
       results.filter(
         (x) =>
           x.error
       ).length,
+
     enrichedCharacters:
       results.reduce(
         (sum, x) =>
@@ -1919,6 +2065,7 @@ async function enrichSources(
           x.content.length,
         0
       ),
+
     pageErrors:
       results
         .filter(
@@ -2086,31 +2233,39 @@ Réponds UNIQUEMENT avec un JSON valide sous cette forme :
           {
             method:
               "POST",
+
             signal:
               controller.signal,
+
             headers: {
               "Content-Type":
                 "application/json",
             },
-            body: JSON.stringify(
-              {
+
+            body:
+              JSON.stringify({
                 contents: [
                   {
                     parts: [
                       {
-                        text: prompt,
+                        text:
+                          prompt,
                       },
                     ],
                   },
                 ],
+
                 generationConfig: {
-                  temperature: 0.2,
-                  maxOutputTokens: 4500,
+                  temperature:
+                    0.2,
+
+                  maxOutputTokens:
+                    4500,
+
                   responseMimeType:
                     "application/json",
                 },
-              }
-            ),
+              }),
           }
         );
 
@@ -2121,7 +2276,9 @@ Réponds UNIQUEMENT avec un JSON valide sous cette forme :
       const raw =
         await response.text();
 
-      if (!response.ok) {
+      if (
+        !response.ok
+      ) {
         const lower =
           raw.toLowerCase();
 
@@ -2145,17 +2302,17 @@ Réponds UNIQUEMENT avec un JSON valide sous cette forme :
           quotaExceeded
         ) {
           return {
-            article: null,
-            error: `Gemini ${model}: HTTP ${response.status} quota/rate limit exceeded`,
+            article:
+              null,
+
+            error:
+              `Gemini ${model}: HTTP ${response.status} quota/rate limit exceeded`,
+
             quotaExceeded:
               true,
           };
         }
 
-        /*
-         * Pour une erreur non liée au quota,
-         * on tente le modèle suivant.
-         */
         continue;
       }
 
@@ -2168,8 +2325,12 @@ Réponds UNIQUEMENT avec un JSON valide sous cette forme :
           );
       } catch {
         return {
-          article: null,
-          error: `Gemini ${model}: invalid API JSON`,
+          article:
+            null,
+
+          error:
+            `Gemini ${model}: invalid API JSON`,
+
           quotaExceeded:
             false,
         };
@@ -2194,16 +2355,24 @@ Réponds UNIQUEMENT avec un JSON valide sous cette forme :
 
       if (!parsed) {
         return {
-          article: null,
-          error: `Gemini ${model}: invalid generated JSON`,
+          article:
+            null,
+
+          error:
+            `Gemini ${model}: invalid generated JSON`,
+
           quotaExceeded:
             false,
         };
       }
 
       return {
-        article: parsed,
-        error: null,
+        article:
+          parsed,
+
+        error:
+          null,
+
         quotaExceeded:
           false,
       };
@@ -2213,10 +2382,6 @@ Réponds UNIQUEMENT avec un JSON valide sous cette forme :
           ? error.message
           : "Gemini request error";
 
-      /*
-       * Timeout :
-       * on essaie le modèle suivant.
-       */
       if (
         message.includes(
           "aborted"
@@ -2230,9 +2395,12 @@ Réponds UNIQUEMENT avec un JSON valide sous cette forme :
   }
 
   return {
-    article: null,
+    article:
+      null,
+
     error:
       "Gemini: all configured models failed",
+
     quotaExceeded:
       false,
   };
@@ -2289,20 +2457,18 @@ function parseGeminiJson(
         cleanGeneratedText(
           parsed.title
         ),
+
       excerpt:
         cleanGeneratedText(
           parsed.excerpt
         ),
+
       content:
         cleanGeneratedText(
           parsed.content
         ),
     };
   } catch {
-    /*
-     * Tentative de récupération
-     * d'un JSON encapsulé dans du texte.
-     */
     const firstBrace =
       cleaned.indexOf(
         "{"
@@ -2315,7 +2481,8 @@ function parseGeminiJson(
 
     if (
       firstBrace >= 0 &&
-      lastBrace > firstBrace
+      lastBrace >
+        firstBrace
     ) {
       try {
         const parsed =
@@ -2339,10 +2506,12 @@ function parseGeminiJson(
               cleanGeneratedText(
                 parsed.title
               ),
+
             excerpt:
               cleanGeneratedText(
                 parsed.excerpt
               ),
+
             content:
               cleanGeneratedText(
                 parsed.content
@@ -2376,6 +2545,7 @@ async function makeUniqueSlug(
         where: {
           slug,
         },
+
         select: {
           id: true,
         },
@@ -2403,7 +2573,8 @@ function slugify(
     )
     .replace(
       /^-+|-+$/g,
-      "")
+      ""
+    )
     .slice(
       0,
       180
@@ -2465,14 +2636,19 @@ function getClusterPriority(
           getTimestamp(
             item.pubDate
           ) <
-        6 * 60 * 60 * 1000
+        6 *
+          60 *
+          60 *
+          1000
     )
       ? 2
       : 0;
 
   return (
-    sourcePriority * 10 +
-    sourceCount * 2 +
+    sourcePriority *
+      10 +
+    sourceCount *
+      2 +
     recentBonus
   );
 }
@@ -2597,11 +2773,6 @@ function meaningfulTokens(
       "plus",
       "apres",
       "avant",
-      "une",
-      "des",
-      "du",
-      "au",
-      "aux",
     ]);
 
   return Array.from(
@@ -2614,7 +2785,8 @@ function meaningfulTokens(
         )
         .filter(
           (token) =>
-            token.length >= 3 &&
+            token.length >=
+              3 &&
             !stopWords.has(
               token
             )
@@ -2640,7 +2812,7 @@ function countWords(
 }
 
 /* =========================================================
-   HTML / PAGE CLEANING
+   HTML CLEANING
 ========================================================= */
 
 function cleanHtml(
