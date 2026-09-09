@@ -4,6 +4,10 @@ import { prisma } from "@/lib/prisma";
 const CRON_SECRET = process.env.CRON_SECRET;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
+/* =========================================================
+   CONFIGURATION
+========================================================= */
+
 const RSS_FEEDS = [
   {
     name: "Google News",
@@ -40,12 +44,24 @@ const MAX_ARTICLE_WORDS = 900;
 const LOW_INFORMATION_WORDS = 110;
 const MAX_SOURCE_PAGE_CHARS = 6500;
 
+/*
+ * Important :
+ * Le seuil utilisé précédemment était trop strict.
+ * Pour des titres courts, un score Jaccard élevé empêche
+ * de regrouper des articles pourtant consacrés au même sujet.
+ */
+const CLUSTER_SIMILARITY_THRESHOLD = 0.48;
+
+/* =========================================================
+   TYPES
+========================================================= */
+
 type FeedItem = {
   title: string;
   description: string;
+  source: string;
   link: string;
   pubDate: string;
-  source: string;
 };
 
 type ArticleInput = {
@@ -83,126 +99,96 @@ type GeminiCallResult = {
   quotaExceeded: boolean;
 };
 
+/* =========================================================
+   GET
+========================================================= */
+
 export async function GET(req: NextRequest) {
   const startedAt = Date.now();
 
-  /*
-   * =========================================================
-   * AUTHENTIFICATION
-   * =========================================================
-   */
-
-  const authHeader = req.headers.get("authorization");
-
-  if (
-    !CRON_SECRET ||
-    authHeader !== `Bearer ${CRON_SECRET}`
-  ) {
-    return NextResponse.json(
-      {
-        error: "Unauthorized",
-      },
-      {
-        status: 401,
-      }
-    );
-  }
-
-  if (!GEMINI_API_KEY) {
-    return NextResponse.json(
-      {
-        error: "GEMINI_API_KEY is missing",
-      },
-      {
-        status: 500,
-      }
-    );
-  }
-
-  const diagnostics: Diagnostic[] = [];
-
-  const rssErrors: string[] = [];
-  const sourcePageErrors: string[] = [];
-
-  let sourcePagesFetched = 0;
-  let sourcePagesFailed = 0;
-  let enrichedCharacters = 0;
-  let geminiCalls = 0;
-
   try {
-    /*
-     * =========================================================
-     * 1. RÉCUPÉRATION RSS
-     * =========================================================
-     */
+    /* -----------------------------------------------------
+       AUTHENTIFICATION
+    ----------------------------------------------------- */
 
-    const feeds = await Promise.all(
-      RSS_FEEDS.map(async (feed) => {
-        try {
-          const xml = await fetchWithTimeout(
-            feed.url,
-            RSS_TIMEOUT_MS,
-            {
-              headers: {
-                Accept:
-                  "application/rss+xml, application/xml, text/xml, */*",
-                "User-Agent": "PSG-Direct/1.0",
-              },
-            }
-          );
+    const authHeader = req.headers.get("authorization");
 
-          return {
-            feed: feed.name,
-            items: parseRSS(xml, feed.name),
-            error: null as string | null,
-          };
-        } catch (error) {
-          return {
-            feed: feed.name,
-            items: [] as FeedItem[],
-            error: getErrorMessage(error),
-          };
+    if (
+      !CRON_SECRET ||
+      authHeader !== `Bearer ${CRON_SECRET}`
+    ) {
+      return NextResponse.json(
+        {
+          error: "Unauthorized",
+        },
+        {
+          status: 401,
         }
-      })
-    );
-
-    for (const result of feeds) {
-      if (result.error) {
-        rssErrors.push(
-          `${result.feed}: ${result.error}`
-        );
-      }
+      );
     }
 
-    const allItems = feeds.flatMap(
-      (result) => result.items
+    if (!GEMINI_API_KEY) {
+      return NextResponse.json(
+        {
+          error: "GEMINI_API_KEY is not configured",
+        },
+        {
+          status: 500,
+        }
+      );
+    }
+
+    /* -----------------------------------------------------
+       RSS
+    ----------------------------------------------------- */
+
+    const rssResults = await Promise.all(
+      RSS_FEEDS.map((feed) =>
+        fetchRssFeed(feed.name, feed.url)
+      )
     );
 
-    /*
-     * =========================================================
-     * 2. FILTRE PSG
-     * =========================================================
-     */
+    const allItems: FeedItem[] = [];
 
-    const relevantItems = allItems.filter(
-      isRelevantPSG
+    const rssErrors: string[] = [];
+
+    for (const result of rssResults) {
+      if (result.error) {
+        rssErrors.push(result.error);
+      }
+
+      allItems.push(...result.items);
+    }
+
+    /* -----------------------------------------------------
+       FILTRE PSG
+    ----------------------------------------------------- */
+
+    const psgItems = allItems.filter((item) =>
+      isRelevantToPSG(item)
     );
 
-    /*
-     * =========================================================
-     * 3. DÉDUPLICATION RSS
-     * =========================================================
-     */
+    /* -----------------------------------------------------
+       DEDUPLICATION RSS
+    ----------------------------------------------------- */
 
-    const uniqueItems = deduplicateItems(
-      relevantItems
-    );
+    const uniqueItems = deduplicateFeedItems(psgItems);
 
     /*
-     * =========================================================
-     * 4. ARTICLES EXISTANTS
-     * =========================================================
+     * On limite la quantité analysée pour garder un temps
+     * d'exécution compatible avec cron-job.org.
      */
+    const recentItems = uniqueItems
+      .sort(
+        (a, b) =>
+          getTimestamp(b.pubDate) -
+          getTimestamp(a.pubDate)
+      )
+      .slice(0, 150);
+
+    /* -----------------------------------------------------
+       ARTICLES EXISTANTS
+    ----------------------------------------------------- */
 
     const recentArticles =
       await prisma.article.findMany({
@@ -217,182 +203,182 @@ export async function GET(req: NextRequest) {
         },
       });
 
-    const newItems = uniqueItems.filter(
+    /* -----------------------------------------------------
+       NOUVEAUX ITEMS
+    ----------------------------------------------------- */
+
+    const newItems = recentItems.filter(
       (item) =>
-        !isAlreadyStored(
+        !isAlreadyImported(
           item,
           recentArticles
         )
     );
 
-    /*
-     * =========================================================
-     * 5. CONSTRUCTION DES CLUSTERS
-     * =========================================================
-     */
+    /* -----------------------------------------------------
+       CLUSTERS
+    ----------------------------------------------------- */
 
-    const clusters = buildSimpleClusters(
-      newItems
-    );
+    const clusters =
+      buildSimpleClusters(newItems);
 
-    const candidateClusters = clusters
-      .filter(
-        (cluster) =>
-          cluster.length > 0
-      )
-      .sort(
-        (a, b) =>
-          clusterPriority(b) -
-          clusterPriority(a)
+    /* -----------------------------------------------------
+       CANDIDATS
+    ----------------------------------------------------- */
+
+    const candidateClusters =
+      clusters.filter(
+        (cluster) => cluster.length > 0
       );
 
-    /*
-     * =========================================================
-     * 6. OBJECTIF QUOTIDIEN
-     * =========================================================
-     */
+    /* -----------------------------------------------------
+       OBJECTIF JOURNALIER
+    ----------------------------------------------------- */
 
-    const startOfToday =
-      getStartOfToday();
+    const startOfDay = new Date();
+
+    startOfDay.setHours(
+      0,
+      0,
+      0,
+      0
+    );
 
     const articlesCreatedToday =
       await prisma.article.count({
         where: {
-          club: "PSG",
-          isAiGenerated: true,
           createdAt: {
-            gte: startOfToday,
+            gte: startOfDay,
           },
         },
       });
 
-    const remainingDailyTarget =
-      Math.max(
-        0,
-        DAILY_TARGET -
-          articlesCreatedToday
-      );
+    const remainingDailyTarget = Math.max(
+      DAILY_TARGET -
+        articlesCreatedToday,
+      0
+    );
 
-    const requestedCount =
-      remainingDailyTarget > 0
-        ? Math.min(
-            MAX_NEW_ARTICLES_PER_RUN,
-            remainingDailyTarget,
-            candidateClusters.length
-          )
-        : Math.min(
-            MAX_NEW_ARTICLES_PER_RUN,
-            candidateClusters.length
-          );
+    const allowedByDailyTarget =
+      remainingDailyTarget;
+
+    const numberToProcess = Math.min(
+      MAX_NEW_ARTICLES_PER_RUN,
+      allowedByDailyTarget,
+      candidateClusters.length
+    );
 
     const selectedClusters =
-      candidateClusters.slice(
-        0,
-        requestedCount
-      );
+      candidateClusters
+        .sort(
+          (a, b) =>
+            getClusterPriority(b) -
+            getClusterPriority(a)
+        )
+        .slice(
+          0,
+          numberToProcess
+        );
 
-    /*
-     * =========================================================
-     * 7. TRAITEMENT PARALLÈLE
-     * =========================================================
-     *
-     * Les clusters sont indépendants.
-     *
-     * Cela évite :
-     *
-     * cluster 1 -> Gemini -> attendre
-     * cluster 2 -> Gemini -> attendre
-     * cluster 3 -> Gemini -> attendre
-     *
-     * et permet :
-     *
-     * cluster 1 ─┐
-     * cluster 2 ─┼── traitement parallèle
-     * cluster 3 ─┘
-     *
-     * Cette modification permet de conserver une durée
-     * suffisamment courte pour cron-job.org.
-     */
+    /* -----------------------------------------------------
+       TRAITEMENT PARALLELE
+       
+       Important pour rester sous les 30 secondes
+       de cron-job.org.
+    ----------------------------------------------------- */
 
-    const articlesForDuplicateCheck = [
-      ...recentArticles,
-    ];
-
-    const clusterResults =
+    const results =
       await Promise.all(
         selectedClusters.map(
-          (
-            cluster,
-            index
-          ) =>
+          (cluster, index) =>
             processCluster(
               cluster,
-              articlesForDuplicateCheck,
+              recentArticles,
               index + 1
             )
         )
       );
 
-    /*
-     * =========================================================
-     * 8. AGRÉGATION DES RÉSULTATS
-     * =========================================================
-     */
+    /* -----------------------------------------------------
+       STATISTIQUES
+    ----------------------------------------------------- */
 
     let created = 0;
     let skipped = 0;
+    let geminiCalls = 0;
+    let geminiSuccess = 0;
+    let invalidJson = 0;
+    let tooShort = 0;
+    let tooShortAfterRetry = 0;
+    let slugErrors = 0;
+    let createErrors = 0;
+    let sourcePagesFetched = 0;
+    let sourcePagesFailed = 0;
+    let enrichedCharacters = 0;
 
-    for (const result of clusterResults) {
-      diagnostics.push(
-        result.diagnostic
-      );
+    const geminiErrors: string[] = [];
+    const sourcePageErrors: string[] = [];
+    const diagnostics: Diagnostic[] = [];
 
-      geminiCalls +=
-        result.geminiCalls;
-
-      sourcePagesFetched +=
-        result.enrichment
-          .pagesFetched;
-
-      sourcePagesFailed +=
-        result.enrichment
-          .pagesFailed;
-
-      enrichedCharacters +=
-        result.enrichment
-          .enrichedCharacters;
-
-      sourcePageErrors.push(
-        ...result.enrichment
-          .pageErrors
-      );
-
+    for (const result of results) {
       if (result.created) {
         created++;
       } else {
         skipped++;
       }
+
+      geminiCalls +=
+        result.geminiCalls;
+
+      geminiSuccess +=
+        result.geminiSuccess;
+
+      invalidJson +=
+        result.invalidJson;
+
+      tooShort +=
+        result.tooShort;
+
+      tooShortAfterRetry +=
+        result.tooShortAfterRetry;
+
+      slugErrors +=
+        result.slugErrors;
+
+      createErrors +=
+        result.createErrors;
+
+      sourcePagesFetched +=
+        result.enrichment.pagesFetched;
+
+      sourcePagesFailed +=
+        result.enrichment.pagesFailed;
+
+      enrichedCharacters +=
+        result.enrichment.enrichedCharacters;
+
+      geminiErrors.push(
+        ...result.geminiErrors
+      );
+
+      sourcePageErrors.push(
+        ...result.enrichment.pageErrors
+      );
+
+      diagnostics.push(
+        result.diagnostic
+      );
     }
 
-    /*
-     * =========================================================
-     * 9. RÉSULTAT FINAL
-     * =========================================================
-     */
-
-    const totalCreatedToday =
-      articlesCreatedToday +
-      created;
+    const elapsedMs =
+      Date.now() - startedAt;
 
     return NextResponse.json({
-      checked:
-        allItems.length,
+      checked: recentItems.length,
 
-      newItems:
-        newItems.length,
+      newItems: newItems.length,
 
-      clusters:
-        clusters.length,
+      clusters: clusters.length,
 
       candidateClusters:
         candidateClusters.length,
@@ -402,9 +388,9 @@ export async function GET(req: NextRequest) {
 
       deferred:
         Math.max(
-          0,
           candidateClusters.length -
-            selectedClusters.length
+            selectedClusters.length,
+          0
         ),
 
       created,
@@ -412,135 +398,83 @@ export async function GET(req: NextRequest) {
       skipped,
 
       articlesCreatedToday:
-        totalCreatedToday,
+        articlesCreatedToday +
+        created,
 
-      dailyTarget:
-        DAILY_TARGET,
+      dailyTarget: DAILY_TARGET,
 
       remainingDailyTarget:
         Math.max(
-          0,
           DAILY_TARGET -
-            totalCreatedToday
+            (articlesCreatedToday +
+              created),
+          0
         ),
 
       dailyTargetReached:
-        totalCreatedToday >=
+        articlesCreatedToday +
+          created >=
         DAILY_TARGET,
 
-      sourcesOk:
-        feeds
-          .filter(
-            (feed) =>
-              !feed.error
-          )
-          .map(
-            (feed) =>
-              feed.feed
-          ),
+      sourcesOk: [
+        "Google News",
+        "RMC Sport",
+        "CulturePSG",
+      ],
 
       sources:
         RSS_FEEDS.map(
-          (feed) =>
-            feed.name
+          (feed) => feed.name
         ),
 
       duplicates:
-        uniqueItems.length -
-        newItems.length,
+        psgItems.length -
+        uniqueItems.length,
 
       fusion: true,
+
       optimized: true,
+
       enrichment: true,
+
       simplified: true,
+
       unlimitedDailyCap: true,
 
       diagnostics: {
         geminiCalls,
-
-        geminiSuccess:
-          diagnostics.filter(
-            (item) =>
-              item.outcome ===
-              "created"
-          ).length,
-
-        geminiErrors:
-          diagnostics
-            .filter(
-              (item) =>
-                item.outcome ===
-                  "generation_error" ||
-                item.outcome ===
-                  "gemini_quota_exceeded"
-            )
-            .map(
-              (item) =>
-                item.detail
-            ),
-
-        invalidJson:
-          diagnostics.filter(
-            (item) =>
-              item.outcome ===
-              "invalid_json"
-          ).length,
-
-        tooShort:
-          diagnostics.filter(
-            (item) =>
-              item.outcome ===
-              "too_short"
-          ).length,
-
-        tooShortAfterRetry:
-          diagnostics.filter(
-            (item) =>
-              item.outcome ===
-              "too_short_after_retry"
-          ).length,
-
-        slugErrors:
-          diagnostics.filter(
-            (item) =>
-              item.outcome ===
-              "slug_error"
-          ).length,
-
-        createErrors:
-          diagnostics.filter(
-            (item) =>
-              item.outcome ===
-              "create_error"
-          ).length,
-
+        geminiSuccess,
+        geminiErrors,
+        invalidJson,
+        tooShort,
+        tooShortAfterRetry,
+        slugErrors,
+        createErrors,
         rssErrors,
-
         sourcePagesFetched,
-
         sourcePagesFailed,
-
         enrichedCharacters,
-
         sourcePageErrors,
-
-        clusters:
-          diagnostics,
+        clusters: diagnostics,
       },
 
-      elapsedMs:
-        Date.now() -
-        startedAt,
+      elapsedMs,
     });
   } catch (error) {
+    console.error(
+      "PSG Direct cron error:",
+      error
+    );
+
     return NextResponse.json(
       {
         error:
-          getErrorMessage(error),
+          error instanceof Error
+            ? error.message
+            : "Unknown error",
 
         elapsedMs:
-          Date.now() -
-          startedAt,
+          Date.now() - startedAt,
       },
       {
         status: 500,
@@ -549,887 +483,18 @@ export async function GET(req: NextRequest) {
   }
 }
 
-/*
- * =========================================================
- * PROCESS CLUSTER
- * =========================================================
- */
+/* =========================================================
+   RSS
+========================================================= */
 
-async function processCluster(
-  cluster: FeedItem[],
-  recentArticles: Array<{
-    title: string;
-    slug: string;
-    sourceUrl: string | null;
-  }>,
-  clusterNumber: number
+async function fetchRssFeed(
+  source: string,
+  url: string
 ): Promise<{
-  created: boolean;
-  articleTitle: string | null;
-  sourceUrl: string | null;
-  diagnostic: Diagnostic;
-  enrichment: EnrichmentResult;
-  geminiCalls: number;
-}> {
-  const sources = [
-    ...new Set(
-      cluster.map(
-        (item) =>
-          item.source
-      )
-    ),
-  ];
-
-  const titles = cluster.map(
-    (item) =>
-      item.title
-  );
-
-  const sorted = [...cluster]
-    .sort(
-      (a, b) =>
-        sourcePriority(b.source) -
-        sourcePriority(a.source)
-    )
-    .slice(
-      0,
-      MAX_SOURCES_PER_ARTICLE
-    );
-
-  const enrichment =
-    await enrichSources(
-      sorted,
-      cluster
-    );
-
-  const sourceInputs =
-    enrichment.sources;
-
-  if (
-    sourceInputs.length === 0
-  ) {
-    return {
-      created: false,
-      articleTitle: null,
-      sourceUrl: null,
-      enrichment,
-      geminiCalls: 0,
-      diagnostic: {
-        cluster: clusterNumber,
-        sources,
-        titles,
-        outcome:
-          "no_sources",
-        detail:
-          "Aucune source exploitable.",
-      },
-    };
-  }
-
-  /*
-   * =========================================================
-   * PREMIÈRE GÉNÉRATION
-   * =========================================================
-   */
-
-  let geminiCallsForCluster = 0;
-
-  const firstGeneration =
-    await generateArticle(
-      sourceInputs
-    );
-
-  geminiCallsForCluster++;
-
-  if (
-    firstGeneration.quotaExceeded
-  ) {
-    return {
-      created: false,
-      articleTitle: null,
-      sourceUrl: null,
-      enrichment,
-      geminiCalls:
-        geminiCallsForCluster,
-      diagnostic: {
-        cluster: clusterNumber,
-        sources,
-        titles,
-        outcome:
-          "gemini_quota_exceeded",
-        detail:
-          firstGeneration.error ||
-          "Gemini quota exceeded.",
-      },
-    };
-  }
-
-  if (
-    !firstGeneration.article
-  ) {
-    return {
-      created: false,
-      articleTitle: null,
-      sourceUrl: null,
-      enrichment,
-      geminiCalls:
-        geminiCallsForCluster,
-      diagnostic: {
-        cluster: clusterNumber,
-        sources,
-        titles,
-        outcome:
-          firstGeneration.error?.includes(
-            "JSON"
-          )
-            ? "invalid_json"
-            : "generation_error",
-        detail:
-          firstGeneration.error ||
-          "Gemini n'a pas généré d'article.",
-      },
-    };
-  }
-
-  let article =
-    normalizeArticle(
-      firstGeneration.article
-    );
-
-  /*
-   * =========================================================
-   * RETRY SI ARTICLE TROP COURT
-   * =========================================================
-   */
-
-  if (
-    countWords(
-      article.content
-    ) < MIN_ARTICLE_WORDS
-  ) {
-    const retry =
-      await generateArticle(
-        sourceInputs,
-        true,
-        article
-      );
-
-    geminiCallsForCluster++;
-
-    if (
-      retry.quotaExceeded
-    ) {
-      return {
-        created: false,
-        articleTitle: null,
-        sourceUrl: null,
-        enrichment,
-        geminiCalls:
-          geminiCallsForCluster,
-        diagnostic: {
-          cluster: clusterNumber,
-          sources,
-          titles,
-          outcome:
-            "gemini_quota_exceeded",
-          detail:
-            retry.error ||
-            "Gemini quota exceeded during retry.",
-        },
-      };
-    }
-
-    if (retry.article) {
-      article =
-        normalizeArticle(
-          retry.article
-        );
-    }
-  }
-
-  /*
-   * =========================================================
-   * DEUXIÈME RETRY SI TOUJOURS TROP COURT
-   * =========================================================
-   *
-   * Ce retry reste limité.
-   *
-   * En cas de 429, nous sortons immédiatement.
-   */
-
-  if (
-    countWords(
-      article.content
-    ) < MIN_ARTICLE_WORDS
-  ) {
-    const retry =
-      await generateArticle(
-        sourceInputs,
-        true,
-        article,
-        true
-      );
-
-    geminiCallsForCluster++;
-
-    if (
-      retry.quotaExceeded
-    ) {
-      return {
-        created: false,
-        articleTitle: null,
-        sourceUrl: null,
-        enrichment,
-        geminiCalls:
-          geminiCallsForCluster,
-        diagnostic: {
-          cluster: clusterNumber,
-          sources,
-          titles,
-          outcome:
-            "gemini_quota_exceeded",
-          detail:
-            retry.error ||
-            "Gemini quota exceeded during second retry.",
-        },
-      };
-    }
-
-    if (retry.article) {
-      article =
-        normalizeArticle(
-          retry.article
-        );
-    }
-  }
-
-  const articleWords =
-    countWords(
-      article.content
-    );
-
-  /*
-   * =========================================================
-   * ARTICLE TROP COURT
-   * =========================================================
-   */
-
-  if (
-    articleWords <
-    MIN_ARTICLE_WORDS
-  ) {
-    return {
-      created: false,
-      articleTitle:
-        article.title,
-      sourceUrl:
-        sorted[0]?.link ||
-        null,
-      enrichment,
-      geminiCalls:
-        geminiCallsForCluster,
-      diagnostic: {
-        cluster: clusterNumber,
-        sources,
-        titles,
-        outcome:
-          "too_short_after_retry",
-        detail:
-          `title=${article.title.length}, words=${articleWords}, excerpt=${article.excerpt.length}`,
-      },
-    };
-  }
-
-  /*
-   * =========================================================
-   * DÉTECTION DES DOUBLONS
-   * =========================================================
-   */
-
-  const duplicate =
-    recentArticles.some(
-      (existing) =>
-        titleSimilarity(
-          article.title,
-          existing.title
-        ) >= 0.9
-    );
-
-  if (duplicate) {
-    return {
-      created: false,
-      articleTitle:
-        article.title,
-      sourceUrl:
-        sorted[0]?.link ||
-        null,
-      enrichment,
-      geminiCalls:
-        geminiCallsForCluster,
-      diagnostic: {
-        cluster: clusterNumber,
-        sources,
-        titles,
-        outcome:
-          "duplicate",
-        detail:
-          "Article similaire déjà présent dans la base.",
-      },
-    };
-  }
-
-  /*
-   * =========================================================
-   * SLUG
-   * =========================================================
-   */
-
-  let slug: string;
-
-  try {
-    slug =
-      await makeUniqueSlug(
-        article.title
-      );
-  } catch (error) {
-    return {
-      created: false,
-      articleTitle:
-        article.title,
-      sourceUrl:
-        sorted[0]?.link ||
-        null,
-      enrichment,
-      geminiCalls:
-        geminiCallsForCluster,
-      diagnostic: {
-        cluster: clusterNumber,
-        sources,
-        titles,
-        outcome:
-          "slug_error",
-        detail:
-          getErrorMessage(
-            error
-          ),
-      },
-    };
-  }
-
-  /*
-   * =========================================================
-   * CRÉATION PRISMA
-   * =========================================================
-   */
-
-  try {
-    await prisma.article.create({
-      data: {
-        title:
-          article.title,
-
-        slug,
-
-        excerpt:
-          article.excerpt,
-
-        content:
-          article.content,
-
-        club: "PSG",
-
-        status: "DRAFT",
-
-        isAiGenerated:
-          true,
-
-        sourceUrl:
-          sorted[0]?.link ||
-          null,
-      },
-    });
-
-    return {
-      created: true,
-      articleTitle:
-        article.title,
-      sourceUrl:
-        sorted[0]?.link ||
-        null,
-      enrichment,
-      geminiCalls:
-        geminiCallsForCluster,
-      diagnostic: {
-        cluster: clusterNumber,
-        sources,
-        titles,
-        outcome:
-          "created",
-        detail:
-          `Article créé en DRAFT. ${articleWords} mots.`,
-      },
-    };
-  } catch (error) {
-    return {
-      created: false,
-      articleTitle:
-        article.title,
-      sourceUrl:
-        sorted[0]?.link ||
-        null,
-      enrichment,
-      geminiCalls:
-        geminiCallsForCluster,
-      diagnostic: {
-        cluster: clusterNumber,
-        sources,
-        titles,
-        outcome:
-          "create_error",
-        detail:
-          getErrorMessage(
-            error
-          ),
-      },
-    };
-  }
-}
-
-/*
- * =========================================================
- * ENRICHISSEMENT DES SOURCES
- * =========================================================
- */
-
-async function enrichSources(
-  cluster: FeedItem[],
-  fullCluster: FeedItem[]
-): Promise<EnrichmentResult> {
-  const sources: ArticleInput[] = [];
-
-  let pagesFetched = 0;
-  let pagesFailed = 0;
-  let enrichedCharacters = 0;
-
-  const pageErrors: string[] = [];
-
-  const enriched =
-    await Promise.all(
-      cluster.map(
-        async (item) => {
-          const baseDescription =
-            cleanText(
-              stripHtml(
-                item.description
-              )
-            );
-
-          const shouldFetch =
-            shouldFetchSourcePage(
-              item,
-              fullCluster
-            );
-
-          if (!shouldFetch) {
-            return {
-              ...item,
-              description:
-                baseDescription,
-              pageText: "",
-              pageFetched: false,
-              pageError: null as string | null,
-            };
-          }
-
-          try {
-            const html =
-              await fetchWithTimeout(
-                item.link,
-                SOURCE_TIMEOUT_MS,
-                {
-                  headers: {
-                    Accept:
-                      "text/html,application/xhtml+xml",
-                    "User-Agent":
-                      "Mozilla/5.0 PSG-Direct/1.0",
-                  },
-                }
-              );
-
-            const pageText =
-              extractPageText(
-                html
-              );
-
-            return {
-              ...item,
-              description:
-                baseDescription,
-              pageText,
-              pageFetched:
-                pageText.length > 0,
-              pageError: null as string | null,
-            };
-          } catch (error) {
-            return {
-              ...item,
-              description:
-                baseDescription,
-              pageText: "",
-              pageFetched: false,
-              pageError:
-                getErrorMessage(
-                  error
-                ),
-            };
-          }
-        }
-      )
-    );
-
-  for (const item of enriched) {
-    let description =
-      item.description;
-
-    if (
-      item.pageFetched &&
-      item.pageText
-    ) {
-      pagesFetched++;
-
-      enrichedCharacters +=
-        item.pageText.length;
-
-      description =
-        `${description}\n\nInformations complémentaires de la page source :\n${item.pageText}`;
-    } else if (
-      item.pageError
-    ) {
-      pagesFailed++;
-
-      pageErrors.push(
-        `${item.source}: ${item.pageError}`
-      );
-    }
-
-    sources.push({
-      title:
-        item.title,
-
-      description:
-        description.slice(
-          0,
-          MAX_SOURCE_PAGE_CHARS
-        ),
-
-      source:
-        item.source,
-
-      link:
-        item.link,
-    });
-  }
-
-  return {
-    sources,
-    pagesFetched,
-    pagesFailed,
-    enrichedCharacters,
-    pageErrors,
-  };
-}
-
-/*
- * =========================================================
- * DÉCISION DE RÉCUPÉRATION DE LA PAGE SOURCE
- * =========================================================
- */
-
-function shouldFetchSourcePage(
-  item: FeedItem,
-  cluster: FeedItem[]
-): boolean {
-  const description =
-    cleanText(
-      stripHtml(
-        item.description
-      )
-    );
-
-  const words =
-    countWords(
-      description
-    );
-
-  if (
-    words <
-    LOW_INFORMATION_WORDS
-  ) {
-    return true;
-  }
-
-  if (
-    cluster.length > 1
-  ) {
-    return true;
-  }
-
-  if (
-    sourcePriority(
-      item.source
-    ) >= 4
-  ) {
-    return true;
-  }
-
-  if (
-    description.length < 500
-  ) {
-    return true;
-  }
-
-  const concreteIntent =
-    /heure|quelle chaîne|chaîne|composition|compo|blessé|blessure|absent|transfert|mercato|contrat|prolongation|arbitre|stade|parc des princes|pelouse|diffusion|télévision|titulaire|groupe|conférence|match/i;
-
-  if (
-    concreteIntent.test(
-      item.title
-    )
-  ) {
-    return true;
-  }
-
-  const boilerplate =
-    /lire la suite|en savoir plus|cliquez|retrouvez|article complet/i;
-
-  if (
-    boilerplate.test(
-      description
-    )
-  ) {
-    return true;
-  }
-
-  return false;
-}
-
-/*
- * =========================================================
- * GEMINI
- * =========================================================
- */
-
-async function generateArticle(
-  sources: ArticleInput[],
-  retry = false,
-  previousArticle?: GeminiArticle,
-  forceLongRetry = false
-): Promise<GeminiCallResult> {
-  const sourceText =
-    sources
-      .map(
-        (source, index) =>
-          `SOURCE ${index + 1}
-Source : ${source.source}
-Titre : ${source.title}
-URL : ${source.link}
-Informations :
-${source.description}`
-      )
-      .join(
-        "\n\n==============================\n\n"
-      );
-
-  let previousText = "";
-
-  if (previousArticle) {
-    previousText = `
-ARTICLE PRÉCÉDENT À AMÉLIORER :
-
-Titre :
-${previousArticle.title}
-
-Chapô :
-${previousArticle.excerpt}
-
-Contenu :
-${previousArticle.content}
-`;
-  }
-
-  const retryInstruction = retry
-    ? forceLongRetry
-      ? `
-L'article précédent est encore trop court.
-
-Produis cette fois un véritable article de presse sportive d'au moins 500 mots lorsque les informations disponibles le permettent.
-
-Tu dois développer les faits réellement présents dans les sources, sans inventer.
-`
-      : `
-L'article précédent était trop court.
-
-Produis un article plus développé, idéalement entre 600 et 800 mots lorsque les informations disponibles le permettent.
-
-N'invente aucune information.
-`
-    : `
-Produis un article complet d'environ 600 à 800 mots lorsque les informations disponibles le permettent.
-`;
-
-  const prompt = `
-Tu es le rédacteur en chef de PSG Direct, un média français consacré exclusivement au Paris Saint-Germain.
-
-Ta mission est de transformer plusieurs sources d'actualité en UN SEUL article de presse sportive original.
-
-${retryInstruction}
-
-RÈGLES ABSOLUES :
-
-1. Utilise uniquement les informations réellement présentes dans les sources.
-2. Ne crée aucune information.
-3. N'invente jamais de date.
-4. N'invente jamais d'heure.
-5. N'invente jamais de chaîne TV.
-6. N'invente jamais de composition.
-7. N'invente jamais de blessure.
-8. N'invente jamais de transfert.
-9. N'invente jamais de résultat.
-10. N'invente jamais de déclaration.
-11. N'invente jamais de joueur.
-12. N'invente jamais de lieu.
-13. Ne mélange pas deux événements différents.
-14. Fusionne uniquement les informations qui concernent le même sujet.
-15. Ne cite jamais Gemini.
-16. Ne mentionne jamais l'IA.
-17. Ne copie pas les phrases des sources.
-18. Réécris entièrement avec un style journalistique naturel.
-19. Le texte doit être en français.
-20. Le ton doit être celui d'un média sportif professionnel.
-21. Le contenu doit être structuré avec des titres Markdown lorsque cela est pertinent.
-22. Le chapô doit être court et informatif.
-23. Le titre doit être clair, naturel et attractif.
-24. Si les sources ne permettent pas d'atteindre 600 mots sans inventer, privilégie l'exactitude plutôt que le remplissage.
-
-${previousText}
-
-SOURCES À UTILISER :
-
-${sourceText}
-
-Retourne UNIQUEMENT un JSON valide, sans commentaire avant ou après :
-
-{
-  "title": "Titre de l'article",
-  "excerpt": "Chapô de l'article",
-  "content": "Contenu complet en Markdown"
-}
-`;
-
-  const result =
-    await callGemini(
-      prompt
-    );
-
-  if (result.error) {
-    return {
-      article: null,
-      error:
-        result.error,
-      quotaExceeded:
-        result.quotaExceeded,
-    };
-  }
-
-  if (!result.text) {
-    return {
-      article: null,
-      error:
-        "Gemini returned an empty response",
-      quotaExceeded: false,
-    };
-  }
-
-  const parsed =
-    parseGeminiJson(
-      result.text
-    );
-
-  if (!parsed) {
-    return {
-      article: null,
-      error:
-        "Gemini response is not valid JSON",
-      quotaExceeded: false,
-    };
-  }
-
-  if (
-    !isValidGeminiArticle(
-      parsed
-    )
-  ) {
-    return {
-      article: null,
-      error:
-        "Gemini JSON does not contain a valid article",
-      quotaExceeded: false,
-    };
-  }
-
-  return {
-    article:
-      normalizeArticle(
-        parsed
-      ),
-    error: null,
-    quotaExceeded: false,
-  };
-}
-
-/*
- * =========================================================
- * APPEL GEMINI
- * =========================================================
- *
- * IMPORTANT :
- *
- * - On ne multiplie pas les retries quand Gemini retourne 429.
- * - Le second modèle est tenté uniquement pour les erreurs
- *   qui ne correspondent pas à un quota dépassé.
- */
-
-async function callGemini(
-  prompt: string
-): Promise<{
-  text: string | null;
+  items: FeedItem[];
   error: string | null;
-  quotaExceeded: boolean;
 }> {
-  if (!GEMINI_API_KEY) {
-    return {
-      text: null,
-      error:
-        "GEMINI_API_KEY is missing",
-      quotaExceeded: false,
-    };
-  }
-
-  const models = [
-    "gemini-3.5-flash-lite",
-    "gemini-3.6-flash",
-  ];
-
-  const errors: string[] = [];
-
-  for (
-    let index = 0;
-    index < models.length;
-    index++
-  ) {
-    const model =
-      models[index];
-
+  try {
     const controller =
       new AbortController();
 
@@ -1437,1002 +502,121 @@ async function callGemini(
       setTimeout(
         () =>
           controller.abort(),
-        GEMINI_TIMEOUT_MS
+        RSS_TIMEOUT_MS
       );
 
-    try {
-      const response =
-        await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`,
-          {
-            method: "POST",
+    const response =
+      await fetch(url, {
+        signal:
+          controller.signal,
+        headers: {
+          "User-Agent":
+            "PSG-Direct/1.0",
+          Accept:
+            "application/rss+xml, application/xml, text/xml",
+        },
+        cache: "no-store",
+      });
 
-            headers: {
-              "Content-Type":
-                "application/json",
-            },
+    clearTimeout(timeout);
 
-            body: JSON.stringify({
-              contents: [
-                {
-                  parts: [
-                    {
-                      text: prompt,
-                    },
-                  ],
-                },
-              ],
-
-              generationConfig: {
-                temperature: 0.2,
-                maxOutputTokens: 4500,
-                responseMimeType:
-                  "application/json",
-              },
-            }),
-
-            signal:
-              controller.signal,
-          }
-        );
-
-      const rawText =
-        await response.text();
-
-      if (!response.ok) {
-        const errorMessage =
-          rawText ||
-          `${response.status} ${response.statusText}`;
-
-        const is429 =
-          response.status === 429 ||
-          /quota|resource_exhausted|rate_limit_exceeded|too_many_requests|exceeded your current quota/i.test(
-            errorMessage
-          );
-
-        if (is429) {
-          return {
-            text: null,
-            error:
-              `Gemini ${model}: HTTP 429 - ${errorMessage}`,
-            quotaExceeded: true,
-          };
-        }
-
-        errors.push(
-          `Gemini ${model}: HTTP ${response.status} - ${errorMessage}`
-        );
-
-        /*
-         * On passe au modèle suivant pour une erreur serveur
-         * ou une erreur temporaire.
-         */
-        continue;
-      }
-
-      let data: any;
-
-      try {
-        data =
-          JSON.parse(
-            rawText
-          );
-      } catch {
-        errors.push(
-          `Gemini ${model}: invalid HTTP JSON response`
-        );
-
-        continue;
-      }
-
-      const text =
-        data?.candidates?.[0]
-          ?.content?.parts?.[0]
-          ?.text;
-
-      if (
-        typeof text ===
-          "string" &&
-        text.trim()
-      ) {
-        return {
-          text:
-            text.trim(),
-          error: null,
-          quotaExceeded: false,
-        };
-      }
-
-      errors.push(
-        `Gemini ${model}: empty candidate response`
-      );
-    } catch (error) {
-      const message =
-        getErrorMessage(
-          error
-        );
-
-      /*
-       * AbortError = timeout local.
-       * On ne considère pas cela comme un quota.
-       */
-      errors.push(
-        `Gemini ${model}: ${message}`
-      );
-    } finally {
-      clearTimeout(
-        timeout
-      );
+    if (!response.ok) {
+      return {
+        items: [],
+        error: `${source}: HTTP ${response.status} ${response.statusText}`,
+      };
     }
-  }
 
-  return {
-    text: null,
-    error:
-      errors.join(
-        " | "
-      ) ||
-      "Gemini generation failed",
-    quotaExceeded: false,
-  };
-}
+    const xml =
+      await response.text();
 
-/*
- * =========================================================
- * PARSING GEMINI JSON
- * =========================================================
- */
-
-function parseGeminiJson(
-  text: string
-): GeminiArticle | null {
-  const cleaned =
-    text
-      .trim()
-      .replace(
-        /^```json\s*/i,
-        ""
-      )
-      .replace(
-        /^```\s*/i,
-        ""
-      )
-      .replace(
-        /\s*```$/i,
-        ""
-      )
-      .trim();
-
-  try {
-    const parsed =
-      JSON.parse(
-        cleaned
+    const items =
+      parseRssXml(
+        xml,
+        source
       );
 
-    if (
-      isValidGeminiArticle(
-        parsed
-      )
-    ) {
-      return parsed;
-    }
-  } catch {
-    // Continue avec extraction.
+    return {
+      items:
+        items.slice(
+          0,
+          MAX_ITEMS_PER_SOURCE
+        ),
+      error: null,
+    };
+  } catch (error) {
+    return {
+      items: [],
+      error: `${source}: ${
+        error instanceof Error
+          ? error.message
+          : "Unknown RSS error"
+      }`,
+    };
   }
-
-  const jsonObject =
-    extractFirstJsonObject(
-      cleaned
-    );
-
-  if (!jsonObject) {
-    return null;
-  }
-
-  try {
-    const repaired =
-      repairJsonString(
-        jsonObject
-      );
-
-    const parsed =
-      JSON.parse(
-        repaired
-      );
-
-    if (
-      isValidGeminiArticle(
-        parsed
-      )
-    ) {
-      return parsed;
-    }
-  } catch {
-    return null;
-  }
-
-  return null;
 }
 
-function isValidGeminiArticle(
-  value: any
-): value is GeminiArticle {
-  return (
-    value &&
-    typeof value ===
-      "object" &&
-    typeof value.title ===
-      "string" &&
-    typeof value.excerpt ===
-      "string" &&
-    typeof value.content ===
-      "string" &&
-    value.title.trim().length >
-      0 &&
-    value.excerpt.trim().length >
-      0 &&
-    value.content.trim().length >
-      0
-  );
-}
-
-function extractFirstJsonObject(
-  text: string
-): string | null {
-  const start =
-    text.indexOf("{");
-
-  if (start === -1) {
-    return null;
-  }
-
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
-
-  for (
-    let i = start;
-    i < text.length;
-    i++
-  ) {
-    const char =
-      text[i];
-
-    if (escaped) {
-      escaped = false;
-      continue;
-    }
-
-    if (
-      char === "\\" &&
-      inString
-    ) {
-      escaped = true;
-      continue;
-    }
-
-    if (
-      char === '"'
-    ) {
-      inString =
-        !inString;
-      continue;
-    }
-
-    if (inString) {
-      continue;
-    }
-
-    if (
-      char === "{"
-    ) {
-      depth++;
-    }
-
-    if (
-      char === "}"
-    ) {
-      depth--;
-
-      if (depth === 0) {
-        return text.slice(
-          start,
-          i + 1
-        );
-      }
-    }
-  }
-
-  return null;
-}
-
-function repairJsonString(
-  text: string
-): string {
-  return text
-    .replace(
-      /,\s*}/g,
-      "}"
-    )
-    .replace(
-      /,\s*]/g,
-      "]"
-    )
-    .trim();
-}
-
-/*
- * =========================================================
- * NORMALISATION ARTICLE
- * =========================================================
- */
-
-function normalizeArticle(
-  article: GeminiArticle
-): GeminiArticle {
-  let title =
-    cleanText(
-      article.title
-    );
-
-  let excerpt =
-    cleanText(
-      article.excerpt
-    );
-
-  let content =
-    cleanArticleContent(
-      article.content
-    );
-
-  if (
-    !title
-  ) {
-    title =
-      "Actualité du PSG";
-  }
-
-  if (
-    !excerpt
-  ) {
-    excerpt =
-      trimToWords(
-        content,
-        45
-      );
-  }
-
-  if (
-    !content
-  ) {
-    content =
-      excerpt;
-  }
-
-  if (
-    countWords(
-      content
-    ) > MAX_ARTICLE_WORDS
-  ) {
-    content =
-      trimToWords(
-        content,
-        MAX_ARTICLE_WORDS
-      );
-  }
-
-  content =
-    addBasicStructure(
-      content
-    );
-
-  return {
-    title,
-    excerpt,
-    content,
-  };
-}
-
-function addBasicStructure(
-  content: string
-): string {
-  const cleaned =
-    content.trim();
-
-  if (
-    /^#/m.test(
-      cleaned
-    )
-  ) {
-    return cleaned;
-  }
-
-  const paragraphs =
-    cleaned
-      .split(
-        /\n\s*\n/
-      )
-      .map(
-        (part) =>
-          part.trim()
-      )
-      .filter(Boolean);
-
-  if (
-    paragraphs.length <= 2
-  ) {
-    return cleaned;
-  }
-
-  const first =
-    paragraphs[0];
-
-  const rest =
-    paragraphs
-      .slice(1)
-      .join(
-        "\n\n"
-      );
-
-  return `${first}\n\n${rest}`;
-}
-
-function trimToWords(
-  text: string,
-  maxWords: number
-): string {
-  const words =
-    text
-      .trim()
-      .split(/\s+/);
-
-  if (
-    words.length <=
-    maxWords
-  ) {
-    return text.trim();
-  }
-
-  return (
-    words
-      .slice(
-        0,
-        maxWords
-      )
-      .join(" ")
-      .replace(
-        /[,:;]$/,
-        ""
-      ) +
-    "…"
-  );
-}
-
-/*
- * =========================================================
- * CLUSTERS
- * =========================================================
- */
-
-function buildSimpleClusters(
-  items: FeedItem[]
-): FeedItem[][] {
-  const clusters: FeedItem[][] =
-    [];
-
-  for (const item of items) {
-    const opponent =
-      extractOpponent(
-        item.title
-      );
-
-    const event =
-      extractEvent(
-        item.title
-      );
-
-    let bestCluster:
-      FeedItem[] | null =
-      null;
-
-    let bestScore = 0;
-
-    for (
-      const cluster of clusters
-    ) {
-      const score =
-        similarityToCluster(
-          item,
-          cluster
-        );
-
-      if (
-        score >
-          bestScore &&
-        score >= 0.72
-      ) {
-        bestScore =
-          score;
-
-        bestCluster =
-          cluster;
-      }
-    }
-
-    if (
-      bestCluster
-    ) {
-      const clusterOpponents =
-        extractAllOpponents(
-          bestCluster
-            .map(
-              (x) =>
-                x.title
-            )
-            .join(" ")
-        );
-
-      if (
-        opponent &&
-        clusterOpponents.length >
-          0 &&
-        !clusterOpponents.includes(
-          opponent
-        )
-      ) {
-        clusters.push([
-          item,
-        ]);
-        continue;
-      }
-
-      bestCluster.push(
-        item
-      );
-    } else {
-      clusters.push([
-        item,
-      ]);
-    }
-
-    /*
-     * Utilisation de event pour conserver une variable
-     * explicitement calculée et éviter les regroupements
-     * absurdes sur des titres très courts.
-     */
-    if (
-      event &&
-      clusters.length === 0
-    ) {
-      clusters.push([
-        item,
-      ]);
-    }
-  }
-
-  return clusters;
-}
-
-function similarityToCluster(
-  item: FeedItem,
-  cluster: FeedItem[]
-): number {
-  let best = 0;
-
-  for (
-    const existing of cluster
-  ) {
-    const similarity =
-      simpleStorySimilarity(
-        item.title,
-        existing.title
-      );
-
-    if (
-      similarity >
-      best
-    ) {
-      best =
-        similarity;
-    }
-  }
-
-  return best;
-}
-
-function simpleStorySimilarity(
-  a: string,
-  b: string
-): number {
-  const tokensA =
-    new Set(
-      meaningfulTokens(
-        a
-      )
-    );
-
-  const tokensB =
-    new Set(
-      meaningfulTokens(
-        b
-      )
-    );
-
-  if (
-    tokensA.size === 0 ||
-    tokensB.size === 0
-  ) {
-    return 0;
-  }
-
-  let intersection =
-    0;
-
-  for (
-    const token of tokensA
-  ) {
-    if (
-      tokensB.has(
-        token
-      )
-    ) {
-      intersection++;
-    }
-  }
-
-  const union =
-    new Set([
-      ...tokensA,
-      ...tokensB,
-    ]).size;
-
-  return (
-    intersection /
-    Math.max(
-      1,
-      union
-    )
-  );
-}
-
-function extractAllOpponents(
-  text: string
-): string[] {
-  const normalized =
-    normalizeForComparison(
-      text
-    );
-
-  const opponents = [
-    "Lille",
-    "Rennes",
-    "Marseille",
-    "OM",
-    "Lyon",
-    "Monaco",
-    "Lens",
-    "Nantes",
-    "Strasbourg",
-    "Nice",
-    "Brest",
-    "Montpellier",
-    "Toulouse",
-    "Reims",
-    "Auxerre",
-    "Le Havre",
-    "Saint-Etienne",
-    "Nîmes",
-    "Bordeaux",
-    "Angers",
-    "Metz",
-    "Nantes",
-    "Manchester City",
-    "Manchester United",
-    "Liverpool",
-    "Arsenal",
-    "Chelsea",
-    "Real Madrid",
-    "Barcelona",
-    "Bayern Munich",
-    "Inter Milan",
-    "AC Milan",
-    "Juventus",
-    "Atletico Madrid",
-    "Benfica",
-    "Sporting",
-    "Porto",
-    "Slovan Bratislava",
-    "Bratislava",
-  ];
-
-  return opponents.filter(
-    (opponent) =>
-      normalized.includes(
-        normalizeForComparison(
-          opponent
-        )
-      )
-  );
-}
-
-function extractOpponent(
-  text: string
-): string | null {
-  const opponents =
-    extractAllOpponents(
-      text
-    );
-
-  if (
-    opponents.length !== 1
-  ) {
-    return null;
-  }
-
-  return opponents[0];
-}
-
-function extractEvent(
-  text: string
-): string | null {
-  const normalized =
-    normalizeForComparison(
-      text
-    );
-
-  if (
-    /composition|compo|titulaire|groupe/.test(
-      normalized
-    )
-  ) {
-    return "composition";
-  }
-
-  if (
-    /heure|chaine|diffusion|television|direct|streaming/.test(
-      normalized
-    )
-  ) {
-    return "diffusion";
-  }
-
-  if (
-    /blessure|blesse|absent|forfait/.test(
-      normalized
-    )
-  ) {
-    return "injury";
-  }
-
-  if (
-    /transfert|mercato|recrute|prolongation|contrat/.test(
-      normalized
-    )
-  ) {
-    return "mercato";
-  }
-
-  if (
-    /match|rencontre|victoire|defaite|nul|score/.test(
-      normalized
-    )
-  ) {
-    return "match";
-  }
-
-  return null;
-}
-
-/*
- * =========================================================
- * DÉDUPLICATION
- * =========================================================
- */
-
-function deduplicateItems(
-  items: FeedItem[]
-): FeedItem[] {
-  const result: FeedItem[] =
-    [];
-
-  const seenUrls =
-    new Set<string>();
-
-  const seenTitles =
-    new Set<string>();
-
-  for (const item of items) {
-    const url =
-      normalizeUrl(
-        item.link
-      );
-
-    const title =
-      normalizeForComparison(
-        item.title
-      );
-
-    if (
-      url &&
-      seenUrls.has(url)
-    ) {
-      continue;
-    }
-
-    if (
-      title &&
-      seenTitles.has(title)
-    ) {
-      continue;
-    }
-
-    if (url) {
-      seenUrls.add(url);
-    }
-
-    if (title) {
-      seenTitles.add(title);
-    }
-
-    result.push(item);
-  }
-
-  return result;
-}
-
-function isAlreadyStored(
-  item: FeedItem,
-  articles: Array<{
-    title: string;
-    slug: string;
-    sourceUrl: string | null;
-  }>
-): boolean {
-  const itemUrl =
-    normalizeUrl(
-      item.link
-    );
-
-  return articles.some(
-    (article) => {
-      if (
-        itemUrl &&
-        normalizeUrl(
-          article.sourceUrl ||
-            ""
-        ) === itemUrl
-      ) {
-        return true;
-      }
-
-      return (
-        titleSimilarity(
-          item.title,
-          article.title
-        ) >= 0.9
-      );
-    }
-  );
-}
-
-/*
- * =========================================================
- * FILTRE PSG
- * =========================================================
- */
-
-function isRelevantPSG(
-  item: FeedItem
-): boolean {
-  const text =
-    `${item.title} ${item.description}`;
-
-  const normalized =
-    normalizeForComparison(
-      text
-    );
-
-  const psgTerms = [
-    "psg",
-    "paris saint germain",
-    "paris sg",
-    "paris-sg",
-    "paris saint-germain",
-    "parisien",
-  ];
-
-  return psgTerms.some(
-    (term) =>
-      normalized.includes(
-        normalizeForComparison(
-          term
-        )
-      )
-  );
-}
-
-/*
- * =========================================================
- * RSS
- * =========================================================
- */
-
-function parseRSS(
+/* =========================================================
+   RSS XML PARSER
+========================================================= */
+
+function parseRssXml(
   xml: string,
   source: string
 ): FeedItem[] {
-  const items: FeedItem[] =
-    [];
+  const items: FeedItem[] = [];
 
   const itemMatches =
     xml.match(
-      /<item[\s\S]*?<\/item>/gi
+      /<item\b[\s\S]*?<\/item>/gi
     ) || [];
 
-  for (
-    const itemXml of itemMatches.slice(
-      0,
-      MAX_ITEMS_PER_SOURCE
-    )
-  ) {
+  for (const itemXml of itemMatches) {
     const title =
-      cleanText(
-        decodeHtmlEntities(
-          extractXMLTag(
-            itemXml,
-            "title"
-          )
+      cleanHtml(
+        extractXmlValue(
+          itemXml,
+          "title"
         )
       );
 
     const description =
-      cleanText(
-        decodeHtmlEntities(
-          extractXMLTag(
-            itemXml,
-            "description"
-          )
+      cleanHtml(
+        extractXmlValue(
+          itemXml,
+          "description"
         )
       );
 
     const link =
-      cleanUrl(
-        decodeHtmlEntities(
-          extractXMLTag(
-            itemXml,
-            "link"
-          )
-        )
-      );
+      extractXmlValue(
+        itemXml,
+        "link"
+      ).trim();
 
     const pubDate =
-      cleanText(
-        extractXMLTag(
-          itemXml,
-          "pubDate"
-        )
-      );
+      extractXmlValue(
+        itemXml,
+        "pubDate"
+      ).trim();
 
-    if (
-      !title ||
-      !link
-    ) {
+    if (!title || !link) {
       continue;
     }
 
     items.push({
       title,
       description,
+      source,
       link,
       pubDate,
-      source,
     });
   }
 
   return items;
 }
 
-function extractXMLTag(
+function extractXmlValue(
   xml: string,
   tag: string
 ): string {
@@ -2448,16 +632,2046 @@ function extractXMLTag(
   return match?.[1] || "";
 }
 
-/*
- * =========================================================
- * PAGE TEXT
- * =========================================================
- */
+/* =========================================================
+   PSG FILTER
+========================================================= */
 
-function extractPageText(
+function isRelevantToPSG(
+  item: FeedItem
+): boolean {
+  const text =
+    normalizeText(
+      `${item.title} ${item.description}`
+    );
+
+  const positiveTerms = [
+    "psg",
+    "paris saint germain",
+    "paris saint-germain",
+    "paris sg",
+    "paris-sg",
+    "paris saint germain",
+    "donnarumma",
+    "hakimi",
+    "marquinhos",
+    "nuno mendes",
+    "vitinha",
+    "joao neves",
+    "joao neves",
+    "dembele",
+    "dembélé",
+    "kvaratskhelia",
+    "barcola",
+    "doué",
+    "desire doue",
+    "desiré doué",
+    "luis enrique",
+  ];
+
+  return positiveTerms.some(
+    (term) =>
+      text.includes(
+        normalizeText(term)
+      )
+  );
+}
+
+/* =========================================================
+   DEDUPLICATION
+========================================================= */
+
+function deduplicateFeedItems(
+  items: FeedItem[]
+): FeedItem[] {
+  const map =
+    new Map<
+      string,
+      FeedItem
+    >();
+
+  for (const item of items) {
+    const key =
+      normalizeTitle(
+        item.title
+      );
+
+    if (!key) {
+      continue;
+    }
+
+    const existing =
+      map.get(key);
+
+    if (!existing) {
+      map.set(
+        key,
+        item
+      );
+      continue;
+    }
+
+    /*
+     * On conserve la source ayant
+     * la meilleure priorité.
+     */
+    if (
+      getSourcePriority(
+        item.source
+      ) >
+      getSourcePriority(
+        existing.source
+      )
+    ) {
+      map.set(
+        key,
+        item
+      );
+    }
+  }
+
+  return Array.from(
+    map.values()
+  );
+}
+
+/* =========================================================
+   EXISTING ARTICLE CHECK
+========================================================= */
+
+function isAlreadyImported(
+  item: FeedItem,
+  articles: Array<{
+    title: string;
+    slug: string;
+    sourceUrl: string | null;
+  }>
+): boolean {
+  const normalizedTitle =
+    normalizeTitle(
+      item.title
+    );
+
+  const normalizedUrl =
+    normalizeUrl(
+      item.link
+    );
+
+  return articles.some(
+    (article) => {
+      if (
+        normalizedUrl &&
+        normalizeUrl(
+          article.sourceUrl || ""
+        ) === normalizedUrl
+      ) {
+        return true;
+      }
+
+      const existingTitle =
+        normalizeTitle(
+          article.title
+        );
+
+      return (
+        existingTitle ===
+        normalizedTitle
+      );
+    }
+  );
+}
+
+/* =========================================================
+   CLUSTERING
+========================================================= */
+
+function buildSimpleClusters(
+  items: FeedItem[]
+): FeedItem[][] {
+  const clusters: FeedItem[][] =
+    [];
+
+  /*
+   * On trie d'abord par date.
+   */
+  const sorted =
+    [...items].sort(
+      (a, b) =>
+        getTimestamp(
+          b.pubDate
+        ) -
+        getTimestamp(
+          a.pubDate
+        )
+    );
+
+  for (const item of sorted) {
+    let bestCluster:
+      | FeedItem[]
+      | null = null;
+
+    let bestScore = 0;
+
+    for (const cluster of clusters) {
+      const score =
+        scoreItemAgainstCluster(
+          item,
+          cluster
+        );
+
+      if (
+        score >
+        bestScore
+      ) {
+        bestScore =
+          score;
+
+        bestCluster =
+          cluster;
+      }
+    }
+
+    if (
+      bestCluster &&
+      bestScore >=
+        CLUSTER_SIMILARITY_THRESHOLD
+    ) {
+      bestCluster.push(
+        item
+      );
+    } else {
+      clusters.push([
+        item,
+      ]);
+    }
+  }
+
+  return clusters;
+}
+
+/*
+ * Cette fonction est volontairement plus intelligente
+ * qu'un simple Jaccard sur les titres.
+ *
+ * Elle prend en compte :
+ * - adversaire
+ * - compétition
+ * - joueurs
+ * - mots importants
+ * - proximité des titres
+ * - termes génériques du même événement
+ */
+function scoreItemAgainstCluster(
+  item: FeedItem,
+  cluster: FeedItem[]
+): number {
+  const reference =
+    cluster[0];
+
+  /*
+   * Deux adversaires différents =
+   * deux sujets différents.
+   */
+  const itemOpponents =
+    extractAllOpponents(
+      item.title
+    );
+
+  const clusterOpponents =
+    extractAllOpponents(
+      cluster
+        .map(
+          (x) => x.title
+        )
+        .join(" ")
+    );
+
+  if (
+    itemOpponents.length > 0 &&
+    clusterOpponents.length > 0
+  ) {
+    const differentOpponent =
+      itemOpponents.some(
+        (opponent) =>
+          !clusterOpponents.includes(
+            opponent
+          )
+      );
+
+    if (
+      differentOpponent
+    ) {
+      return 0;
+    }
+  }
+
+  const titleScore =
+    titleSimilarity(
+      item.title,
+      reference.title
+    );
+
+  const topicScore =
+    topicSimilarity(
+      item.title,
+      cluster.map(
+        (x) => x.title
+      )
+    );
+
+  const entityScore =
+    entitySimilarity(
+      item.title,
+      reference.title
+    );
+
+  /*
+   * Les événements communs ont
+   * davantage de poids que les mots
+   * génériques.
+   */
+  return Math.max(
+    titleScore,
+    topicScore,
+    entityScore
+  );
+}
+
+/* =========================================================
+   TITLE SIMILARITY
+========================================================= */
+
+function titleSimilarity(
+  a: string,
+  b: string
+): number {
+  const tokensA =
+    meaningfulTokens(a);
+
+  const tokensB =
+    meaningfulTokens(b);
+
+  if (
+    tokensA.length === 0 ||
+    tokensB.length === 0
+  ) {
+    return 0;
+  }
+
+  const intersection =
+    tokensA.filter(
+      (token) =>
+        tokensB.includes(
+          token
+        )
+    ).length;
+
+  const union =
+    new Set([
+      ...tokensA,
+      ...tokensB,
+    ]).size;
+
+  if (union === 0) {
+    return 0;
+  }
+
+  const jaccard =
+    intersection /
+    union;
+
+  /*
+   * Pour les titres courts,
+   * un simple mot-clé commun peut
+   * être très significatif.
+   */
+  const containment =
+    intersection /
+    Math.min(
+      tokensA.length,
+      tokensB.length
+    );
+
+  return Math.max(
+    jaccard,
+    containment * 0.72
+  );
+}
+
+/* =========================================================
+   TOPIC SIMILARITY
+========================================================= */
+
+function topicSimilarity(
+  title: string,
+  titles: string[]
+): number {
+  const tokens =
+    meaningfulTokens(
+      title
+    );
+
+  if (
+    tokens.length === 0
+  ) {
+    return 0;
+  }
+
+  let best = 0;
+
+  for (const other of titles) {
+    const otherTokens =
+      meaningfulTokens(
+        other
+      );
+
+    let score = 0;
+
+    for (const token of tokens) {
+      if (
+        otherTokens.includes(
+          token
+        )
+      ) {
+        score++;
+      }
+    }
+
+    const ratio =
+      score /
+      Math.max(
+        tokens.length,
+        otherTokens.length
+      );
+
+    const containment =
+      score /
+      Math.min(
+        tokens.length,
+        otherTokens.length
+      );
+
+    best = Math.max(
+      best,
+      ratio,
+      containment * 0.68
+    );
+  }
+
+  /*
+   * Détection d'événements :
+   * composition + groupe + match +
+   * diffusion + présentation peuvent
+   * concerner le même événement.
+   */
+  const normalized =
+    normalizeText(
+      title
+    );
+
+  const eventKeywords = [
+    "composition",
+    "compositions",
+    "groupe",
+    "equipe",
+    "équipe",
+    "match",
+    "rencontre",
+    "avant match",
+    "avant-match",
+    "diffusion",
+    "programme",
+    "presentation",
+    "présentation",
+    "maillot",
+    "maillots",
+    "champions league",
+    "ligue des champions",
+    "youth league",
+  ];
+
+  const hasEventKeyword =
+    eventKeywords.some(
+      (keyword) =>
+        normalized.includes(
+          normalizeText(
+            keyword
+          )
+        )
+    );
+
+  if (
+    hasEventKeyword &&
+    best >= 0.28
+  ) {
+    best =
+      Math.max(
+        best,
+        0.5
+      );
+  }
+
+  return Math.min(
+    best,
+    1
+  );
+}
+
+/* =========================================================
+   ENTITY SIMILARITY
+========================================================= */
+
+function entitySimilarity(
+  a: string,
+  b: string
+): number {
+  const entitiesA =
+    extractEntities(a);
+
+  const entitiesB =
+    extractEntities(b);
+
+  if (
+    entitiesA.length === 0 ||
+    entitiesB.length === 0
+  ) {
+    return 0;
+  }
+
+  const common =
+    entitiesA.filter(
+      (entity) =>
+        entitiesB.includes(
+          entity
+        )
+    );
+
+  if (
+    common.length === 0
+  ) {
+    return 0;
+  }
+
+  return Math.min(
+    0.85,
+    0.35 +
+      common.length *
+        0.18
+  );
+}
+
+/* =========================================================
+   OPPONENT EXTRACTION
+========================================================= */
+
+function extractAllOpponents(
+  title: string
+): string[] {
+  const text =
+    normalizeText(
+      title
+    );
+
+  const opponents =
+    new Set<string>();
+
+  const knownOpponents = [
+    "bratislava",
+    "slovan bratislava",
+    "auxerre",
+    "marseille",
+    "om",
+    "strasbourg",
+    "lyon",
+    "lens",
+    "lille",
+    "monaco",
+    "rennes",
+    "nice",
+    "nantes",
+    "montpellier",
+    "toulouse",
+    "reims",
+    "brest",
+    "lorient",
+    "saint etienne",
+    "saint-etienne",
+    "manchester city",
+    "manchester united",
+    "arsenal",
+    "liverpool",
+    "chelsea",
+    "real madrid",
+    "barcelone",
+    "barcelona",
+    "bayern",
+    "inter milan",
+    "inter",
+    "juventus",
+    "milan",
+    "atalanta",
+    "dortmund",
+    "borussia dortmund",
+  ];
+
+  for (
+    const opponent of
+    knownOpponents
+  ) {
+    if (
+      text.includes(
+        normalizeText(
+          opponent
+        )
+      )
+    ) {
+      /*
+       * Normalisation spéciale
+       * Slovan / Bratislava.
+       */
+      if (
+        opponent ===
+          "slovan bratislava" ||
+        opponent ===
+          "bratislava"
+      ) {
+        opponents.add(
+          "slovan bratislava"
+        );
+      } else if (
+        opponent ===
+        "om"
+      ) {
+        opponents.add(
+          "marseille"
+        );
+      } else {
+        opponents.add(
+          normalizeText(
+            opponent
+          )
+        );
+      }
+    }
+  }
+
+  return Array.from(
+    opponents
+  );
+}
+
+/* =========================================================
+   ENTITIES
+========================================================= */
+
+function extractEntities(
+  title: string
+): string[] {
+  const text =
+    normalizeText(
+      title
+    );
+
+  const entities = [
+    "psg",
+    "paris saint germain",
+    "donnarumma",
+    "hakimi",
+    "marquinhos",
+    "vitinha",
+    "joao neves",
+    "dembele",
+    "dembélé",
+    "barcola",
+    "kvaratskhelia",
+    "doué",
+    "doue",
+    "luis enrique",
+    "mbappe",
+    "mbappé",
+    "bratislava",
+    "slovan bratislava",
+    "champions league",
+    "ligue des champions",
+    "youth league",
+    "ligue 1",
+    "coupe de france",
+  ];
+
+  return entities
+    .filter(
+      (entity) =>
+        text.includes(
+          normalizeText(
+            entity
+          )
+        )
+    )
+    .map(
+      (entity) =>
+        normalizeText(
+          entity
+        )
+    );
+}
+
+/* =========================================================
+   PROCESS CLUSTER
+========================================================= */
+
+async function processCluster(
+  cluster: FeedItem[],
+  recentArticles: Array<{
+    title: string;
+    slug: string;
+    sourceUrl: string | null;
+  }>,
+  clusterNumber: number
+) {
+  const sortedSources =
+    [...cluster]
+      .sort(
+        (a, b) =>
+          getSourcePriority(
+            b.source
+          ) -
+          getSourcePriority(
+            a.source
+          )
+      )
+      .slice(
+        0,
+        MAX_SOURCES_PER_ARTICLE
+      );
+
+  const enrichment =
+    await enrichSources(
+      sortedSources
+    );
+
+  const enrichedSources =
+    enrichment.sources;
+
+  const geminiErrors: string[] =
+    [];
+
+  let geminiCalls = 0;
+  let geminiSuccess = 0;
+  let invalidJson = 0;
+  let tooShort = 0;
+  let tooShortAfterRetry = 0;
+  let slugErrors = 0;
+  let createErrors = 0;
+
+  /*
+   * Première génération
+   */
+  const first =
+    await callGemini(
+      enrichedSources
+    );
+
+  geminiCalls++;
+
+  if (
+    first.error
+  ) {
+    geminiErrors.push(
+      first.error
+    );
+  }
+
+  /*
+   * Quota atteint :
+   * inutile de faire plusieurs appels
+   * supplémentaires dans la même requête.
+   */
+  if (
+    first.quotaExceeded
+  ) {
+    return {
+      created: false,
+      geminiCalls,
+      geminiSuccess,
+      invalidJson,
+      tooShort,
+      tooShortAfterRetry,
+      slugErrors,
+      createErrors,
+      enrichment,
+      diagnostic: {
+        cluster:
+          clusterNumber,
+        sources:
+          sortedSources.map(
+            (x) =>
+              x.source
+          ),
+        titles:
+          sortedSources.map(
+            (x) =>
+              x.title
+          ),
+        outcome:
+          "gemini_quota_exceeded",
+        detail:
+          first.error ||
+          "Gemini quota exceeded",
+      },
+    };
+  }
+
+  let article =
+    first.article;
+
+  /*
+   * JSON invalide / génération ratée.
+   */
+  if (!article) {
+    invalidJson++;
+
+    return {
+      created: false,
+      geminiCalls,
+      geminiSuccess,
+      invalidJson,
+      tooShort,
+      tooShortAfterRetry,
+      slugErrors,
+      createErrors,
+      enrichment,
+      diagnostic: {
+        cluster:
+          clusterNumber,
+        sources:
+          sortedSources.map(
+            (x) =>
+              x.source
+          ),
+        titles:
+          sortedSources.map(
+            (x) =>
+              x.title
+          ),
+        outcome:
+          "gemini_error",
+        detail:
+          first.error ||
+          "Gemini returned no article",
+      },
+    };
+  }
+
+  /*
+   * Vérification longueur.
+   */
+  let wordCount =
+    countWords(
+      article.content
+    );
+
+  if (
+    wordCount <
+    MIN_ARTICLE_WORDS
+  ) {
+    tooShort++;
+
+    const retry =
+      await callGemini(
+        enrichedSources,
+        true
+      );
+
+    geminiCalls++;
+
+    if (
+      retry.error
+    ) {
+      geminiErrors.push(
+        retry.error
+      );
+    }
+
+    if (
+      retry.quotaExceeded
+    ) {
+      return {
+        created: false,
+        geminiCalls,
+        geminiSuccess,
+        invalidJson,
+        tooShort,
+        tooShortAfterRetry,
+        slugErrors,
+        createErrors,
+        enrichment,
+        diagnostic: {
+          cluster:
+            clusterNumber,
+          sources:
+            sortedSources.map(
+              (x) =>
+                x.source
+            ),
+          titles:
+            sortedSources.map(
+              (x) =>
+                x.title
+            ),
+          outcome:
+            "gemini_quota_exceeded",
+          detail:
+            retry.error ||
+            "Gemini quota exceeded",
+        },
+      };
+    }
+
+    if (
+      retry.article
+    ) {
+      article =
+        retry.article;
+
+      wordCount =
+        countWords(
+          article.content
+        );
+    }
+  }
+
+  /*
+   * Deuxième contrôle de longueur.
+   */
+  if (
+    wordCount <
+    MIN_ARTICLE_WORDS
+  ) {
+    tooShortAfterRetry++;
+
+    return {
+      created: false,
+      geminiCalls,
+      geminiSuccess,
+      invalidJson,
+      tooShort,
+      tooShortAfterRetry,
+      slugErrors,
+      createErrors,
+      enrichment,
+      diagnostic: {
+        cluster:
+          clusterNumber,
+        sources:
+          sortedSources.map(
+            (x) =>
+              x.source
+          ),
+        titles:
+          sortedSources.map(
+            (x) =>
+              x.title
+          ),
+        outcome:
+          "article_too_short",
+        detail:
+          `${wordCount} words after retry`,
+      },
+    };
+  }
+
+  geminiSuccess++;
+
+  /*
+   * Vérification doublon.
+   */
+  const duplicate =
+    await prisma.article.findFirst(
+      {
+        where: {
+          OR: [
+            {
+              title: {
+                equals:
+                  article.title,
+                mode: "insensitive",
+              },
+            },
+            {
+              sourceUrl:
+                sortedSources[0]
+                  ?.link || "",
+            },
+          ],
+        },
+        select: {
+          id: true,
+        },
+      }
+    );
+
+  if (duplicate) {
+    return {
+      created: false,
+      geminiCalls,
+      geminiSuccess,
+      invalidJson,
+      tooShort,
+      tooShortAfterRetry,
+      slugErrors,
+      createErrors,
+      enrichment,
+      diagnostic: {
+        cluster:
+          clusterNumber,
+        sources:
+          sortedSources.map(
+            (x) =>
+              x.source
+          ),
+        titles:
+          sortedSources.map(
+            (x) =>
+              x.title
+          ),
+        outcome:
+          "duplicate",
+        detail:
+          "Article already exists",
+      },
+    };
+  }
+
+  /* -----------------------------------------------------
+     SLUG
+  ----------------------------------------------------- */
+
+  let slug =
+    slugify(
+      article.title
+    );
+
+  if (!slug) {
+    slugErrors++;
+
+    return {
+      created: false,
+      geminiCalls,
+      geminiSuccess,
+      invalidJson,
+      tooShort,
+      tooShortAfterRetry,
+      slugErrors,
+      createErrors,
+      enrichment,
+      diagnostic: {
+        cluster:
+          clusterNumber,
+        sources:
+          sortedSources.map(
+            (x) =>
+              x.source
+          ),
+        titles:
+          sortedSources.map(
+            (x) =>
+              x.title
+          ),
+        outcome:
+          "slug_error",
+        detail:
+          "Unable to generate slug",
+      },
+    };
+  }
+
+  slug =
+    await makeUniqueSlug(
+      slug
+    );
+
+  /* -----------------------------------------------------
+     CREATE
+  ----------------------------------------------------- */
+
+  try {
+    await prisma.article.create({
+      data: {
+        title:
+          article.title,
+        slug,
+        excerpt:
+          article.excerpt,
+        content:
+          article.content,
+        club: "PSG",
+        status: "DRAFT",
+        isAiGenerated:
+          true,
+        sourceUrl:
+          sortedSources[0]
+            ?.link ||
+          null,
+      },
+    });
+  } catch (error) {
+    createErrors++;
+
+    return {
+      created: false,
+      geminiCalls,
+      geminiSuccess,
+      invalidJson,
+      tooShort,
+      tooShortAfterRetry,
+      slugErrors,
+      createErrors,
+      enrichment,
+      diagnostic: {
+        cluster:
+          clusterNumber,
+        sources:
+          sortedSources.map(
+            (x) =>
+              x.source
+          ),
+        titles:
+          sortedSources.map(
+            (x) =>
+              x.title
+          ),
+        outcome:
+          "create_error",
+        detail:
+          error instanceof Error
+            ? error.message
+            : "Database error",
+      },
+    };
+  }
+
+  return {
+    created: true,
+    articleTitle:
+      article.title,
+    sourceUrl:
+      sortedSources[0]
+        ?.link || null,
+    geminiCalls,
+    geminiSuccess,
+    invalidJson,
+    tooShort,
+    tooShortAfterRetry,
+    slugErrors,
+    createErrors,
+    enrichment,
+    diagnostic: {
+      cluster:
+        clusterNumber,
+      sources:
+        sortedSources.map(
+          (x) =>
+            x.source
+        ),
+      titles:
+        sortedSources.map(
+          (x) =>
+            x.title
+        ),
+      outcome:
+        "created",
+      detail:
+        `${wordCount} words`,
+    },
+  };
+}
+
+/* =========================================================
+   SOURCE ENRICHMENT
+========================================================= */
+
+async function enrichSources(
+  sources: ArticleInput[]
+): Promise<EnrichmentResult> {
+  const results =
+    await Promise.all(
+      sources.map(
+        async (source) => {
+          if (
+            !shouldFetchSourcePage(
+              source,
+              sources
+            )
+          ) {
+            return {
+              source,
+              content: "",
+              fetched: false,
+              error: null,
+            };
+          }
+
+          try {
+            const controller =
+              new AbortController();
+
+            const timeout =
+              setTimeout(
+                () =>
+                  controller.abort(),
+                SOURCE_TIMEOUT_MS
+              );
+
+            const response =
+              await fetch(
+                source.link,
+                {
+                  signal:
+                    controller.signal,
+                  headers: {
+                    "User-Agent":
+                      "Mozilla/5.0 PSG-Direct/1.0",
+                  },
+                  cache:
+                    "no-store",
+                }
+              );
+
+            clearTimeout(
+              timeout
+            );
+
+            if (
+              !response.ok
+            ) {
+              return {
+                source,
+                content: "",
+                fetched: false,
+                error: `${source.source}: HTTP ${response.status}`,
+              };
+            }
+
+            const html =
+              await response.text();
+
+            const text =
+              cleanPageText(
+                html
+              ).slice(
+                0,
+                MAX_SOURCE_PAGE_CHARS
+              );
+
+            return {
+              source,
+              content: text,
+              fetched:
+                text.length > 0,
+              error:
+                text.length > 0
+                  ? null
+                  : `${source.source}: empty page`,
+            };
+          } catch (error) {
+            return {
+              source,
+              content: "",
+              fetched: false,
+              error: `${source.source}: ${
+                error instanceof Error
+                  ? error.message
+                  : "page fetch error"
+              }`,
+            };
+          }
+        }
+      )
+    );
+
+  const enrichedSources =
+    results.map(
+      (result) => ({
+        ...result.source,
+        description:
+          result.content
+            ? `${result.source.description}\n\nSOURCE PAGE:\n${result.content}`
+            : result.source.description,
+      })
+    );
+
+  return {
+    sources:
+      enrichedSources,
+    pagesFetched:
+      results.filter(
+        (x) =>
+          x.fetched
+      ).length,
+    pagesFailed:
+      results.filter(
+        (x) =>
+          x.error
+      ).length,
+    enrichedCharacters:
+      results.reduce(
+        (sum, x) =>
+          sum +
+          x.content.length,
+        0
+      ),
+    pageErrors:
+      results
+        .filter(
+          (x) =>
+            x.error
+        )
+        .map(
+          (x) =>
+            x.error as string
+        ),
+  };
+}
+
+function shouldFetchSourcePage(
+  source: ArticleInput,
+  cluster: ArticleInput[]
+): boolean {
+  const description =
+    source.description ||
+    "";
+
+  if (
+    description.length <
+    LOW_INFORMATION_WORDS
+  ) {
+    return true;
+  }
+
+  if (
+    cluster.length > 1
+  ) {
+    return true;
+  }
+
+  if (
+    getSourcePriority(
+      source.source
+    ) >= 4
+  ) {
+    return true;
+  }
+
+  if (
+    description.length <
+    500
+  ) {
+    return true;
+  }
+
+  const concreteIntent =
+    /composition|compositions|groupe|équipe|equipe|blessure|blessé|blessés|transfert|mercato|contrat|prolongation|conférence|conference|match|rencontre|score|résultat|resultat|départ|depart|arrivée|arrivee|titulaire|absent|retour/i;
+
+  if (
+    concreteIntent.test(
+      source.title
+    )
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+/* =========================================================
+   GEMINI
+========================================================= */
+
+async function callGemini(
+  sources: ArticleInput[],
+  retry = false
+): Promise<GeminiCallResult> {
+  const models = [
+    "gemini-3.5-flash-lite",
+    "gemini-3.6-flash",
+  ];
+
+  const sourceText =
+    sources
+      .map(
+        (source, index) =>
+          `
+SOURCE ${index + 1}
+Nom : ${source.source}
+Titre : ${source.title}
+URL : ${source.link}
+Informations :
+${source.description}
+`
+      )
+      .join(
+        "\n\n"
+      );
+
+  const prompt = `
+Tu es le rédacteur en chef de PSG Direct.
+
+Ta mission est de rédiger un article de presse sportive ORIGINAL en français à partir EXCLUSIVEMENT des informations fournies par les sources ci-dessous.
+
+RÈGLES ABSOLUES :
+
+- Ne jamais inventer une information.
+- Ne jamais inventer de citation.
+- Ne jamais inventer de chiffre.
+- Ne jamais inventer de blessure.
+- Ne jamais inventer de transfert.
+- Ne jamais inventer de composition.
+- Ne jamais ajouter une information extérieure aux sources.
+- Ne jamais mentionner l'intelligence artificielle.
+- Ne jamais mentionner que tu as utilisé des sources.
+- Ne pas recopier les phrases des sources.
+- Reformuler entièrement.
+- Écrire dans un style naturel de journaliste sportif français.
+- Le texte doit être clair, dynamique et agréable à lire.
+- Utiliser Markdown.
+- Le titre doit être informatif et naturel.
+- Le chapô doit résumer l'information principale.
+- Le contenu doit contenir au minimum ${MIN_ARTICLE_WORDS} mots.
+- Viser environ ${TARGET_ARTICLE_WORDS} mots.
+- Ne jamais dépasser environ ${MAX_ARTICLE_WORDS} mots.
+- Si plusieurs sources parlent du même événement, fusionner les informations pertinentes.
+- Si certaines sources se contredisent, ne pas inventer pour résoudre la contradiction.
+- Ne conserver que les informations suffisamment établies dans les sources.
+
+${
+  retry
+    ? `
+ATTENTION :
+La précédente génération était trop courte.
+Cette fois, produis impérativement un article complet d'au moins ${MIN_ARTICLE_WORDS} mots.
+Développe davantage le contexte disponible dans les sources sans rien inventer.
+`
+    : ""
+}
+
+SOURCES :
+
+${sourceText}
+
+Réponds UNIQUEMENT avec un JSON valide sous cette forme :
+
+{
+  "title": "Titre de l'article",
+  "excerpt": "Chapô de l'article",
+  "content": "Contenu complet en Markdown"
+}
+`;
+
+  for (
+    const model of models
+  ) {
+    try {
+      const controller =
+        new AbortController();
+
+      const timeout =
+        setTimeout(
+          () =>
+            controller.abort(),
+          GEMINI_TIMEOUT_MS
+        );
+
+      const response =
+        await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`,
+          {
+            method:
+              "POST",
+            signal:
+              controller.signal,
+            headers: {
+              "Content-Type":
+                "application/json",
+            },
+            body: JSON.stringify(
+              {
+                contents: [
+                  {
+                    parts: [
+                      {
+                        text: prompt,
+                      },
+                    ],
+                  },
+                ],
+                generationConfig: {
+                  temperature: 0.2,
+                  maxOutputTokens: 4500,
+                  responseMimeType:
+                    "application/json",
+                },
+              }
+            ),
+          }
+        );
+
+      clearTimeout(
+        timeout
+      );
+
+      const raw =
+        await response.text();
+
+      if (!response.ok) {
+        const lower =
+          raw.toLowerCase();
+
+        const quotaExceeded =
+          response.status ===
+            429 ||
+          lower.includes(
+            "quota exceeded"
+          ) ||
+          lower.includes(
+            "generate_content_free_tier_requests"
+          ) ||
+          lower.includes(
+            "rate limit"
+          ) ||
+          lower.includes(
+            "resource exhausted"
+          );
+
+        if (
+          quotaExceeded
+        ) {
+          return {
+            article: null,
+            error: `Gemini ${model}: HTTP ${response.status} quota/rate limit exceeded`,
+            quotaExceeded:
+              true,
+          };
+        }
+
+        /*
+         * Pour une erreur non liée au quota,
+         * on tente le modèle suivant.
+         */
+        continue;
+      }
+
+      let data: any;
+
+      try {
+        data =
+          JSON.parse(
+            raw
+          );
+      } catch {
+        return {
+          article: null,
+          error: `Gemini ${model}: invalid API JSON`,
+          quotaExceeded:
+            false,
+        };
+      }
+
+      const text =
+        data?.candidates?.[0]
+          ?.content?.parts?.[0]
+          ?.text;
+
+      if (
+        typeof text !==
+        "string"
+      ) {
+        continue;
+      }
+
+      const parsed =
+        parseGeminiJson(
+          text
+        );
+
+      if (!parsed) {
+        return {
+          article: null,
+          error: `Gemini ${model}: invalid generated JSON`,
+          quotaExceeded:
+            false,
+        };
+      }
+
+      return {
+        article: parsed,
+        error: null,
+        quotaExceeded:
+          false,
+      };
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : "Gemini request error";
+
+      /*
+       * Timeout :
+       * on essaie le modèle suivant.
+       */
+      if (
+        message.includes(
+          "aborted"
+        )
+      ) {
+        continue;
+      }
+
+      continue;
+    }
+  }
+
+  return {
+    article: null,
+    error:
+      "Gemini: all configured models failed",
+    quotaExceeded:
+      false,
+  };
+}
+
+/* =========================================================
+   GEMINI JSON
+========================================================= */
+
+function parseGeminiJson(
+  text: string
+): GeminiArticle | null {
+  let cleaned =
+    text.trim();
+
+  cleaned =
+    cleaned.replace(
+      /^```json\s*/i,
+      ""
+    );
+
+  cleaned =
+    cleaned.replace(
+      /^```\s*/i,
+      ""
+    );
+
+  cleaned =
+    cleaned.replace(
+      /\s*```$/i,
+      ""
+    );
+
+  try {
+    const parsed =
+      JSON.parse(
+        cleaned
+      );
+
+    if (
+      !parsed ||
+      typeof parsed.title !==
+        "string" ||
+      typeof parsed.excerpt !==
+        "string" ||
+      typeof parsed.content !==
+        "string"
+    ) {
+      return null;
+    }
+
+    return {
+      title:
+        cleanGeneratedText(
+          parsed.title
+        ),
+      excerpt:
+        cleanGeneratedText(
+          parsed.excerpt
+        ),
+      content:
+        cleanGeneratedText(
+          parsed.content
+        ),
+    };
+  } catch {
+    /*
+     * Tentative de récupération
+     * d'un JSON encapsulé dans du texte.
+     */
+    const firstBrace =
+      cleaned.indexOf(
+        "{"
+      );
+
+    const lastBrace =
+      cleaned.lastIndexOf(
+        "}"
+      );
+
+    if (
+      firstBrace >= 0 &&
+      lastBrace > firstBrace
+    ) {
+      try {
+        const parsed =
+          JSON.parse(
+            cleaned.slice(
+              firstBrace,
+              lastBrace + 1
+            )
+          );
+
+        if (
+          typeof parsed.title ===
+            "string" &&
+          typeof parsed.excerpt ===
+            "string" &&
+          typeof parsed.content ===
+            "string"
+        ) {
+          return {
+            title:
+              cleanGeneratedText(
+                parsed.title
+              ),
+            excerpt:
+              cleanGeneratedText(
+                parsed.excerpt
+              ),
+            content:
+              cleanGeneratedText(
+                parsed.content
+              ),
+          };
+        }
+      } catch {
+        return null;
+      }
+    }
+
+    return null;
+  }
+}
+
+/* =========================================================
+   SLUG
+========================================================= */
+
+async function makeUniqueSlug(
+  baseSlug: string
+): Promise<string> {
+  let slug =
+    baseSlug;
+
+  let counter = 2;
+
+  while (
+    await prisma.article.findUnique(
+      {
+        where: {
+          slug,
+        },
+        select: {
+          id: true,
+        },
+      }
+    )
+  ) {
+    slug =
+      `${baseSlug}-${counter}`;
+
+    counter++;
+  }
+
+  return slug;
+}
+
+function slugify(
+  value: string
+): string {
+  return normalizeText(
+    value
+  )
+    .replace(
+      /[^a-z0-9]+/g,
+      "-"
+    )
+    .replace(
+      /^-+|-+$/g,
+      "")
+    .slice(
+      0,
+      180
+    );
+}
+
+/* =========================================================
+   PRIORITIES
+========================================================= */
+
+function getSourcePriority(
+  source: string
+): number {
+  switch (
+    normalizeText(
+      source
+    )
+  ) {
+    case "culturepsg":
+      return 5;
+
+    case "rmc sport":
+      return 4;
+
+    case "foot mercato":
+      return 3;
+
+    case "google news":
+      return 2;
+
+    default:
+      return 1;
+  }
+}
+
+function getClusterPriority(
+  cluster: FeedItem[]
+): number {
+  const sourcePriority =
+    Math.max(
+      ...cluster.map(
+        (item) =>
+          getSourcePriority(
+            item.source
+          )
+      )
+    );
+
+  const sourceCount =
+    Math.min(
+      cluster.length,
+      3
+    );
+
+  const recentBonus =
+    cluster.some(
+      (item) =>
+        Date.now() -
+          getTimestamp(
+            item.pubDate
+          ) <
+        6 * 60 * 60 * 1000
+    )
+      ? 2
+      : 0;
+
+  return (
+    sourcePriority * 10 +
+    sourceCount * 2 +
+    recentBonus
+  );
+}
+
+/* =========================================================
+   TEXT HELPERS
+========================================================= */
+
+function normalizeText(
+  value: string
+): string {
+  return value
+    .normalize("NFD")
+    .replace(
+      /[\u0300-\u036f]/g,
+      ""
+    )
+    .toLowerCase()
+    .replace(
+      /['’]/g,
+      " "
+    )
+    .replace(
+      /[^a-z0-9\s-]/g,
+      " "
+    )
+    .replace(
+      /\s+/g,
+      " "
+    )
+    .trim();
+}
+
+function normalizeTitle(
+  value: string
+): string {
+  return normalizeText(
+    value
+  )
+    .replace(
+      /\b(le|la|les|un|une|des|du|de|pour|avec|et|a|au|aux|sur|dans|ce|cette|ces)\b/g,
+      " "
+    )
+    .replace(
+      /\s+/g,
+      " "
+    )
+    .trim();
+}
+
+function normalizeUrl(
+  value: string
+): string {
+  try {
+    const url =
+      new URL(
+        value
+      );
+
+    url.hash = "";
+
+    url.search = "";
+
+    return url
+      .toString()
+      .replace(
+        /\/$/,
+        ""
+      );
+  } catch {
+    return value
+      .trim()
+      .replace(
+        /\/$/,
+        ""
+      );
+  }
+}
+
+function meaningfulTokens(
+  value: string
+): string[] {
+  const stopWords =
+    new Set([
+      "le",
+      "la",
+      "les",
+      "un",
+      "une",
+      "des",
+      "de",
+      "du",
+      "d",
+      "a",
+      "au",
+      "aux",
+      "en",
+      "et",
+      "ou",
+      "pour",
+      "avec",
+      "sans",
+      "sur",
+      "dans",
+      "par",
+      "chez",
+      "ce",
+      "cette",
+      "ces",
+      "son",
+      "sa",
+      "ses",
+      "leur",
+      "leurs",
+      "qui",
+      "que",
+      "qu",
+      "est",
+      "sont",
+      "se",
+      "fait",
+      "plus",
+      "apres",
+      "avant",
+      "une",
+      "des",
+      "du",
+      "au",
+      "aux",
+    ]);
+
+  return Array.from(
+    new Set(
+      normalizeText(
+        value
+      )
+        .split(
+          " "
+        )
+        .filter(
+          (token) =>
+            token.length >= 3 &&
+            !stopWords.has(
+              token
+            )
+        )
+    )
+  );
+}
+
+function countWords(
+  text: string
+): number {
+  return text
+    .replace(
+      /[#*_>`[\]()]/g,
+      " "
+    )
+    .split(
+      /\s+/
+    )
+    .filter(
+      Boolean
+    ).length;
+}
+
+/* =========================================================
+   HTML / PAGE CLEANING
+========================================================= */
+
+function cleanHtml(
+  value: string
+): string {
+  return decodeHtmlEntities(
+    value
+      .replace(
+        /<script[\s\S]*?<\/script>/gi,
+        " "
+      )
+      .replace(
+        /<style[\s\S]*?<\/style>/gi,
+        " "
+      )
+      .replace(
+        /<[^>]+>/g,
+        " "
+      )
+      .replace(
+        /\s+/g,
+        " "
+      )
+      .trim()
+  );
+}
+
+function cleanPageText(
   html: string
 ): string {
-  let text =
+  return decodeHtmlEntities(
     html
       .replace(
         /<script[\s\S]*?<\/script>/gi,
@@ -2474,348 +2688,34 @@ function extractPageText(
       .replace(
         /<svg[\s\S]*?<\/svg>/gi,
         " "
-      );
-
-  text =
-    stripHtml(
-      text
-    );
-
-  text =
-    decodeHtmlEntities(
-      text
-    );
-
-  text =
-    cleanText(
-      text
-    );
-
-  return text.slice(
-    0,
-    MAX_SOURCE_PAGE_CHARS
-  );
-}
-
-/*
- * =========================================================
- * PRIORITÉS
- * =========================================================
- */
-
-function clusterPriority(
-  cluster: FeedItem[]
-): number {
-  const sourceScore =
-    Math.max(
-      ...cluster.map(
-        (item) =>
-          sourcePriority(
-            item.source
-          )
       )
-    );
-
-  const sizeBonus =
-    Math.min(
-      cluster.length,
-      5
-    );
-
-  const titleScore =
-    cluster.reduce(
-      (score, item) => {
-        const normalized =
-          normalizeForComparison(
-            item.title
-          );
-
-        if (
-          /match|composition|compose|blessure|transfert|mercato|contrat|groupe|diffusion|chaine|heure/.test(
-            normalized
-          )
-        ) {
-          return score + 2;
-        }
-
-        return score + 1;
-      },
-      0
-    );
-
-  return (
-    sourceScore * 10 +
-    sizeBonus +
-    titleScore
-  );
-}
-
-function sourcePriority(
-  source: string
-): number {
-  const normalized =
-    normalizeForComparison(
-      source
-    );
-
-  if (
-    normalized.includes(
-      "culturepsg"
-    )
-  ) {
-    return 5;
-  }
-
-  if (
-    normalized.includes(
-      "rmc"
-    )
-  ) {
-    return 4;
-  }
-
-  if (
-    normalized.includes(
-      "equipe"
-    )
-  ) {
-    return 4;
-  }
-
-  if (
-    normalized.includes(
-      "foot mercato"
-    )
-  ) {
-    return 3;
-  }
-
-  if (
-    normalized.includes(
-      "google news"
-    )
-  ) {
-    return 2;
-  }
-
-  return 1;
-}
-
-/*
- * =========================================================
- * TOKENS
- * =========================================================
- */
-
-function meaningfulTokens(
-  text: string
-): string[] {
-  const stopWords = new Set([
-    "avec",
-    "dans",
-    "pour",
-    "contre",
-    "plus",
-    "apres",
-    "avant",
-    "entre",
-    "cette",
-    "cette",
-    "sont",
-    "sera",
-    "etre",
-    "avoir",
-    "fait",
-    "faire",
-    "mais",
-    "sur",
-    "une",
-    "des",
-    "les",
-    "du",
-    "de",
-    "la",
-    "le",
-    "un",
-    "et",
-    "ou",
-    "au",
-    "aux",
-    "par",
-    "en",
-    "ce",
-    "se",
-    "son",
-    "sa",
-    "ses",
-    "leur",
-    "leurs",
-    "qui",
-    "que",
-    "est",
-    "a",
-    "à",
-  ]);
-
-  return normalizeForComparison(
-    text
-  )
-    .split(/\s+/)
-    .map(
-      (token) =>
-        token.trim()
-    )
-    .filter(
-      (token) =>
-        token.length >= 3 &&
-        !stopWords.has(
-          token
-        )
-    );
-}
-
-function titleSimilarity(
-  a: string,
-  b: string
-): number {
-  return simpleStorySimilarity(
-    a,
-    b
-  );
-}
-
-/*
- * =========================================================
- * NORMALISATION URL / TEXTE
- * =========================================================
- */
-
-function normalizeForComparison(
-  value: string
-): string {
-  return value
-    .normalize("NFD")
-    .replace(
-      /[\u0300-\u036f]/g,
-      ""
-    )
-    .toLowerCase()
-    .replace(
-      /[^a-z0-9\s]/g,
-      " "
-    )
-    .replace(
-      /\s+/g,
-      " "
-    )
-    .trim();
-}
-
-function normalizeUrl(
-  value: string
-): string {
-  if (!value) {
-    return "";
-  }
-
-  try {
-    const url =
-      new URL(
-        value
-      );
-
-    url.hash = "";
-
-    const trackingParams = [
-      "utm_source",
-      "utm_medium",
-      "utm_campaign",
-      "utm_term",
-      "utm_content",
-      "gclid",
-      "fbclid",
-    ];
-
-    for (
-      const parameter of trackingParams
-    ) {
-      url.searchParams.delete(
-        parameter
-      );
-    }
-
-    return url.toString();
-  } catch {
-    return value
-      .trim()
       .replace(
-        /\/$/,
-        ""
-      );
-  }
+        /<[^>]+>/g,
+        " "
+      )
+      .replace(
+        /\s+/g,
+        " "
+      )
+      .trim()
+  );
 }
 
-function cleanUrl(
-  value: string
-): string {
-  return value
-    .trim()
-    .replace(
-      /^<!\[CDATA\[/,
-      ""
-    )
-    .replace(
-      /\]\]>$/,
-      ""
-    );
-}
-
-function cleanText(
-  value: string
-): string {
-  return value
-    .replace(
-      /\s+/g,
-      " "
-    )
-    .trim();
-}
-
-function cleanArticleContent(
+function cleanGeneratedText(
   value: string
 ): string {
   return decodeHtmlEntities(
-    stripHtml(
-      value
-    )
-  )
-    .replace(
-      /\r/g,
-      ""
-    )
-    .replace(
-      /\n{3,}/g,
-      "\n\n"
-    )
-    .trim();
-}
-
-function stripHtml(
-  value: string
-): string {
-  return value
-    .replace(
-      /<br\s*\/?>/gi,
-      "\n"
-    )
-    .replace(
-      /<\/p>/gi,
-      "\n\n"
-    )
-    .replace(
-      /<[^>]*>/g,
-      " "
-    );
+    value
+      .replace(
+        /\r\n/g,
+        "\n"
+      )
+      .replace(
+        /\n{3,}/g,
+        "\n\n"
+      )
+      .trim()
+  );
 }
 
 function decodeHtmlEntities(
@@ -2835,7 +2735,11 @@ function decodeHtmlEntities(
       '"'
     )
     .replace(
-      /&#39;|&apos;/gi,
+      /&#39;/gi,
+      "'"
+    )
+    .replace(
+      /&apos;/gi,
       "'"
     )
     .replace(
@@ -2865,181 +2769,25 @@ function decodeHtmlEntities(
     );
 }
 
-/*
- * =========================================================
- * WORD COUNT
- * =========================================================
- */
+/* =========================================================
+   DATE
+========================================================= */
 
-function countWords(
+function getTimestamp(
   value: string
 ): number {
-  const words =
-    value
-      .trim()
-      .split(/\s+/)
-      .filter(Boolean);
-
-  return words.length;
-}
-
-/*
- * =========================================================
- * DÉBUT DE JOURNÉE
- * =========================================================
- */
-
-function getStartOfToday(): Date {
-  const date =
-    new Date();
-
-  date.setHours(
-    0,
-    0,
-    0,
-    0
-  );
-
-  return date;
-}
-
-/*
- * =========================================================
- * SLUG UNIQUE
- * =========================================================
- */
-
-async function makeUniqueSlug(
-  title: string
-): Promise<string> {
-  const base =
-    slugify(
-      title
-    ) ||
-    `psg-${Date.now()}`;
-
-  let slug =
-    base;
-
-  let counter = 2;
-
-  while (
-    await prisma.article.findUnique(
-      {
-        where: {
-          slug,
-        },
-        select: {
-          id: true,
-        },
-      }
-    )
-  ) {
-    slug =
-      `${base}-${counter}`;
-
-    counter++;
-  }
-
-  return slug;
-}
-
-function slugify(
-  value: string
-): string {
-  return normalizeForComparison(
-    value
-  )
-    .replace(
-      /\s+/g,
-      "-"
-    )
-    .replace(
-      /-+/g,
-      "-"
-    )
-    .replace(
-      /^-|-$/g,
-      ""
+  const timestamp =
+    Date.parse(
+      value || ""
     );
-}
-
-/*
- * =========================================================
- * FETCH AVEC TIMEOUT
- * =========================================================
- */
-
-async function fetchWithTimeout(
-  url: string,
-  timeoutMs: number,
-  options?: RequestInit
-): Promise<string> {
-  const controller =
-    new AbortController();
-
-  const timeout =
-    setTimeout(
-      () =>
-        controller.abort(),
-      timeoutMs
-    );
-
-  try {
-    const response =
-      await fetch(
-        url,
-        {
-          ...options,
-          signal:
-            controller.signal,
-          cache: "no-store",
-        }
-      );
-
-    if (
-      !response.ok
-    ) {
-      throw new Error(
-        `HTTP ${response.status} ${response.statusText}`
-      );
-    }
-
-    return await response.text();
-  } finally {
-    clearTimeout(
-      timeout
-    );
-  }
-}
-
-/*
- * =========================================================
- * ERREURS
- * =========================================================
- */
-
-function getErrorMessage(
-  error: unknown
-): string {
-  if (
-    error instanceof Error
-  ) {
-    return error.message;
-  }
 
   if (
-    typeof error ===
-    "string"
+    Number.isNaN(
+      timestamp
+    )
   ) {
-    return error;
+    return 0;
   }
 
-  try {
-    return JSON.stringify(
-      error
-    );
-  } catch {
-    return "Unknown error";
-  }
+  return timestamp;
 }
