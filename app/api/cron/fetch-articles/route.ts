@@ -320,35 +320,62 @@ export async function GET(req: NextRequest) {
         requestedCount
       );
 
+    /*
+     * =========================================================
+     * 7. TRAITEMENT DES CLUSTERS
+     * =========================================================
+     *
+     * IMPORTANT :
+     *
+     * Avant :
+     *
+     * cluster 1 -> attente complète
+     * cluster 2 -> attente complète
+     * cluster 3 -> attente complète
+     *
+     * Maintenant :
+     *
+     * cluster 1 ─┐
+     * cluster 2 ─┼──> traitement parallèle
+     * cluster 3 ─┘
+     *
+     * Cela réduit fortement la durée totale de la requête.
+     *
+     * Le moteur éditorial reste identique.
+     */
+
     const articlesForDuplicateCheck =
       [
         ...recentArticles,
       ];
 
-    let created = 0;
-    let skipped = 0;
+    const clusterResults =
+      await Promise.all(
+        selectedClusters.map(
+          (
+            cluster,
+            index
+          ) =>
+            processCluster(
+              cluster,
+              articlesForDuplicateCheck,
+              index + 1
+            )
+        )
+      );
 
     /*
      * =========================================================
-     * 7. TRAITEMENT DES CLUSTERS
+     * 8. AGRÉGATION DES RÉSULTATS
      * =========================================================
      */
 
-    for (
-      let index = 0;
-      index <
-      selectedClusters.length;
-      index++
-    ) {
-      const result =
-        await processCluster(
-          selectedClusters[
-            index
-          ],
-          articlesForDuplicateCheck,
-          index + 1
-        );
+    let created = 0;
+    let skipped = 0;
 
+    for (
+      const result of clusterResults
+    ) {
       diagnostics.push(
         result.diagnostic
       );
@@ -377,24 +404,16 @@ export async function GET(req: NextRequest) {
         result.created
       ) {
         created++;
-
-        articlesForDuplicateCheck.push(
-          {
-            title:
-              result.articleTitle ||
-              "",
-
-            slug: "",
-
-            sourceUrl:
-              result.sourceUrl ||
-              null,
-          }
-        );
       } else {
         skipped++;
       }
     }
+
+    /*
+     * =========================================================
+     * 9. RÉSULTAT FINAL
+     * =========================================================
+     */
 
     const totalCreatedToday =
       articlesCreatedToday +
