@@ -819,69 +819,89 @@ function isAlreadyImported(
    CLUSTERING
 ========================================================= */
 
+type ClusterProfile = {
+  opponents: string[];
+  competitions: string[];
+  topic: string;
+  entities: string[];
+  tokens: string[];
+};
+
 function buildSimpleClusters(
   items: FeedItem[]
 ): FeedItem[][] {
-  const clusters: FeedItem[][] =
-    [];
+  const clusters: FeedItem[][] = [];
 
   const sorted =
     [...items].sort(
       (a, b) =>
-        getTimestamp(
-          b.pubDate
-        ) -
-        getTimestamp(
-          a.pubDate
-        )
+        getTimestamp(b.pubDate) -
+        getTimestamp(a.pubDate)
     );
 
-  for (
-    const item of sorted
-  ) {
-    let bestCluster:
-      | FeedItem[]
-      | null = null;
-
+  for (const item of sorted) {
+    let bestCluster: FeedItem[] | null = null;
     let bestScore = 0;
 
-    for (
-      const cluster of clusters
-    ) {
-      const score =
-        scoreItemAgainstCluster(
-          item,
-          cluster
-        );
+    for (const cluster of clusters) {
+      const score = scoreItemAgainstCluster(item, cluster);
 
-      if (
-        score >
-        bestScore
-      ) {
-        bestScore =
-          score;
-
-        bestCluster =
-          cluster;
+      if (score > bestScore) {
+        bestScore = score;
+        bestCluster = cluster;
       }
     }
 
     if (
       bestCluster &&
-      bestScore >=
-        CLUSTER_SIMILARITY_THRESHOLD
+      bestScore >= CLUSTER_SIMILARITY_THRESHOLD
     ) {
-      bestCluster.push(
-        item
-      );
+      bestCluster.push(item);
     } else {
-      clusters.push([
-        item,
-      ]);
+      clusters.push([item]);
     }
   }
 
   return clusters;
+}
+
+/* =========================================================
+   CLUSTER PROFILE
+========================================================= */
+
+function buildClusterProfile(
+  items: FeedItem[]
+): ClusterProfile {
+  const opponents = new Set<string>();
+  const competitions = new Set<string>();
+  const entities = new Set<string>();
+  const tokens = new Set<string>();
+
+  for (const item of items) {
+    for (const opponent of extractAllOpponents(item.title)) {
+      opponents.add(opponent);
+    }
+
+    for (const competition of extractCompetitions(item.title)) {
+      competitions.add(competition);
+    }
+
+    for (const entity of extractEntities(item.title)) {
+      entities.add(entity);
+    }
+
+    for (const token of meaningfulTokens(item.title)) {
+      tokens.add(token);
+    }
+  }
+
+  return {
+    opponents: Array.from(opponents),
+    competitions: Array.from(competitions),
+    topic: getTopicFamily(items[0]?.title || ''),
+    entities: Array.from(entities),
+    tokens: Array.from(tokens),
+  };
 }
 
 /* =========================================================
@@ -892,76 +912,138 @@ function scoreItemAgainstCluster(
   item: FeedItem,
   cluster: FeedItem[]
 ): number {
-  const reference =
-    cluster[0];
+  if (cluster.length === 0) {
+    return 0;
+  }
 
-  const itemOpponents =
-    extractAllOpponents(
-      item.title
-    );
-
-  const clusterOpponents =
-    extractAllOpponents(
-      cluster
-        .map(
-          (x) =>
-            x.title
-        )
-        .join(" ")
-    );
+  const reference = cluster[0];
+  const profile = buildClusterProfile(cluster);
+  const itemProfile = buildClusterProfile([item]);
 
   /*
-   * Si les deux articles identifient
-   * explicitement des adversaires différents,
-   * ils ne doivent pas être fusionnés.
+   * Adversaire différent = sujet différent.
+   * Exemple : Bratislava ne doit jamais rejoindre un cluster
+   * dont l'identité est Lille/LOSC.
    */
   if (
-    itemOpponents.length >
-      0 &&
-    clusterOpponents.length >
-      0
+    itemProfile.opponents.length > 0 &&
+    profile.opponents.length > 0
   ) {
-    const differentOpponent =
-      itemOpponents.some(
-        (opponent) =>
-          !clusterOpponents.includes(
-            opponent
-          )
-      );
+    const sharedOpponent = itemProfile.opponents.some((opponent) =>
+      profile.opponents.includes(opponent)
+    );
 
-    if (
-      differentOpponent
-    ) {
+    if (!sharedOpponent) {
       return 0;
     }
   }
 
-  const titleScore =
-    titleSimilarity(
-      item.title,
-      reference.title
-    );
+  /*
+   * Si l'un des titres possède un thème éditorial précis et que
+   * l'autre possède un thème précis différent, on sépare.
+   */
+  const itemTopic = itemProfile.topic;
+  const clusterTopic = profile.topic;
 
-  const topicScore =
-    topicSimilarity(
-      item.title,
-      cluster.map(
-        (x) =>
-          x.title
-      )
-    );
+  if (
+    itemTopic !== 'general' &&
+    clusterTopic !== 'general' &&
+    itemTopic !== clusterTopic
+  ) {
+    return 0;
+  }
 
-  const entityScore =
-    entitySimilarity(
-      item.title,
-      reference.title
-    );
-
-  return Math.max(
-    titleScore,
-    topicScore,
-    entityScore
+  const titleScore = titleSimilarity(
+    item.title,
+    reference.title
   );
+
+  const tokenScore = tokenSimilarityAgainstCluster(
+    item.title,
+    cluster
+  );
+
+  const entityScore = entitySimilarity(
+    item.title,
+    reference.title
+  );
+
+  const opponentScore =
+    sharedSetScore(
+      itemProfile.opponents,
+      profile.opponents
+    );
+
+  const competitionScore =
+    sharedSetScore(
+      itemProfile.competitions,
+      profile.competitions
+    );
+
+  let score = Math.max(
+    titleScore * 0.55,
+    tokenScore * 0.55,
+    entityScore * 0.55
+  );
+
+  if (opponentScore > 0) {
+    score += 0.25;
+  }
+
+  if (competitionScore > 0) {
+    score += 0.08;
+  }
+
+  /*
+   * Pour les sujets sans adversaire, on demande une ressemblance
+   * textuelle beaucoup plus forte. Cela évite notamment de fusionner
+   * un article sur un maillot avec un article sur une pelouse.
+   */
+  if (
+    itemProfile.opponents.length === 0 &&
+    profile.opponents.length === 0 &&
+    itemTopic === 'general'
+  ) {
+    score = Math.max(
+      titleScore * 0.7,
+      tokenScore * 0.7,
+      entityScore * 0.7
+    );
+  }
+
+  return Math.min(score, 1);
+}
+
+function tokenSimilarityAgainstCluster(
+  title: string,
+  cluster: FeedItem[]
+): number {
+  let best = 0;
+
+  for (const other of cluster) {
+    best = Math.max(
+      best,
+      titleSimilarity(title, other.title)
+    );
+  }
+
+  return best;
+}
+
+function sharedSetScore(
+  a: string[],
+  b: string[]
+): number {
+  if (a.length === 0 || b.length === 0) {
+    return 0;
+  }
+
+  const common = a.filter((value) =>
+    b.includes(value)
+  ).length;
+
+  return common /
+    Math.max(a.length, b.length);
 }
 
 /* =========================================================
@@ -972,11 +1054,8 @@ function titleSimilarity(
   a: string,
   b: string
 ): number {
-  const tokensA =
-    meaningfulTokens(a);
-
-  const tokensB =
-    meaningfulTokens(b);
+  const tokensA = meaningfulTokens(a);
+  const tokensB = meaningfulTokens(b);
 
   if (
     tokensA.length === 0 ||
@@ -985,36 +1064,23 @@ function titleSimilarity(
     return 0;
   }
 
-  const intersection =
-    tokensA.filter(
-      (token) =>
-        tokensB.includes(
-          token
-        )
-    ).length;
+  const intersection = tokensA.filter((token) =>
+    tokensB.includes(token)
+  ).length;
 
-  const union =
-    new Set([
-      ...tokensA,
-      ...tokensB,
-    ]).size;
+  const union = new Set([
+    ...tokensA,
+    ...tokensB,
+  ]).size;
 
-  if (
-    union === 0
-  ) {
+  if (union === 0) {
     return 0;
   }
 
-  const jaccard =
-    intersection /
-    union;
-
+  const jaccard = intersection / union;
   const containment =
     intersection /
-    Math.min(
-      tokensA.length,
-      tokensB.length
-    );
+    Math.min(tokensA.length, tokensB.length);
 
   return Math.max(
     jaccard,
@@ -1023,121 +1089,171 @@ function titleSimilarity(
 }
 
 /* =========================================================
-   TOPIC SIMILARITY
+   TOPIC FAMILY
 ========================================================= */
 
-function topicSimilarity(
-  title: string,
-  titles: string[]
-): number {
-  const tokens =
-    meaningfulTokens(
-      title
-    );
+function getTopicFamily(title: string): string {
+  const text = normalizeText(title);
 
-  if (
-    tokens.length === 0
-  ) {
-    return 0;
-  }
-
-  let best = 0;
-
-  for (
-    const other of titles
-  ) {
-    const otherTokens =
-      meaningfulTokens(
-        other
-      );
-
-    let common = 0;
-
-    for (
-      const token of tokens
-    ) {
-      if (
-        otherTokens.includes(
-          token
-        )
-      ) {
-        common++;
-      }
-    }
-
-    const ratio =
-      common /
-      Math.max(
-        tokens.length,
-        otherTokens.length
-      );
-
-    const containment =
-      common /
-      Math.min(
-        tokens.length,
-        otherTokens.length
-      );
-
-    best =
-      Math.max(
-        best,
-        ratio,
-        containment * 0.68
-      );
-  }
-
-  const normalized =
-    normalizeText(
-      title
-    );
-
-  const eventKeywords = [
-    "composition",
-    "compositions",
-    "groupe",
-    "equipe",
-    "équipe",
-    "match",
-    "rencontre",
-    "avant match",
-    "avant-match",
-    "diffusion",
-    "programme",
-    "presentation",
-    "présentation",
-    "maillot",
-    "maillots",
-    "champions league",
-    "ligue des champions",
-    "youth league",
+  const topicRules: Array<{
+    name: string;
+    keywords: string[];
+  }> = [
+    {
+      name: 'kit',
+      keywords: [
+        'maillot',
+        'maillots',
+        'tenue',
+        'tenues',
+        'equipementier',
+        'equipement',
+      ],
+    },
+    {
+      name: 'pitch',
+      keywords: [
+        'pelouse',
+        'terrain',
+        'gazon',
+        'parc des princes',
+      ],
+    },
+    {
+      name: 'transfer',
+      keywords: [
+        'mercato',
+        'transfert',
+        'transferts',
+        'recrutement',
+        'recrue',
+        'arrivee',
+        'arrive',
+        'depart',
+        'quitter',
+      ],
+    },
+    {
+      name: 'contract',
+      keywords: [
+        'contrat',
+        'prolongation',
+        'prolonge',
+        'sous contrat',
+      ],
+    },
+    {
+      name: 'injury',
+      keywords: [
+        'blessure',
+        'blesse',
+        'blesse',
+        'forfait',
+        'indisponible',
+        'retour',
+      ],
+    },
+    {
+      name: 'match',
+      keywords: [
+        'match',
+        'rencontre',
+        'contre',
+        'face a',
+        'affronte',
+        'affronter',
+        'opposera',
+        'opposer',
+        'score',
+        'resultat',
+        'notes',
+        'note',
+        'composition',
+        'compositions',
+        'groupe',
+        'equipe',
+        'titulaire',
+        'titulaires',
+        'absent',
+        'absents',
+        'diffusion',
+        'streaming',
+        'chaine',
+        'heure',
+        'programme',
+      ],
+    },
+    {
+      name: 'player',
+      keywords: [
+        'ballon d or',
+        'kopa',
+        'prix',
+        'trophee',
+        'distinction',
+        'candidat',
+        'candidates',
+        'candidats',
+        'nomme',
+        'nommes',
+      ],
+    },
+    {
+      name: 'coach',
+      keywords: [
+        'entraineur',
+        'coach',
+        'luis enrique',
+      ],
+    },
   ];
 
-  const hasEventKeyword =
-    eventKeywords.some(
-      (keyword) =>
-        normalized.includes(
-          normalizeText(
-            keyword
-          )
-        )
-    );
-
-  if (
-    hasEventKeyword &&
-    best >= 0.28
-  ) {
-    best =
-      Math.max(
-        best,
-        0.5
-      );
+  for (const rule of topicRules) {
+    if (
+      rule.keywords.some((keyword) =>
+        text.includes(normalizeText(keyword))
+      )
+    ) {
+      return rule.name;
+    }
   }
 
-  return Math.min(
-    best,
-    1
-  );
+  return 'general';
+}
+
+/* =========================================================
+   COMPETITIONS
+========================================================= */
+
+function extractCompetitions(
+  title: string
+): string[] {
+  const text = normalizeText(title);
+  const competitions = new Set<string>();
+
+  const knownCompetitions = [
+    'ligue des champions',
+    'champions league',
+    'youth league',
+    'ligue 1',
+    'ligue 2',
+    'coupe de france',
+    'trophee des champions',
+  ];
+
+  for (const competition of knownCompetitions) {
+    if (
+      text.includes(
+        normalizeText(competition)
+      )
+    ) {
+      competitions.add(
+        normalizeText(competition)
+      );
+    }
+  }
+
+  return Array.from(competitions);
 }
 
 /* =========================================================
@@ -1148,11 +1264,8 @@ function entitySimilarity(
   a: string,
   b: string
 ): number {
-  const entitiesA =
-    extractEntities(a);
-
-  const entitiesB =
-    extractEntities(b);
+  const entitiesA = extractEntities(a);
+  const entitiesB = extractEntities(b);
 
   if (
     entitiesA.length === 0 ||
@@ -1161,25 +1274,17 @@ function entitySimilarity(
     return 0;
   }
 
-  const common =
-    entitiesA.filter(
-      (entity) =>
-        entitiesB.includes(
-          entity
-        )
-    );
+  const common = entitiesA.filter((entity) =>
+    entitiesB.includes(entity)
+  );
 
-  if (
-    common.length === 0
-  ) {
+  if (common.length === 0) {
     return 0;
   }
 
   return Math.min(
     0.85,
-    0.35 +
-      common.length *
-        0.18
+    0.35 + common.length * 0.18
   );
 }
 
@@ -1190,98 +1295,80 @@ function entitySimilarity(
 function extractAllOpponents(
   title: string
 ): string[] {
-  const text =
-    normalizeText(
-      title
-    );
-
-  const opponents =
-    new Set<string>();
+  const text = normalizeText(title);
+  const opponents = new Set<string>();
 
   const knownOpponents = [
-    "bratislava",
-    "slovan bratislava",
-
-    "auxerre",
-    "marseille",
-    "om",
-    "strasbourg",
-    "lyon",
-    "lens",
-    "lille",
-    "monaco",
-    "rennes",
-    "nice",
-    "nantes",
-    "montpellier",
-    "toulouse",
-    "reims",
-    "brest",
-    "lorient",
-    "saint etienne",
-    "saint-etienne",
-
-    "manchester city",
-    "manchester united",
-    "arsenal",
-    "liverpool",
-    "chelsea",
-
-    "real madrid",
-    "barcelone",
-    "barcelona",
-
-    "bayern",
-    "inter milan",
-    "inter",
-    "juventus",
-    "milan",
-    "atalanta",
-
-    "dortmund",
-    "borussia dortmund",
+    'bratislava',
+    'slovan bratislava',
+    'auxerre',
+    'marseille',
+    'om',
+    'strasbourg',
+    'lyon',
+    'lens',
+    'lille',
+    'monaco',
+    'rennes',
+    'nice',
+    'nantes',
+    'montpellier',
+    'toulouse',
+    'reims',
+    'brest',
+    'lorient',
+    'saint etienne',
+    'saint-etienne',
+    'le havre',
+    'angers',
+    'nimes',
+    'metz',
+    'manchester city',
+    'manchester united',
+    'arsenal',
+    'liverpool',
+    'chelsea',
+    'tottenham',
+    'real madrid',
+    'barcelone',
+    'barcelona',
+    'atletico madrid',
+    'bayern',
+    'inter milan',
+    'inter',
+    'juventus',
+    'milan',
+    'atalanta',
+    'dortmund',
+    'borussia dortmund',
   ];
 
-  for (
-    const opponent of
-    knownOpponents
-  ) {
+  for (const opponent of knownOpponents) {
     if (
       text.includes(
-        normalizeText(
-          opponent
-        )
+        normalizeText(opponent)
       )
     ) {
       if (
-        opponent ===
-          "slovan bratislava" ||
-        opponent ===
-          "bratislava"
+        opponent === 'slovan bratislava' ||
+        opponent === 'bratislava'
       ) {
-        opponents.add(
-          "slovan bratislava"
-        );
-      } else if (
-        opponent ===
-        "om"
-      ) {
-        opponents.add(
-          "marseille"
-        );
+        opponents.add('slovan bratislava');
+      } else if (opponent === 'om') {
+        opponents.add('marseille');
+      } else if (opponent === 'inter') {
+        opponents.add('inter milan');
+      } else if (opponent === 'milan') {
+        opponents.add('milan');
       } else {
         opponents.add(
-          normalizeText(
-            opponent
-          )
+          normalizeText(opponent)
         );
       }
     }
   }
 
-  return Array.from(
-    opponents
-  );
+  return Array.from(opponents);
 }
 
 /* =========================================================
@@ -1291,56 +1378,42 @@ function extractAllOpponents(
 function extractEntities(
   title: string
 ): string[] {
-  const text =
-    normalizeText(
-      title
-    );
+  const text = normalizeText(title);
 
   const entities = [
-    "psg",
-    "paris saint germain",
-
-    "donnarumma",
-    "hakimi",
-    "marquinhos",
-    "vitinha",
-    "joao neves",
-    "dembele",
-    "dembélé",
-    "barcola",
-    "kvaratskhelia",
-    "doue",
-    "doué",
-    "luis enrique",
-    "mbappe",
-    "mbappé",
-
-    "bratislava",
-    "slovan bratislava",
-
-    "champions league",
-    "ligue des champions",
-    "youth league",
-    "ligue 1",
-    "coupe de france",
+    'psg',
+    'paris saint germain',
+    'donnarumma',
+    'hakimi',
+    'marquinhos',
+    'vitinha',
+    'joao neves',
+    'dembele',
+    'barcola',
+    'kvaratskhelia',
+    'doue',
+    'luis enrique',
+    'mbappe',
+    'bratislava',
+    'slovan bratislava',
+    'ligue des champions',
+    'champions league',
+    'youth league',
+    'ligue 1',
+    'coupe de france',
   ];
 
   return entities
-    .filter(
-      (entity) =>
-        text.includes(
-          normalizeText(
-            entity
-          )
-        )
+    .filter((entity) =>
+      text.includes(
+        normalizeText(entity)
+      )
     )
-    .map(
-      (entity) =>
-        normalizeText(
-          entity
-        )
+    .map((entity) =>
+      normalizeText(entity)
     );
 }
+
 
 /* =========================================================
    PROCESS CLUSTER
