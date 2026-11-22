@@ -1,11 +1,74 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 
 export const dynamic = "force-dynamic";
 
 const FOOTBALL_DATA_API_KEY = process.env.FOOTBALL_DATA_API_KEY;
+const HIGHLIGHTLY_API_KEY = process.env.HIGHLIGHTLY_API_KEY;
 
 const PSG_ID = "524";
-const API_URL = "https://api.football-data.org/v4";
+const FOOTBALL_DATA_URL = "https://api.football-data.org/v4";
+const HIGHLIGHTLY_URL = "https://sports.highlightly.net";
+
+/* ---------------- Cache partagé (Upstash Redis + mémoire) ----------------
+   Évite de dépasser les quotas des API gratuites : un seul appel externe
+   sert tous les téléphones pendant la durée indiquée. */
+
+const REDIS_URL = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
+const REDIS_TOKEN = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
+const memoryCache = new Map<string, { expires: number; value: any }>();
+
+async function redisCommand(command: (string | number)[]) {
+  const response = await fetch(REDIS_URL as string, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${REDIS_TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify(command),
+    cache: "no-store",
+  });
+  const json = await response.json();
+  if (json?.error) throw new Error(json.error);
+  return json?.result;
+}
+
+async function cached<T>(key: string, ttlSeconds: number, loader: () => Promise<T>): Promise<T> {
+  const fullKey = `psg:cache:${key}`;
+  const now = Date.now();
+
+  const inMemory = memoryCache.get(fullKey);
+  if (inMemory && inMemory.expires > now) {
+    return inMemory.value as T;
+  }
+
+  if (REDIS_URL && REDIS_TOKEN) {
+    try {
+      const raw = await redisCommand(["GET", fullKey]);
+      if (raw) {
+        const value = JSON.parse(raw);
+        memoryCache.set(fullKey, { expires: now + 10_000, value });
+        return value as T;
+      }
+    } catch {
+      /* Redis indisponible : on continue sans cache partagé */
+    }
+  }
+
+  const value = await loader();
+  // Un échec (null) n'est gardé que 60 secondes pour réessayer vite.
+  const ttl = value === null ? Math.min(ttlSeconds, 60) : ttlSeconds;
+
+  memoryCache.set(fullKey, { expires: now + ttl * 1000, value });
+
+  if (REDIS_URL && REDIS_TOKEN) {
+    try {
+      await redisCommand(["SET", fullKey, JSON.stringify(value), "EX", ttl]);
+    } catch {
+      /* ignoré */
+    }
+  }
+
+  return value;
+}
+
+/* ---------------- Football-Data.org (score, statut) ---------------- */
 
 function getDateString(date: Date) {
   return date.toISOString().slice(0, 10);
@@ -13,10 +76,6 @@ function getDateString(date: Date) {
 
 function getTeamName(team: any) {
   return team?.name || team?.shortName || team?.tla || "Équipe inconnue";
-}
-
-function getTeamLogo(team: any) {
-  return team?.crest || null;
 }
 
 function getScore(match: any) {
@@ -28,14 +87,10 @@ function getScore(match: any) {
   };
 }
 
-// Appel à Football-Data.org, avec un cache de 20 secondes côté serveur
-// pour rester sous la limite de 10 requêtes par minute, même avec
-// plusieurs téléphones qui rafraîchissent en même temps.
 async function footballData(path: string) {
-  const response = await fetch(`${API_URL}${path}`, {
-    method: "GET",
+  const response = await fetch(`${FOOTBALL_DATA_URL}${path}`, {
     headers: { "X-Auth-Token": FOOTBALL_DATA_API_KEY as string },
-    next: { revalidate: 20 },
+    cache: "no-store",
   });
 
   if (!response.ok) {
@@ -50,134 +105,181 @@ async function footballData(path: string) {
   return response.json();
 }
 
-// Transforme une minute de l'API (nombre, objet ou texte) en "67'" ou "45+2'".
-function formatMinute(value: any, injuryTime?: number | null): string | null {
-  if (value === null || value === undefined || value === "") {
-    return null;
-  }
-
-  if (typeof value === "object") {
-    if (typeof value.inPlay === "number") {
-      return `${value.inPlay}'`;
-    }
-    if (typeof value.extraTime === "number") {
-      return `${value.extraTime}'`;
-    }
-    return null;
-  }
-
-  if (typeof value === "number") {
-    return injuryTime ? `${value}+${injuryTime}'` : `${value}'`;
-  }
-
-  const text = String(value);
-  return text.includes("'") ? text : `${text}'`;
-}
-
-// Quand l'API ne donne pas la minute (cas fréquent avec l'offre gratuite),
-// on l'estime à partir de l'heure du coup d'envoi.
+// Minute estimée à partir du coup d'envoi (l'offre gratuite ne la fournit pas).
 function estimateMinute(match: any): string | null {
-  if (match?.status === "PAUSED") {
-    return "MT";
-  }
+  if (match?.status === "PAUSED") return "MT";
+  if (match?.status !== "IN_PLAY" || !match?.utcDate) return null;
 
-  if (match?.status !== "IN_PLAY" || !match?.utcDate) {
-    return null;
-  }
+  const elapsed = Math.floor((Date.now() - new Date(match.utcDate).getTime()) / 60000);
+  if (elapsed < 0) return null;
 
-  const elapsed = Math.floor(
-    (Date.now() - new Date(match.utcDate).getTime()) / 60000
-  );
-
-  if (elapsed < 0) {
-    return null;
-  }
-
-  // Environ 15 minutes de pause à la mi-temps.
   const minute = elapsed <= 45 ? Math.max(elapsed, 1) : Math.max(46, elapsed - 15);
-
   return minute > 90 ? "90+'" : `${minute}'`;
 }
 
-function buildGoals(match: any) {
-  const goals = Array.isArray(match?.goals) ? match.goals : [];
+/* ---------------- Highlightly (buteurs, cartons, changements) ---------------- */
 
-  return goals.map((goal: any) => {
-    let playerName = goal?.scorer?.name || "But";
+async function highlightly(path: string) {
+  const response = await fetch(`${HIGHLIGHTLY_URL}${path}`, {
+    headers: { "x-rapidapi-key": HIGHLIGHTLY_API_KEY as string },
+    cache: "no-store",
+  });
 
-    if (goal?.type === "OWN") {
-      playerName += " (c.s.c.)";
-    } else if (goal?.type === "PENALTY") {
-      playerName += " (pen.)";
+  if (!response.ok) {
+    throw new Error(`Highlightly ${response.status}`);
+  }
+
+  return response.json();
+}
+
+function asList(json: any): any[] {
+  if (Array.isArray(json)) return json;
+  if (Array.isArray(json?.data)) return json.data;
+  return [];
+}
+
+function parisDate(iso: string) {
+  return new Date(iso).toLocaleDateString("en-CA", { timeZone: "Europe/Paris" });
+}
+
+const PSG_NAME = /paris|psg/i;
+
+// Retrouve l'identifiant Highlightly du match du PSG (1 requête, gardée en cache).
+async function findHighlightlyMatchId(match: any, debug: any): Promise<number | null> {
+  const date = parisDate(match.utcDate);
+  const leagueName = match?.competition?.name || "";
+
+  return cached<number | null>(
+    `hl-match-id:${match.id}`,
+    6 * 3600,
+    async () => {
+      try {
+        const json = await highlightly(
+          `/football/matches?date=${date}&timezone=Europe%2FParis` +
+            `&leagueName=${encodeURIComponent(leagueName)}&limit=50`
+        );
+        debug.matches = json;
+
+        const found = asList(json).find(
+          (m: any) =>
+            PSG_NAME.test(String(m?.homeTeam?.name || "")) ||
+            PSG_NAME.test(String(m?.awayTeam?.name || ""))
+        );
+
+        return found?.id ?? null;
+      } catch (error) {
+        console.error("Highlightly lookup error:", error);
+        return null;
+      }
+    }
+  );
+}
+
+function personName(value: any): string {
+  if (!value) return "";
+  if (typeof value === "string") return value;
+  return value?.name || value?.displayName || "";
+}
+
+function eventMinute(event: any): string | null {
+  const raw = event?.time ?? event?.minute ?? event?.elapsed;
+  if (raw === null || raw === undefined || raw === "") return null;
+  const text = String(raw);
+  return text.includes("'") ? text : `${text}'`;
+}
+
+function buildEvents(events: any[]) {
+  const goals: any[] = [];
+  const cards: any[] = [];
+  const substitutions: any[] = [];
+
+  for (const event of events) {
+    const type = String(event?.type ?? event?.event ?? event?.detail ?? "").toLowerCase();
+    const minute = eventMinute(event);
+    const team = event?.team?.name || null;
+
+    if (type.includes("sub")) {
+      substitutions.push({
+        minute,
+        playerInName: personName(event?.player ?? event?.playerIn),
+        playerOutName: personName(event?.substituted ?? event?.playerOut ?? event?.assist),
+        team,
+      });
+      continue;
     }
 
-    return {
-      minute: formatMinute(goal?.minute, goal?.injuryTime),
-      playerName,
-      scorer: goal?.scorer ?? null,
-      assist: goal?.assist?.name ?? null,
-      type: goal?.type ?? null,
-      team: goal?.team?.shortName || goal?.team?.name || null,
-      teamId: goal?.team?.id ?? null,
-    };
+    if (type.includes("red") || type.includes("yellow")) {
+      cards.push({
+        minute,
+        playerName: personName(event?.player) || "Joueur",
+        card: type.includes("red") ? "RED" : "YELLOW",
+        team,
+      });
+      continue;
+    }
+
+    if (
+      type.includes("goal") &&
+      !type.includes("disallow") &&
+      !type.includes("cancel") &&
+      !type.includes("miss")
+    ) {
+      let playerName = personName(event?.player) || "But";
+      if (type.includes("own")) playerName += " (c.s.c.)";
+      else if (type.includes("pen")) playerName += " (pen.)";
+
+      goals.push({ minute, playerName, assist: personName(event?.assist) || null, team });
+    }
+  }
+
+  return { goals, cards, substitutions };
+}
+
+async function loadHighlightlyEvents(match: any, isLive: boolean, debug: any) {
+  if (!HIGHLIGHTLY_API_KEY) return null;
+
+  const id = await findHighlightlyMatchId(match, debug);
+  if (!id) return null;
+
+  // En direct : rafraîchi toutes les 90 s (≈ 80 requêtes pour un match entier,
+  // pour un quota de 100/jour). Match terminé : toutes les heures.
+  const json = await cached<any>(`hl-events:${id}`, isLive ? 90 : 3600, async () => {
+    try {
+      return await highlightly(`/football/events/${id}`);
+    } catch (error) {
+      console.error("Highlightly events error:", error);
+      return null;
+    }
   });
+
+  debug.events = json;
+  if (!json) return null;
+
+  return buildEvents(asList(json));
 }
 
-function buildCards(match: any) {
-  const bookings = Array.isArray(match?.bookings) ? match.bookings : [];
+/* ---------------- Route ---------------- */
 
-  return bookings.map((booking: any) => {
-    const raw = String(booking?.card || "").toUpperCase();
+// GET /api/live-score   (ajoutez ?debug=1 pour voir les réponses brutes de Highlightly)
+export async function GET(request: NextRequest) {
+  const wantsDebug = request.nextUrl.searchParams.get("debug") === "1";
+  const debug: any = {};
 
-    return {
-      minute: formatMinute(booking?.minute),
-      playerName: booking?.player?.name || "Joueur",
-      player: booking?.player ?? null,
-      card: raw.includes("RED") ? "RED" : "YELLOW",
-      team: booking?.team?.shortName || booking?.team?.name || null,
-      teamId: booking?.team?.id ?? null,
-    };
-  });
-}
-
-function buildSubstitutions(match: any) {
-  const substitutions = Array.isArray(match?.substitutions)
-    ? match.substitutions
-    : [];
-
-  return substitutions.map((sub: any) => ({
-    minute: formatMinute(sub?.minute),
-    playerInName: sub?.playerIn?.name || "",
-    playerOutName: sub?.playerOut?.name || "",
-    playerIn: sub?.playerIn ?? null,
-    playerOut: sub?.playerOut ?? null,
-    team: sub?.team?.shortName || sub?.team?.name || null,
-    teamId: sub?.team?.id ?? null,
-  }));
-}
-
-export async function GET() {
   try {
     if (!FOOTBALL_DATA_API_KEY) {
-      return NextResponse.json(
-        { error: "FOOTBALL_DATA_API_KEY manquante" },
-        { status: 500 }
-      );
+      return NextResponse.json({ error: "FOOTBALL_DATA_API_KEY manquante" }, { status: 500 });
     }
 
     const today = new Date();
-
     const from = new Date(today);
     from.setDate(from.getDate() - 7);
-
     const to = new Date(today);
     to.setDate(to.getDate() + 7);
 
-    const data = await footballData(
-      `/teams/${PSG_ID}/matches` +
-        `?dateFrom=${getDateString(from)}` +
-        `&dateTo=${getDateString(to)}` +
-        `&limit=20`
+    const data = await cached<any>("fd-psg-matches", 20, () =>
+      footballData(
+        `/teams/${PSG_ID}/matches?dateFrom=${getDateString(from)}&dateTo=${getDateString(to)}&limit=20`
+      )
     );
 
     const matches = Array.isArray(data?.matches) ? data.matches : [];
@@ -187,122 +289,85 @@ export async function GET() {
     }
 
     const liveMatches = matches.filter(
-      (match: any) => match?.status === "IN_PLAY" || match?.status === "PAUSED"
+      (m: any) => m?.status === "IN_PLAY" || m?.status === "PAUSED"
     );
 
     const finishedMatches = matches
-      .filter((match: any) => match?.status === "FINISHED")
-      .sort(
-        (a: any, b: any) =>
-          new Date(b.utcDate).getTime() - new Date(a.utcDate).getTime()
-      );
+      .filter((m: any) => m?.status === "FINISHED")
+      .sort((a: any, b: any) => new Date(b.utcDate).getTime() - new Date(a.utcDate).getTime());
 
     const upcomingMatches = matches
-      .filter(
-        (match: any) => match?.status === "SCHEDULED" || match?.status === "TIMED"
-      )
-      .sort(
-        (a: any, b: any) =>
-          new Date(a.utcDate).getTime() - new Date(b.utcDate).getTime()
-      );
+      .filter((m: any) => m?.status === "SCHEDULED" || m?.status === "TIMED")
+      .sort((a: any, b: any) => new Date(a.utcDate).getTime() - new Date(b.utcDate).getTime());
 
-    const listMatch =
-      liveMatches[0] || finishedMatches[0] || upcomingMatches[0];
+    const match = liveMatches[0] || finishedMatches[0] || upcomingMatches[0];
 
-    if (!listMatch) {
+    if (!match) {
       return NextResponse.json({ liveScore: null });
     }
 
-    // La liste des matchs ne contient NI les buteurs, NI les cartons,
-    // NI les changements : il faut demander le détail du match.
-    let match = listMatch;
-
-    if (listMatch.status !== "SCHEDULED" && listMatch.status !== "TIMED") {
-      try {
-        const detail = await footballData(`/matches/${listMatch.id}`);
-        match = { ...listMatch, ...detail };
-      } catch {
-        // En cas d'échec, on garde les informations de base.
-        match = listMatch;
-      }
-    }
-
     const score = getScore(match);
-    const isPsgHome = String(match?.homeTeam?.id) === PSG_ID;
+    const isLive = match.status === "IN_PLAY" || match.status === "PAUSED";
+    const hasStarted = isLive || match.status === "FINISHED";
 
-    const homeTeam = {
-      name: getTeamName(match?.homeTeam),
-      logo: getTeamLogo(match?.homeTeam),
-      id: match?.homeTeam?.id ?? null,
-    };
+    let goals: any[] = [];
+    let cards: any[] = [];
+    let substitutions: any[] = [];
+    let eventsSource: string | null = null;
 
-    const awayTeam = {
-      name: getTeamName(match?.awayTeam),
-      logo: getTeamLogo(match?.awayTeam),
-      id: match?.awayTeam?.id ?? null,
-    };
+    if (hasStarted) {
+      const events = await loadHighlightlyEvents(match, isLive, debug);
 
-    const isLive = match?.status === "IN_PLAY" || match?.status === "PAUSED";
-
-    let minute: string | null = null;
-    let minuteEstimated = false;
-
-    if (isLive) {
-      minute = formatMinute(match?.minute, match?.injuryTime);
-
-      if (!minute) {
-        minute = estimateMinute(match);
-        minuteEstimated = minute !== null;
+      if (events) {
+        goals = events.goals;
+        cards = events.cards;
+        substitutions = events.substitutions;
+        eventsSource = "highlightly";
       }
     }
 
-    let matchStatus = "UPCOMING";
-
-    if (isLive) {
-      matchStatus = "LIVE";
-    } else if (match.status === "FINISHED") {
-      matchStatus = "FINISHED";
-    }
+    const minute = isLive ? estimateMinute(match) : null;
 
     const liveScore = {
       competition: match?.competition?.name || "Football",
 
       status:
-        match?.status === "FINISHED"
+        match.status === "FINISHED"
           ? "Terminé"
-          : match?.status === "IN_PLAY"
+          : match.status === "IN_PLAY"
             ? "En direct"
-            : match?.status === "PAUSED"
+            : match.status === "PAUSED"
               ? "Mi-temps"
               : "À venir",
 
       minute,
-      minuteEstimated,
+      minuteEstimated: minute !== null,
 
-      homeTeam: homeTeam.name,
-      awayTeam: awayTeam.name,
+      homeTeam: getTeamName(match?.homeTeam),
+      awayTeam: getTeamName(match?.awayTeam),
 
-      homeLogo: homeTeam.logo,
-      awayLogo: awayTeam.logo,
+      homeLogo: match?.homeTeam?.crest || null,
+      awayLogo: match?.awayTeam?.crest || null,
 
-      homeTeamId: homeTeam.id,
-      awayTeamId: awayTeam.id,
+      homeTeamId: match?.homeTeam?.id ?? null,
+      awayTeamId: match?.awayTeam?.id ?? null,
 
       homeScore: score.home,
       awayScore: score.away,
 
       isLive,
-      isPsgHome,
+      isPsgHome: String(match?.homeTeam?.id) === PSG_ID,
 
-      goals: buildGoals(match),
-      cards: buildCards(match),
-      substitutions: buildSubstitutions(match),
+      goals,
+      cards,
+      substitutions,
+      eventsSource,
 
       events: [],
 
       kickoff: match?.utcDate || null,
 
-      matchStatus,
+      matchStatus: isLive ? "LIVE" : match.status === "FINISHED" ? "FINISHED" : "UPCOMING",
 
       venue: match?.venue || null,
       matchday: match?.matchday || null,
@@ -312,12 +377,8 @@ export async function GET() {
     };
 
     return NextResponse.json(
-      { liveScore },
-      {
-        headers: {
-          "Cache-Control": "no-store, no-cache, must-revalidate",
-        },
-      }
+      wantsDebug ? { liveScore, debug } : { liveScore },
+      { headers: { "Cache-Control": "no-store, no-cache, must-revalidate" } }
     );
   } catch (error: any) {
     console.error("Live score error:", error);
