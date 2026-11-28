@@ -27,7 +27,12 @@ async function redisCommand(command: (string | number)[]) {
   return json?.result;
 }
 
-async function cached<T>(key: string, ttlSeconds: number, loader: () => Promise<T>): Promise<T> {
+async function cached<T>(
+  key: string,
+  ttlSeconds: number,
+  loader: () => Promise<T>,
+  nullTtlSeconds = 60
+): Promise<T> {
   const fullKey = `psg:cache:${key}`;
   const now = Date.now();
 
@@ -50,8 +55,8 @@ async function cached<T>(key: string, ttlSeconds: number, loader: () => Promise<
   }
 
   const value = await loader();
-  // Un échec (null) n'est gardé que 60 secondes pour réessayer vite.
-  const ttl = value === null ? Math.min(ttlSeconds, 60) : ttlSeconds;
+  // Un échec (null) est gardé moins longtemps, pour réessayer sans gaspiller les quotas.
+  const ttl = value === null ? Math.min(ttlSeconds, nullTtlSeconds) : ttlSeconds;
 
   memoryCache.set(fullKey, { expires: now + ttl * 1000, value });
 
@@ -114,58 +119,61 @@ function parisDate(iso: string) {
 }
 
 async function findHighlightlyMatchId(match: any): Promise<number | null> {
-  return cached<number | null>(`hl-match-id:${match.id}`, 6 * 3600, async () => {
-    try {
-      const json = await highlightly(
-        `/football/matches?date=${parisDate(match.utcDate)}&timezone=Europe%2FParis` +
-          `&leagueName=${encodeURIComponent(match?.competition?.name || "")}&limit=50`
-      );
+  return cached<number | null>(
+    `hl-match-id:${match.id}`,
+    6 * 3600,
+    async () => {
+      try {
+        const json = await highlightly(
+          `/football/matches?date=${parisDate(match.utcDate)}&timezone=Europe%2FParis` +
+            `&leagueName=${encodeURIComponent(match?.competition?.name || "")}&limit=50`
+        );
 
-      const found = asList(json).find(
-        (m: any) =>
-          PSG_NAME.test(String(m?.homeTeam?.name || "")) ||
-          PSG_NAME.test(String(m?.awayTeam?.name || ""))
-      );
+        const found = asList(json).find(
+          (m: any) =>
+            PSG_NAME.test(String(m?.homeTeam?.name || "")) ||
+            PSG_NAME.test(String(m?.awayTeam?.name || ""))
+        );
 
-      return found?.id ?? null;
-    } catch {
-      return null;
-    }
-  });
+        return found?.id ?? null;
+      } catch {
+        return null;
+      }
+    },
+    600
+  );
 }
 
 /* ---------------- Compositions ---------------- */
 
-function personName(value: any): string {
-  if (!value) return "";
-  if (typeof value === "string") return value;
-  return value?.name || value?.displayName || "";
-}
-
 function toPlayers(list: any): any[] {
   if (!Array.isArray(list)) return [];
 
-  // Certaines API renvoient les joueurs par lignes : on aplatit.
-  const flat = list.flatMap((item: any) => (Array.isArray(item) ? item : [item]));
-
-  return flat
-    .map((p: any) => {
-      const player = p?.player && typeof p.player === "object" ? { ...p, ...p.player } : p;
-      return {
-        name: personName(player?.name ? player : player?.player ?? player),
-        number: player?.number ?? player?.shirtNumber ?? player?.jerseyNumber ?? null,
-        position: player?.position ?? player?.pos ?? null,
-      };
-    })
+  return list
+    .flatMap((item: any) => (Array.isArray(item) ? item : [item]))
+    .map((p: any) => ({
+      name: typeof p === "string" ? p : p?.name || p?.displayName || "",
+      number: p?.number ?? p?.shirtNumber ?? p?.jerseyNumber ?? null,
+      position: p?.position ?? null,
+    }))
     .filter((p: any) => p.name);
 }
 
 function parseLineupSide(side: any) {
   if (!side) return null;
 
+  const initial = side?.initialLineup ?? side?.startingXI ?? side?.starters ?? side?.lineup;
+
+  // Highlightly renvoie les titulaires ligne par ligne : gardien, défense, milieu, attaque.
+  const rows =
+    Array.isArray(initial) && initial.every((row: any) => Array.isArray(row))
+      ? initial.map((row: any) => toPlayers(row)).filter((row: any[]) => row.length > 0)
+      : [];
+
   return {
     formation: side?.formation ?? null,
-    starters: toPlayers(side?.startingXI ?? side?.initialLineup ?? side?.starters ?? side?.lineup),
+    rows,
+    starters: toPlayers(initial),
     substitutes: toPlayers(side?.substitutes ?? side?.bench),
   };
 }
@@ -179,24 +187,61 @@ function parseLineups(json: any) {
   return { home, away };
 }
 
-/* ---------------- Statistiques ---------------- */
+/* ---------------- Statistiques (bilan de fin de match) ---------------- */
 
-const STAT_LABELS: Array<[RegExp, string]> = [
-  [/possession/i, "Possession"],
-  [/on target|cadr/i, "Tirs cadrés"],
-  [/shots|tirs/i, "Tirs"],
-  [/corner/i, "Corners"],
-  [/foul|faute/i, "Fautes"],
-  [/offside|hors/i, "Hors-jeu"],
-  [/yellow|jaune/i, "Cartons jaunes"],
-  [/red card|rouge/i, "Cartons rouges"],
-  [/pass/i, "Passes"],
-  [/save|arr[eê]t/i, "Arrêts"],
+type StatSpec = {
+  label: string;
+  names: string[];
+  mode: "int" | "dec" | "pct" | "sum" | "ratio";
+};
+
+const STAT_SPECS: StatSpec[] = [
+  { label: "Possession", names: ["Possession"], mode: "pct" },
+  { label: "Expected goals (xG)", names: ["Expected Goals"], mode: "dec" },
+  { label: "Tirs", names: ["Shots on target", "Shots off target", "Blocked shots"], mode: "sum" },
+  { label: "Tirs cadrés", names: ["Shots on target"], mode: "int" },
+  { label: "Grosses occasions", names: ["Big Chances Created"], mode: "int" },
+  { label: "Corners", names: ["Corners"], mode: "int" },
+  { label: "Passes", names: ["Total passes"], mode: "int" },
+  { label: "Passes réussies", names: ["Successful passes", "Total passes"], mode: "ratio" },
+  { label: "Interceptions", names: ["Interceptions"], mode: "int" },
+  { label: "Arrêts du gardien", names: ["Goalkeeper saves"], mode: "int" },
+  { label: "Fautes", names: ["Fouls"], mode: "int" },
+  { label: "Hors-jeu", names: ["Offsides"], mode: "int" },
+  { label: "Cartons jaunes", names: ["Yellow cards"], mode: "int" },
+  { label: "Cartons rouges", names: ["Red cards"], mode: "int" },
 ];
 
-function statLabel(raw: string) {
-  const found = STAT_LABELS.find(([regex]) => regex.test(raw));
-  return found ? found[1] : raw;
+function statValue(entry: any, name: string): number | null {
+  const stat = (entry?.statistics || []).find(
+    (s: any) => String(s?.displayName ?? s?.name ?? "").toLowerCase() === name.toLowerCase()
+  );
+  if (!stat || stat.value === null || stat.value === undefined) return null;
+
+  const n = Number(stat.value);
+  return Number.isNaN(n) ? null : n;
+}
+
+function computeStat(entry: any, spec: StatSpec): string | null {
+  const values = spec.names.map((name) => statValue(entry, name));
+
+  if (spec.mode === "sum") {
+    if (values.every((v) => v === null)) return null;
+    return String(values.reduce((sum: number, v) => sum + (v ?? 0), 0));
+  }
+
+  if (spec.mode === "ratio") {
+    const [done, total] = values;
+    if (done === null || total === null || !total) return null;
+    return `${Math.round((done / total) * 100)}%`;
+  }
+
+  const value = values[0];
+  if (value === null) return null;
+
+  if (spec.mode === "pct") return `${Math.round(value <= 1 ? value * 100 : value)}%`;
+  if (spec.mode === "dec") return value.toFixed(2);
+  return String(Math.round(value));
 }
 
 function parseStats(json: any, psgIsHome: boolean) {
@@ -210,23 +255,23 @@ function parseStats(json: any, psgIsHome: boolean) {
 
   const rows: Array<{ label: string; home: string; away: string }> = [];
 
-  for (const stat of homeEntry.statistics) {
-    const name = String(stat?.displayName ?? stat?.name ?? stat?.type ?? "");
-    const other = awayEntry.statistics.find(
-      (s: any) => String(s?.displayName ?? s?.name ?? s?.type ?? "") === name
-    );
-
-    if (!name || stat?.value === undefined || other?.value === undefined) continue;
-
-    rows.push({ label: statLabel(name), home: String(stat.value), away: String(other.value) });
+  for (const spec of STAT_SPECS) {
+    const home = computeStat(homeEntry, spec);
+    const away = computeStat(awayEntry, spec);
+    if (home !== null && away !== null) rows.push({ label: spec.label, home, away });
   }
 
-  return rows.length ? rows.slice(0, 12) : null;
+  return rows.length ? rows : null;
 }
 
 /* ---------------- Route ---------------- */
 
 // GET /api/match-center (ajoutez ?debug=1 pour voir les réponses brutes)
+//
+// Économie de requêtes Highlightly (100/jour en gratuit) :
+//  - compositions : 1 requête, seulement dans l'heure qui précède le coup d'envoi ;
+//  - statistiques : 1 requête, uniquement quand le match est terminé ;
+//  - un échec n'est retenté que toutes les 5 à 10 minutes.
 export async function GET(request: NextRequest) {
   const wantsDebug = request.nextUrl.searchParams.get("debug") === "1";
   const debug: any = {};
@@ -248,48 +293,61 @@ export async function GET(request: NextRequest) {
       .sort((a, b) => new Date(a.utcDate).getTime() - new Date(b.utcDate).getTime())[0];
 
     const match = live || finished || upcoming;
-    const isLive = Boolean(live);
 
     if (!match || !HIGHLIGHTLY_API_KEY) {
       return NextResponse.json({ matchCenter: null });
     }
 
-    const id = await findHighlightlyMatchId(match);
-    if (!id) return NextResponse.json({ matchCenter: null });
-
+    const phase = live ? "LIVE" : match.status === "FINISHED" ? "FINISHED" : "UPCOMING";
+    const msToKickoff = new Date(match.utcDate).getTime() - Date.now();
     const psgIsHome = String(match?.homeTeam?.id) === PSG_ID;
 
-    // Quotas Highlightly (100 requêtes/jour en gratuit) : durées de cache volontairement longues.
-    const lineupsJson = await cached<any>(`hl-lineups:${id}`, isLive ? 1800 : 6 * 3600, async () => {
-      try {
-        return await highlightly(`/football/lineups/${id}`);
-      } catch {
-        return null;
+    let lineups: any = null;
+    let stats: any = null;
+
+    // Compositions : seulement dans les 75 minutes avant le coup d'envoi, puis une fois pour toutes.
+    if (phase !== "UPCOMING" || msToKickoff < 75 * 60000) {
+      const id = await findHighlightlyMatchId(match);
+
+      if (id) {
+        lineups = await cached<any>(
+          `hl-lineups-parsed:${id}`,
+          12 * 3600,
+          async () => {
+            try {
+              const json = await highlightly(`/football/lineups/${id}`);
+              if (wantsDebug) debug.lineups = json;
+              return parseLineups(json);
+            } catch {
+              return null;
+            }
+          },
+          600
+        );
+
+        // Statistiques : une seule requête, une fois le match terminé.
+        if (phase === "FINISHED") {
+          stats = await cached<any>(
+            `hl-stats-parsed:${id}`,
+            24 * 3600,
+            async () => {
+              try {
+                const json = await highlightly(`/football/statistics/${id}`);
+                if (wantsDebug) debug.statistics = json;
+                return parseStats(json, psgIsHome);
+              } catch {
+                return null;
+              }
+            },
+            300
+          );
+        }
       }
-    });
-
-    const started = match.status === "IN_PLAY" || match.status === "PAUSED" || match.status === "FINISHED";
-
-    const statsJson = started
-      ? await cached<any>(`hl-stats:${id}`, isLive ? 300 : 3600, async () => {
-          try {
-            return await highlightly(`/football/statistics/${id}`);
-          } catch {
-            return null;
-          }
-        })
-      : null;
-
-    if (wantsDebug) {
-      debug.lineups = lineupsJson;
-      debug.statistics = statsJson;
     }
-
-    const lineups = lineupsJson ? parseLineups(lineupsJson) : null;
-    const stats = statsJson ? parseStats(statsJson, psgIsHome) : null;
 
     const payload = {
       matchId: match.id,
+      phase,
       homeTeam: match?.homeTeam?.shortName || match?.homeTeam?.name,
       awayTeam: match?.awayTeam?.shortName || match?.awayTeam?.name,
       lineups,
