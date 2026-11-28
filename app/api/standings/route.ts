@@ -232,7 +232,7 @@ async function fromHighlightly(
 
   const json = await highlightly(
     `/football/standings?leagueId=${found.id}&season=${currentSeason()}`,
-    3600 // le classement change seulement après les matchs : 1 requête par heure
+    21600 // le classement change seulement après les matchs : 1 requête toutes les 6 h
   );
   debug.standings = json;
 
